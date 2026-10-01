@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Redacted known credential fields from LiteLLM standard and streaming request
+  debug logs, including nested authorization headers and token or secret fields,
+  without changing the arguments sent to providers.
+
 ## [0.15.0] - 2026-09-13
 
 AgentLane `0.15.0` forwards complete native run events through the process bridge, adds strict final-result serialization, and fixes shutdown when a client stops reading output. The native event contract replaces the previous flat event shape; update the Python and TypeScript packages together.
