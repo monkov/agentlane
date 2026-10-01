@@ -7,11 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-01
+
+AgentLane `0.16.0` adds file I/O adapters for native tools and skills, combines local and remote skill roots through one reader, and removes known credentials from LiteLLM request debug logs.
+
+### Added
+
+- Added public file I/O protocols and `LocalFileSystem`, with `reader=` and `writer=` injection for native tools and `reader=` injection for `FilesystemSkillLoader`. Applications can supply storage while AgentLane retains tool behavior, skill discovery, parsing, and activation ([`3e81cff`](https://github.com/yasik/agentlane/commit/3e81cff)).
+- Added `MountedReader` to combine local and remote skill roots with one loader and one read tool, with mount-based paths and root-order precedence for duplicate skill names ([`3e81cff`](https://github.com/yasik/agentlane/commit/3e81cff)).
+- Added the AgentLane website with product examples and installation guidance ([`8e41451`](https://github.com/yasik/agentlane/commit/8e41451)).
+
+### Changed
+
+- Skill activation now emits `read_path` instead of `absolute_path` for resources. Use this attribute with a read tool that shares the loader's storage namespace; local paths remain absolute. Skill manifest paths now use `PurePath` to support reader-relative paths ([`3e81cff`](https://github.com/yasik/agentlane/commit/3e81cff)).
+- Moved the memory package from `agentlane.harness.memory` to `agentlane.harness.shims.memory` ([`3e81cff`](https://github.com/yasik/agentlane/commit/3e81cff)).
+- Added storage adapter documentation with mixed-root examples, path rules, permissions, concurrency, and cancellation behavior ([`3e81cff`](https://github.com/yasik/agentlane/commit/3e81cff)).
+
 ### Fixed
 
-- Redacted known credential fields from LiteLLM standard and streaming request
-  debug logs, including nested authorization headers and token or secret fields,
-  without changing the arguments sent to providers.
+- Redacted known credential fields from LiteLLM standard and streaming request debug logs, including nested authorization headers and token or secret fields, without changing the arguments sent to providers ([`c786aad`](https://github.com/yasik/agentlane/commit/c786aad)).
 
 ## [0.15.0] - 2026-09-13
 
@@ -310,7 +324,8 @@ AgentLane `0.3.0` is the initial public release. It ships the runtime and distri
 
 - Final pre-release cleanup removed dead code and added repo-level `vulture` configuration for ongoing dead-code checks ([`f009e5d`](https://github.com/yasik/agentlane/commit/f009e5d523a84d3e6747329522582d3196906534))
 
-[Unreleased]: https://github.com/yasik/agentlane/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/yasik/agentlane/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/yasik/agentlane/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/yasik/agentlane/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/yasik/agentlane/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/yasik/agentlane/compare/v0.13.0...v0.13.1
