@@ -2,7 +2,7 @@
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import fields, replace
 from typing import Any, cast
 
@@ -43,6 +43,57 @@ from .types import (
 )
 
 LOGGER = structlog.get_logger(log_tag="agentlane.litellm.client")
+
+_REDACTED = "[redacted]"
+_SENSITIVE_LOG_KEY_SEGMENTS = frozenset(
+    {
+        "access",
+        "apikey",
+        "auth",
+        "authorization",
+        "credential",
+        "credentials",
+        "cookie",
+        "key",
+        "password",
+        "private",
+        "secret",
+        "token",
+    }
+)
+_NON_SENSITIVE_LOG_KEY_SEGMENTS = frozenset({"cost"})
+
+
+def _is_sensitive_log_key(key: object) -> bool:
+    """Return whether a provider argument key can contain credentials."""
+    normalized_key = str(key).lower().replace("-", "_")
+    key_segments = frozenset(normalized_key.split("_"))
+    if key_segments & _NON_SENSITIVE_LOG_KEY_SEGMENTS:
+        return False
+
+    return bool(key_segments & _SENSITIVE_LOG_KEY_SEGMENTS)
+
+
+def _redact_sensitive_log_values(value: object) -> object:
+    """Return a log-safe copy of a provider request value."""
+    if isinstance(value, Mapping):
+        mapping = cast(Mapping[object, object], value)
+        redacted: dict[str, object] = {}
+        for key, item in mapping.items():
+            rendered_key = str(key)
+            redacted[rendered_key] = (
+                _REDACTED
+                if _is_sensitive_log_key(key)
+                else _redact_sensitive_log_values(item)
+            )
+        return redacted
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        sequence = cast(Sequence[object], value)
+        return [_redact_sensitive_log_values(item) for item in sequence]
+
+    return value
+
 
 _litellm_transport_configured = False
 
@@ -245,7 +296,7 @@ class Client(Model[TResponseType]):
                 LOGGER.debug(
                     "LLM call started",
                     messages=conversation,
-                    call_args=call_args,
+                    call_args=_redact_sensitive_log_values(call_args),
                 )
 
                 result, retry_metrics = await self._execute_with_retry(
@@ -383,7 +434,7 @@ class Client(Model[TResponseType]):
                 LOGGER.debug(
                     "LLM stream started",
                     messages=messages,
-                    call_args=call_args,
+                    call_args=_redact_sensitive_log_values(call_args),
                 )
 
                 retry_metrics: RetryMetrics | None = None

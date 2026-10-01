@@ -9,6 +9,7 @@ import pytest
 from agentlane_litellm import Client, Factory
 from litellm.types.utils import ModelResponseStream
 from pydantic import BaseModel
+from structlog.testing import capture_logs
 
 from agentlane.models import (
     Config,
@@ -235,6 +236,134 @@ def test_litellm_client_forwards_native_tool_schema(
     assert await_kwargs["tools"][0]["function"]["name"] == "echo"
     assert await_kwargs["parallel_tool_calls"] is True
     assert await_kwargs["drop_params"] is True
+
+
+def test_litellm_client_redacts_credentials_from_request_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Request logs must redact credentials without changing provider arguments."""
+    api_key = "canary-api-key"
+    authorization = "Bearer canary-authorization"
+    header_api_key = "canary-header-api-key"
+    refresh_token = "canary-refresh-token"  # noqa: S105
+    aws_access_key_id = "AKIAIOSFODNN7EXAMPLE"  # noqa: S105
+    aws_secret_access_key = "canary-aws-secret-access-key"  # noqa: S105
+    google_api_key = "canary-google-api-key"
+    vertex_credentials = '{"type":"service_account","private_key":"canary-private-key"}'
+    client = Client(
+        Config(
+            api_key=api_key,
+            model="gpt-4o",
+            default_headers={
+                "Authorization": authorization,
+                "X-API-Key": header_api_key,
+                "X-Trace-ID": "visible-trace",
+            },
+        )
+    )
+    completion_mock = AsyncMock(return_value=_make_model_response("hello"))
+    monkeypatch.setattr(litellm, "acompletion", completion_mock)
+
+    with capture_logs() as logs:
+        asyncio.run(
+            client.get_response(
+                messages=[{"role": "user", "content": "hello"}],
+                extra_call_args={
+                    "provider_options": {
+                        "refresh_token": refresh_token,
+                        "region": "eu",
+                        "aws_access_key_id": aws_access_key_id,
+                        "aws_secret_access_key": aws_secret_access_key,
+                        "vertex_credentials": vertex_credentials,
+                        "headers": {"X-Goog-Api-Key": google_api_key},
+                        "input_cost_per_token": 0.0001,
+                    }
+                },
+            )
+        )
+
+    rendered_logs = repr(logs)
+    assert api_key not in rendered_logs
+    assert authorization not in rendered_logs
+    assert header_api_key not in rendered_logs
+    assert refresh_token not in rendered_logs
+    assert aws_access_key_id not in rendered_logs
+    assert aws_secret_access_key not in rendered_logs
+    assert google_api_key not in rendered_logs
+    assert vertex_credentials not in rendered_logs
+    started = next(log for log in logs if log["event"] == "LLM call started")
+    logged_args = cast(dict[str, Any], started["call_args"])
+    logged_headers = cast(dict[str, Any], logged_args["default_headers"])
+    logged_options = cast(dict[str, Any], logged_args["provider_options"])
+    assert logged_args["api_key"] == "[redacted]"
+    assert logged_headers["Authorization"] == "[redacted]"
+    assert logged_headers["X-API-Key"] == "[redacted]"
+    assert logged_headers["X-Trace-ID"] == "visible-trace"
+    assert logged_options == {
+        "refresh_token": "[redacted]",
+        "region": "eu",
+        "aws_access_key_id": "[redacted]",
+        "aws_secret_access_key": "[redacted]",
+        "vertex_credentials": "[redacted]",
+        "headers": {"X-Goog-Api-Key": "[redacted]"},
+        "input_cost_per_token": 0.0001,
+    }
+
+    await_kwargs = cast(dict[str, Any], cast(Any, completion_mock.await_args).kwargs)
+    assert await_kwargs["api_key"] == api_key
+    assert await_kwargs["default_headers"]["Authorization"] == authorization
+    assert await_kwargs["default_headers"]["X-API-Key"] == header_api_key
+    assert await_kwargs["provider_options"]["refresh_token"] == refresh_token
+    assert await_kwargs["provider_options"]["aws_access_key_id"] == aws_access_key_id
+    assert (
+        await_kwargs["provider_options"]["aws_secret_access_key"]
+        == aws_secret_access_key
+    )
+    assert await_kwargs["provider_options"]["vertex_credentials"] == vertex_credentials
+    assert (
+        await_kwargs["provider_options"]["headers"]["X-Goog-Api-Key"] == google_api_key
+    )
+
+
+def test_litellm_client_redacts_credentials_from_stream_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming request logs must use the same credential redaction."""
+    api_key = "canary-stream-api-key"
+    client = Client(
+        Config(
+            api_key=api_key,
+            model="gpt-4o",
+            default_headers={"Proxy-Authorization": "Bearer canary-proxy"},
+        )
+    )
+    completion_mock = AsyncMock(
+        return_value=_FakeAsyncStream(
+            [
+                _make_stream_chunk(content="hello"),
+                _make_stream_chunk(finish_reason="stop"),
+            ]
+        )
+    )
+    monkeypatch.setattr(litellm, "acompletion", completion_mock)
+
+    with capture_logs() as logs:
+        events = asyncio.run(_collect_stream_events(client))
+
+    assert events[-1].kind == ModelStreamEventKind.COMPLETED
+    assert api_key not in repr(logs)
+    assert "Bearer canary-proxy" not in repr(logs)
+    started = next(log for log in logs if log["event"] == "LLM stream started")
+    logged_args = cast(dict[str, Any], started["call_args"])
+    logged_headers = cast(dict[str, Any], logged_args["default_headers"])
+    assert logged_args["api_key"] == "[redacted]"
+    assert logged_headers["Proxy-Authorization"] == "[redacted]"
+
+    await_kwargs = cast(dict[str, Any], cast(Any, completion_mock.await_args).kwargs)
+    assert await_kwargs["api_key"] == api_key
+    assert await_kwargs["default_headers"]["Proxy-Authorization"] == (
+        "Bearer canary-proxy"
+    )
 
 
 def test_litellm_factory_forwards_default_model_args(
