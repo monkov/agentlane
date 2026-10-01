@@ -8,9 +8,15 @@ Parameters:
 2. `offset: int | None = None`
 3. `limit: int | None = None`
 
+At construction, pass `reader=` to read from application storage. The native
+schema, text limits, and result format stay the same. The reader receives
+relative POSIX paths; `cwd` defaults to its root (`.`). Omit `reader` for local
+files. See [File I/O adapters](filesystem.md) for the stream contract and example.
+
 ## Permissions
 
-`read` resolves `path` through `ToolPathResolver` and checks
+For local files, `read` resolves `path` through `ToolPathResolver`. An injected
+reader uses relative storage paths. Both modes check
 `ToolOperation.READ_FILE` before opening the file. A denied request returns:
 
 ```text

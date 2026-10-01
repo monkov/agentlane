@@ -265,6 +265,8 @@ def test_read_tool_sanitizes_os_error_text(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    (tmp_path / "notes.txt").write_text("content", encoding="utf-8")
+
     def raise_os_error(
         self: Path,
         *args: object,
