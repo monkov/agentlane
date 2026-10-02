@@ -201,6 +201,16 @@ Cleanup continues in owned background tasks; another `aclose()` call waits
 for the same cleanup with a new timeout. `manager.closed` means the manager
 rejects new work. It does not mean all transports have finished closing.
 
+At run cleanup, a shim with its own manager calls `aclose()` directly. A shim
+with a shared manager releases its run leases concurrently and leaves the
+manager open. If the last lease closes a failed or incomplete connection,
+`shutdown_timeout_seconds` also bounds that release wait. A timeout raises
+`MCPShutdownTimeoutError` while the connection cleanup continues.
+
+The harness reports cleanup failures in an exception group. If connection
+setup or the run has already failed or was cancelled, cleanup failures do not
+replace that original error or cancellation.
+
 The connection cleanup deadline also covers credential lookup during HTTP
 session termination. Stdio cleanup can continue beyond that deadline while
 the SDK completes its bounded graceful-exit and forced-kill stages. Closing

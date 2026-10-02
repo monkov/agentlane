@@ -245,7 +245,15 @@ class MCPClientLease:
                 ),
                 name=f"agentlane-mcp-release-{self.server.name}",
             )
+            self._release_task.add_done_callback(_consume_release_task_result)
         await asyncio.shield(self._release_task)
+
+
+def _consume_release_task_result(task: asyncio.Task[None]) -> None:
+    """Observe cleanup errors even when the lease caller is cancelled."""
+    if task.cancelled():
+        return
+    _ = task.exception()
 
 
 class MCPClientManager:
@@ -310,8 +318,11 @@ class MCPClientManager:
         lease = MCPClientLease(self, entry)
         try:
             await self._connection(entry)
-        except BaseException:
-            await lease.release()
+        except BaseException as exc:
+            try:
+                await lease.release()
+            except BaseException:
+                exc.add_note("MCP connection cleanup also failed.")
             raise
         return lease
 
@@ -385,7 +396,15 @@ class MCPClientManager:
                 else:
                     self._schedule_idle_locked(entry)
         if retirement is not None:
-            await asyncio.shield(retirement)
+            _, pending = await asyncio.wait(
+                (retirement,), timeout=self._limits.shutdown_timeout_seconds
+            )
+            if pending:
+                # Keep the owned retirement alive to finish SDK process reaping.
+                raise MCPShutdownTimeoutError(
+                    "MCP shutdown timed out; connection cleanup is still in progress."
+                )
+            await retirement
 
     async def _call_finished(self, entry: _PoolEntry) -> None:
         async with self._lock:

@@ -174,18 +174,31 @@ class _BoundMCPToolsShim(BoundShim):
         sources, self.sources = self.sources, ()
         self.tools = ()
         errors: list[BaseException] = []
-        for source in sources:
-            if source.lease is None:
-                continue
-            try:
-                await source.lease.release()
-            except BaseException as exc:
-                errors.append(exc)
         if self.owns_manager:
             try:
                 await self.manager.aclose()
             except BaseException as exc:
                 errors.append(exc)
+        else:
+            try:
+                # Start every release even if cancellation reaches the batch
+                # before its lease coroutines get their first event-loop turn.
+                results = await asyncio.shield(
+                    asyncio.gather(
+                        *(
+                            source.lease.release()
+                            for source in sources
+                            if source.lease is not None
+                        ),
+                        return_exceptions=True,
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            else:
+                errors.extend(
+                    result for result in results if isinstance(result, BaseException)
+                )
         if errors:
             raise BaseExceptionGroup("MCP resource cleanup failed.", errors)
 
