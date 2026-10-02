@@ -6,6 +6,8 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import cast
 
+import structlog
+
 from ._auth import MCPAuthorizationState, product_bearer_auth, record_http_failure
 from ._errors import (
     MCPAuthorizationError,
@@ -23,10 +25,13 @@ from ._sdk import (
 )
 from ._types import (
     MCPAuthorizationContext,
+    MCPCatalog,
     MCPServer,
     MCPStreamableHTTPTransport,
 )
 from ._validation import validate_redirect
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -41,6 +46,8 @@ class MCPConnection:
     owner_task: asyncio.Task[None] | None = None
     close_task: asyncio.Task[None] | None = None
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    catalog: MCPCatalog | None = None
+    catalog_revision: int = 0
     catalog_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     active_calls: set[asyncio.Task[object]] = field(
         default_factory=set[asyncio.Task[object]]
@@ -77,6 +84,7 @@ async def _own_connection(
     connection: MCPConnection, shutdown: MCPShutdownScope
 ) -> None:
     """Enter and exit every SDK context in one task, even during cancellation."""
+    listener: asyncio.Task[None] | None = None
     operation: MCPOperation | None = None
     stack = AsyncExitStack()
     try:
@@ -88,6 +96,11 @@ async def _own_connection(
 
                 async def message_handler(message: object) -> None:
                     if (
+                        getattr(message, "method", None)
+                        == "notifications/tools/list_changed"
+                    ):
+                        connection.catalog_revision += 1
+                    elif (
                         isinstance(message, Exception)
                         and exception_kind(message) == "transport"
                     ):
@@ -145,6 +158,10 @@ async def _own_connection(
                 connection.protocol_version = cast(
                     str | None, sdk_client.session.protocol_version
                 )
+            listener = asyncio.create_task(
+                _listen_for_tool_changes(connection),
+                name=f"agentlane-mcp-listen-{server.name}",
+            )
             connection.ready.set_result(None)
             await connection.stop_event.wait()
     except BaseException as exc:
@@ -180,6 +197,9 @@ async def _own_connection(
             asyncio.get_running_loop().time() + connection.shutdown_timeout_seconds
         )
         try:
+            if listener is not None:
+                listener.cancel()
+                await asyncio.gather(listener, return_exceptions=True)
             calls = tuple(connection.active_calls)
             for call in calls:
                 call.cancel()
@@ -212,3 +232,21 @@ async def _finish_close(connection: MCPConnection) -> None:
             MCPError("MCP connection startup was cancelled.")
         )
         connection.ready.exception()
+
+
+async def _listen_for_tool_changes(connection: MCPConnection) -> None:
+    try:
+        async with connection.get_client().listen(
+            tools_list_changed=True
+        ) as subscription:
+            async for _event in subscription:
+                connection.catalog_revision += 1
+    except Exception as exc:
+        if exception_kind(exc) == "transport":
+            connection.failed = True
+        elif type(exc).__name__ != "ListenNotSupportedError":
+            logger.debug(
+                "mcp_subscription_ended",
+                server=connection.server.name,
+                status="unavailable",
+            )
