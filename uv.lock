@@ -35,6 +35,7 @@ all = [
     { name = "braintrust" },
     { name = "claude-agent-sdk" },
     { name = "litellm" },
+    { name = "mcp" },
 ]
 braintrust = [
     { name = "braintrust" },
@@ -45,11 +46,15 @@ claude-agent-sdk = [
 litellm = [
     { name = "litellm" },
 ]
+mcp = [
+    { name = "mcp" },
+]
 
 [package.dev-dependencies]
 dev = [
     { name = "black" },
     { name = "isort" },
+    { name = "mcp" },
     { name = "mypy" },
     { name = "pyright" },
     { name = "pytest" },
@@ -74,6 +79,8 @@ requires-dist = [
     { name = "litellm", marker = "extra == 'all'", specifier = ">=1.71.1" },
     { name = "litellm", marker = "extra == 'litellm'", specifier = ">=1.71.1" },
     { name = "llm-patch-tool", specifier = ">=0.1.0" },
+    { name = "mcp", marker = "extra == 'all'", specifier = ">=2,<3" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2,<3" },
     { name = "openai", specifier = ">=1.68.2" },
     { name = "pathspec", specifier = ">=1.0.4,<2.0.0" },
     { name = "protobuf", specifier = ">=5.29.0,<6.0.0" },
@@ -89,12 +96,13 @@ requires-dist = [
     { name = "typing-extensions", specifier = ">=4.12.0" },
     { name = "wcmatch", specifier = ">=10.1,<11.0" },
 ]
-provides-extras = ["braintrust", "claude-agent-sdk", "litellm", "openai", "all"]
+provides-extras = ["braintrust", "claude-agent-sdk", "litellm", "openai", "all", "mcp"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "black", specifier = "==26.1.0" },
     { name = "isort", specifier = "==7.0.0" },
+    { name = "mcp", specifier = ">=2,<3" },
     { name = "mypy" },
     { name = "pyright", specifier = ">=1.1.408" },
     { name = "pytest", specifier = ">=8.2" },

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added `agentlane[mcp]` with Streamable HTTP and stdio servers, native tools,
+  and application-managed bearer authorization through `MCPToolsShim`.
 - Added `ToolSpec.strict` for schema handling and `Tool.retry_on_timeout` for
   per-tool timeout retry control.
 - Added `PreparedTurn.add_tools(...)`, persistent tool exclusions, and
@@ -19,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject a tool request if its authorization changes between discovery and the
+  first HTTP send.
 - Clean up started shims after partial startup, continue later cleanup after a
   callback fails, and preserve the primary startup or run error.
 - Apply tool exclusions and execution budgets after all shim contributions,
