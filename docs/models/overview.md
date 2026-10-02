@@ -71,9 +71,9 @@ schema mode. Set `strict=False` to preserve optional fields and open objects
 in inferred schemas. An explicit `parameters_schema` is passed through
 unchanged; adapters receive the strictness setting with the tool definition.
 
-`Tool.retry_on_timeout` defaults to `True`. Set it to `False` for a tool that
-must not be repeated after a timeout, even when `Tools.tool_call_max_retries`
-allows retries.
+`Tool.retry_on_timeout` defaults to `True`. Set it to `False` to disable
+automatic timeout retries in `ToolExecutor`, even when
+`Tools.tool_call_max_retries` allows retries.
 
 ### Wrapping And Copying Tools
 
