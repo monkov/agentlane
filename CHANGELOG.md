@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `ToolSpec.strict` for schema handling and `Tool.retry_on_timeout` for
+  per-tool timeout retry control.
+
 ## [0.16.0] - 2026-10-01
 
 AgentLane `0.16.0` adds file I/O adapters for native tools and skills, combines local and remote skill roots through one reader, and removes known credentials from LiteLLM request debug logs.
