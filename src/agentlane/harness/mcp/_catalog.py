@@ -20,14 +20,15 @@ logger = structlog.get_logger(__name__)
 
 async def get_catalog(connection: MCPConnection) -> MCPCatalog:
     """Fetch every page without retaining a previous discovery result."""
-    async with connection.catalog_lock:
-        started_at = time.monotonic()
-        with mcp_operation() as operation:
-            try:
-                snapshot = await asyncio.wait_for(
-                    _discover_catalog(connection, operation),
-                    timeout=connection.server.discovery_timeout_seconds,
-                )
+    started_at = time.monotonic()
+    with mcp_operation() as operation:
+        try:
+            # Lock contention and all discovery attempts share one deadline.
+            async with (
+                asyncio.timeout(connection.server.discovery_timeout_seconds),
+                connection.catalog_lock,
+            ):
+                snapshot = await _discover_catalog(connection, operation)
                 if (
                     snapshot.authorization_generation
                     != connection.authorization.generation
@@ -35,28 +36,28 @@ async def get_catalog(connection: MCPConnection) -> MCPCatalog:
                     raise MCPAuthorizationError(
                         "MCP authorization changed during discovery."
                     )
-            except Exception as exc:
-                failure_kind = operation.failure_kind or exception_kind(exc)
-                if failure_kind == "authorization":
-                    connection.authorization.reject()
-                    raise MCPAuthorizationError(
-                        f"Authorization failed for MCP server {connection.server.name!r}."
-                    ) from None
-                if failure_kind == "transport":
-                    connection.failed = True
-                    raise ConnectionError("MCP discovery transport failed.") from None
-                raise
-            finally:
-                connection.secrets.update(operation.secrets)
-        logger.info(
-            "mcp_catalog_discovered",
-            server=connection.server.name,
-            tool_count=len(snapshot.tools),
-            duration=time.monotonic() - started_at,
-            protocol_version=connection.protocol_version,
-            status="ok",
-        )
-        return snapshot
+        except Exception as exc:
+            failure_kind = operation.failure_kind or exception_kind(exc)
+            if failure_kind == "authorization":
+                connection.authorization.reject()
+                raise MCPAuthorizationError(
+                    f"Authorization failed for MCP server {connection.server.name!r}."
+                ) from None
+            if failure_kind == "transport":
+                connection.failed = True
+                raise ConnectionError("MCP discovery transport failed.") from None
+            raise
+        finally:
+            connection.secrets.update(operation.secrets)
+    logger.info(
+        "mcp_catalog_discovered",
+        server=connection.server.name,
+        tool_count=len(snapshot.tools),
+        duration=time.monotonic() - started_at,
+        protocol_version=connection.protocol_version,
+        status="ok",
+    )
+    return snapshot
 
 
 class _AuthorizationChanged(Exception):

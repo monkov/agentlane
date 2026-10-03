@@ -183,6 +183,11 @@ handshake for both transports. `MCPStreamableHTTPTransport` also has
 operations. These configured timeout values must be finite and greater
 than zero.
 
+`discovery_timeout_seconds` covers waiting for another catalog discovery,
+fetching all pages, and any discovery restart. The initial credential check has
+its own limit of `discovery_timeout_seconds`. Connection startup uses the
+separate `connect_timeout_seconds` limit.
+
 ## Inheritance and tool policies
 
 `INHERIT_TOOLS`, `RESTRICT_TOOLS`, `OVERRIDE_TOOLS`, and `ExcludeToolsShim` use
