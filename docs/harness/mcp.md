@@ -207,8 +207,10 @@ There are no background retry attempts. Authorization, configuration, and
 protocol failures disable retries for that server for the current run.
 Failures during tool execution return `ToolFailure`.
 
-A lost connection is reopened at the next catalog check. AgentLane does not
-replay a tool call after a transport failure or timeout. Manager shutdown
+A lost connection is reopened at the next catalog check. A lost notification
+subscription causes the next catalog check to reopen the connection, fetch the
+catalog, and restore the subscription. AgentLane does not replay a tool call
+after a transport failure or timeout. Manager shutdown
 cancels active work and closes connections concurrently. The configured
 shutdown timeout bounds each `aclose()` wait. If cleanup is still in progress,
 `aclose()` raises `MCPShutdownTimeoutError` from `agentlane.harness.mcp`.

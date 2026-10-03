@@ -87,6 +87,7 @@ class MCPDependencies:
     client: Any
     stdio: Any
     streamable_http: Any
+    subscriptions: Any
     http: Any
     types: Any
     modern_protocol_versions: tuple[str, ...]
@@ -100,6 +101,7 @@ def load_mcp_dependencies() -> MCPDependencies:
             client=import_module("mcp").Client,
             stdio=import_module("mcp.client.stdio"),
             streamable_http=import_module("mcp.client.streamable_http"),
+            subscriptions=import_module("mcp.client.subscriptions"),
             http=import_module("httpx2"),
             types=import_module("mcp.types"),
             modern_protocol_versions=import_module(
@@ -144,7 +146,12 @@ def exception_kind(exc: BaseException) -> MCPFailureKind:
     if type(exc).__module__.startswith(("httpx2", "anyio")) or isinstance(exc, OSError):
         return MCPFailureKind.TRANSPORT
     if type(exc).__module__.startswith("mcp"):
-        types = load_mcp_dependencies().types
+        sdk = load_mcp_dependencies()
+        # A lost subscription requires a fresh catalog and notification stream.
+        if isinstance(exc, sdk.subscriptions.SubscriptionLost):
+            return MCPFailureKind.TRANSPORT
+
+        types = sdk.types
         code = getattr(exc, "code", None)
         if code == types.CONNECTION_CLOSED:
             return MCPFailureKind.TRANSPORT
