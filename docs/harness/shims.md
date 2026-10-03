@@ -223,7 +223,18 @@ The normal mutation points are:
 `RunResult | None` and the same `transient_state`, and runs once after the
 last turn. It also runs if that session's `on_run_start(...)` began but did not
 finish. Cleanup follows shim order and continues if one callback fails. A
-cleanup failure does not replace the original startup or run error.
+cleanup failure does not replace the original startup or run error or
+cancellation.
+
+Cancelling the run's `CancellationToken` interrupts awaited shim startup and
+turn preparation. Cleanup still runs for each session whose startup began.
+The cancelled run token does not interrupt cleanup, so teardown callbacks can
+await resource release.
+
+If there is no earlier error or cancellation, cancellation during cleanup
+is propagated as cancellation. Other cleanup failures are reported together
+in an exception group. See [run cancellation](./runner.md#stream-cancellation-and-closure)
+for the public result conventions.
 
 ## Minimal Example
 

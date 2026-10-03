@@ -45,7 +45,11 @@ from agentlane.models.run import DefaultRunContext
 from agentlane.runtime import CancellationToken, RuntimeEngine
 from agentlane.tracing import Span, generation_span
 
-from ._cancellation import cancel_task_callback
+from ._cancellation import (
+    cancel_task_callback,
+    cancellation_scope,
+    raise_cleanup_errors,
+)
 from ._events import (
     RunEventEmitter,
     RunEventStream,
@@ -419,7 +423,8 @@ class Runner:
         try:
             await hooks.on_agent_start(agent, state)
             if shim_manager is not None:
-                await shim_manager.on_run_start(state, transient_state)
+                async with cancellation_scope(cancellation_token):
+                    await shim_manager.on_run_start(state, transient_state)
             if run_events is not None:
                 run_events.state_snapshot(RunStateSnapshotBoundary.RUN_START, state)
             # One generation span scopes the entire agent run: every model call
@@ -438,7 +443,8 @@ class Runner:
                         transient_state=transient_state,
                     )
                     if shim_manager is not None:
-                        await shim_manager.prepare_turn(prepared_turn)
+                        async with cancellation_scope(cancellation_token):
+                            await shim_manager.prepare_turn(prepared_turn)
                     if prepared_turn.tools is not None:
                         prepared_turn.tools = _limit_tools(
                             prepared_turn.tools, tool_call_counts, tool_round_trips
@@ -565,7 +571,8 @@ class Runner:
                 cleanup_errors.append(exc)
             if cleanup_errors:
                 if run_error is None:
-                    raise BaseExceptionGroup("Run cleanup failed.", cleanup_errors)
+                    raise_cleanup_errors("Run cleanup failed.", cleanup_errors)
+
                 LOGGER.warning(
                     "Run cleanup failed after a run error",
                     error_types=[type(error).__name__ for error in cleanup_errors],

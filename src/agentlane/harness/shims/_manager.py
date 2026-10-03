@@ -6,6 +6,7 @@ from typing import Any, Self
 from agentlane.models import MessageDict, ModelResponse
 from agentlane.models.run import RunContext
 
+from .._cancellation import raise_cleanup_errors
 from .._hooks import RunnerHooks
 from .._run import RunResult, RunState
 from ._base import BoundShim, Shim
@@ -98,8 +99,9 @@ class BoundShimManager:
                 await session.on_run_end(result, transient_state)
             except BaseException as exc:
                 errors.append(exc)
+
         if errors:
-            raise BaseExceptionGroup("Shim cleanup failed.", errors)
+            raise_cleanup_errors("Shim cleanup failed.", errors)
 
 
 def _collect_runner_hooks(
