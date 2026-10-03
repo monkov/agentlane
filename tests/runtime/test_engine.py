@@ -365,6 +365,121 @@ def test_per_agent_ordering_for_stateful_handler() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("cancel_task", [False, True])
+def test_delivery_cancellation_keeps_worker_and_waits_for_cleanup(
+    cancel_task: bool,
+) -> None:
+    async def scenario() -> None:
+        runtime = SingleThreadedRuntimeEngine(worker_count=1)
+        started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        calls: list[str] = []
+
+        class CancelingAgent(_ProtocolAgentMixin):
+            @on_message
+            async def handle(self, payload: str, context: MessageContext) -> object:
+                calls.append(payload)
+                if payload == "first":
+                    started.set()
+                    try:
+                        await context.cancellation_token.wait_cancelled()
+                        if cancel_task:
+                            owner = asyncio.current_task()
+                            assert owner is not None
+                            owner.cancel()
+                            await asyncio.sleep(0)
+                        raise asyncio.CancelledError
+                    finally:
+                        cleanup_started.set()
+                        await release_cleanup.wait()
+                        calls.append("cleaned")
+
+                return payload
+
+        recipient = AgentId.from_values("canceling", "k")
+        runtime.register_instance(recipient, CancelingAgent())
+        token = CancellationToken()
+        first = asyncio.create_task(
+            runtime.send_message("first", recipient=recipient, cancellation_token=token)
+        )
+        second: asyncio.Task[DeliveryOutcome] | None = None
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            second = asyncio.create_task(
+                runtime.send_message("second", recipient=recipient)
+            )
+            token.cancel()
+            await asyncio.wait_for(cleanup_started.wait(), 1)
+            assert not first.done()
+            assert not second.done()
+            assert calls == ["first"]
+
+            release_cleanup.set()
+            first_outcome, second_outcome = await asyncio.wait_for(
+                asyncio.gather(first, second), 1
+            )
+            assert first_outcome.status == DeliveryStatus.CANCELED
+            assert second_outcome.status == DeliveryStatus.DELIVERED
+            assert calls == ["first", "cleaned", "second"]
+            assert runtime.is_running
+            await asyncio.wait_for(runtime.stop_when_idle(), 1)
+        finally:
+            release_cleanup.set()
+            await runtime.stop()
+            pending = [first] if second is None else [first, second]
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_runtime_stop_finishes_when_handler_suppresses_cancellation() -> None:
+    async def scenario() -> None:
+        runtime = SingleThreadedRuntimeEngine(worker_count=1)
+        started = asyncio.Event()
+        finished = asyncio.Event()
+
+        class SettlingAgent(_ProtocolAgentMixin):
+            @on_message
+            async def handle(self, payload: str, context: MessageContext) -> object:
+                del payload, context
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    return "settled"
+                finally:
+                    finished.set()
+
+                return None
+
+        recipient = AgentId.from_values("settling", "k")
+        runtime.register_instance(recipient, SettlingAgent())
+        sending = asyncio.create_task(
+            runtime.send_message("first", recipient=recipient)
+        )
+        queued: asyncio.Task[DeliveryOutcome] | None = None
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            queued = asyncio.create_task(
+                runtime.send_message("second", recipient=recipient)
+            )
+            await asyncio.sleep(0)
+            await asyncio.wait_for(runtime.stop(), 1)
+            outcome = await asyncio.wait_for(sending, 1)
+            queued_outcome = await asyncio.wait_for(queued, 1)
+            assert outcome.status == DeliveryStatus.CANCELED
+            assert queued_outcome.status == DeliveryStatus.CANCELED
+            assert finished.is_set()
+            assert not runtime.is_running
+        finally:
+            await runtime.stop()
+            pending = [sending] if queued is None else [sending, queued]
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_stop_cancels_inflight_and_queued_deliveries() -> None:
     async def scenario() -> None:
         runtime = SingleThreadedRuntimeEngine()

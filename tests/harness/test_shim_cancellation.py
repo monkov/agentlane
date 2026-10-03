@@ -255,6 +255,50 @@ async def _assert_no_task_leaks(before: set[asyncio.Task[Any]]) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["start", "prepare"])
+async def test_shared_runtime_reuses_worker_after_shim_token_cancellation(
+    phase: _WaitPhase,
+) -> None:
+    before = asyncio.all_tasks()
+    runtime = SingleThreadedRuntimeEngine(worker_count=1)
+    calls: list[str] = []
+    shim = _ContextShim(calls, wait_at=phase)
+    model = SequenceModel([make_assistant_response("recovered")])
+    agent = DefaultAgent(
+        runtime=runtime,
+        descriptor=AgentDescriptor(name="fixture", model=model, shims=(shim,)),
+    )
+    await runtime.start()
+    try:
+        # Reuse the same worker after each cancellation, including its cleanup.
+        for _ in range(2):
+            shim.entered.clear()
+            token = CancellationToken()
+            task = asyncio.create_task(agent.run("cancel", cancellation_token=token))
+            try:
+                await asyncio.wait_for(shim.entered.wait(), 1)
+                token.cancel()
+                await _assert_cancelled(task, "run")
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+            assert runtime.is_running
+            assert agent.run_state is None
+            assert not model.calls
+
+        shim.release.set()
+        result = await asyncio.wait_for(agent.run("retry"), 1)
+        assert result.final_output == "recovered"
+        assert calls.count("context:end") == 3
+        assert shim.values[-1] == "unset"
+    finally:
+        await runtime.stop()
+
+    await _assert_no_task_leaks(before)
+
+
+@pytest.mark.asyncio
 async def test_runtime_stop_during_shim_cleanup_resolves_cancelled_delivery() -> None:
     before = asyncio.all_tasks()
     runtime = SingleThreadedRuntimeEngine()

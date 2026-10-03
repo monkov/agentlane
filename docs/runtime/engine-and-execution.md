@@ -115,6 +115,11 @@ the handler as `context.cancellation_token`:
 3. forward `context.cancellation_token` to nested outbound sends so one cancel
    propagates down a call chain
 
+Cancelling a delivery leaves runtime workers available for later deliveries.
+The runtime waits for the delivery's cleanup before it starts the next delivery
+for that recipient. Runtime shutdown still cancels workers and their active
+deliveries.
+
 In distributed mode the token is not propagated across the process boundary, so
 cooperative cancellation applies within the worker that runs the delivery.
 
