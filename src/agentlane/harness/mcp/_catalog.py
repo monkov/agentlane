@@ -18,11 +18,17 @@ from ._types import MCPCatalog, MCPRemoteTool
 logger = structlog.get_logger(__name__)
 
 
-async def get_catalog(connection: MCPConnection) -> MCPCatalog:
+async def get_catalog(
+    connection: MCPConnection, *, expected_authorization_generation: int
+) -> MCPCatalog:
     """Get a shared fresh catalog; stale fallback belongs to each lease."""
     async with connection.catalog_lock:
         if _catalog_is_fresh(connection):
-            return cast(MCPCatalog, connection.catalog)
+            cached = cast(MCPCatalog, connection.catalog)
+            if cached.authorization_generation == expected_authorization_generation:
+                return cached
+            # Another lease may have changed authorization while this caller
+            # waited. Rediscover with this caller's context before publication.
         started_at = time.monotonic()
         with mcp_operation() as operation:
             try:

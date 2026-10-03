@@ -37,7 +37,8 @@ logger = structlog.get_logger(__name__)
 @dataclass(slots=True)
 class MCPConnection:
     server: MCPServer
-    context: MCPAuthorizationContext
+    lifecycle_context: MCPAuthorizationContext
+    """Full context of the lease that opened this transport generation."""
     ready: asyncio.Future[None]
     authorization: MCPAuthorizationState = field(default_factory=MCPAuthorizationState)
     client: MCPClientProtocol | None = None
@@ -88,7 +89,9 @@ async def _own_connection(
     operation: MCPOperation | None = None
     stack = AsyncExitStack()
     try:
-        with mcp_operation() as operation:
+        with mcp_operation(
+            authorization_context=connection.lifecycle_context
+        ) as operation:
             operation.secrets = connection.secrets
             async with asyncio.timeout(connection.server.connect_timeout_seconds):
                 sdk = load_mcp_dependencies()
@@ -114,7 +117,7 @@ async def _own_connection(
                                 product_bearer_auth(
                                     sdk.http,
                                     server,
-                                    connection.context,
+                                    connection.lifecycle_context,
                                     connection.authorization,
                                 )
                                 if server.authorization is not None
@@ -208,7 +211,7 @@ async def _own_connection(
             # A native asyncio timeout defeats the SDK's bounded stdio process
             # cleanup shield. The outer AnyIO scope cancels HTTP auth on DELETE
             # but lets the SDK finish bounded process-tree termination first.
-            with mcp_operation():
+            with mcp_operation(authorization_context=connection.lifecycle_context):
                 await stack.aclose()
 
 
@@ -235,18 +238,19 @@ async def _finish_close(connection: MCPConnection) -> None:
 
 
 async def _listen_for_tool_changes(connection: MCPConnection) -> None:
-    try:
-        async with connection.get_client().listen(
-            tools_list_changed=True
-        ) as subscription:
-            async for _event in subscription:
-                connection.catalog_revision += 1
-    except Exception as exc:
-        if exception_kind(exc) == "transport":
-            connection.failed = True
-        elif type(exc).__name__ != "ListenNotSupportedError":
-            logger.debug(
-                "mcp_subscription_ended",
-                server=connection.server.name,
-                status="unavailable",
-            )
+    with mcp_operation(authorization_context=connection.lifecycle_context):
+        try:
+            async with connection.get_client().listen(
+                tools_list_changed=True
+            ) as subscription:
+                async for _event in subscription:
+                    connection.catalog_revision += 1
+        except Exception as exc:
+            if exception_kind(exc) == "transport":
+                connection.failed = True
+            elif type(exc).__name__ != "ListenNotSupportedError":
+                logger.debug(
+                    "mcp_subscription_ended",
+                    server=connection.server.name,
+                    status="unavailable",
+                )

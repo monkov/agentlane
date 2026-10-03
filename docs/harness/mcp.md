@@ -114,6 +114,13 @@ authorized user or connection. Different keys isolate connections and cached
 catalogs. The optional `value` is opaque application data passed to the
 provider. Both the provider and context value stay in memory.
 
+Each run lease retains its full authorization context. Discovery, tool calls,
+and their `401` invalidation and retry use that lease's context, including
+when another lease shares the same key with a different value. Connection
+startup, the background tool-change listener, and HTTP session termination
+use the full context of the lease that opened the current connection. A new
+connection records the context of its opener again.
+
 Before each HTTP request and catalog check, AgentLane asks for a current token.
 The provider should reuse a valid token until refresh is needed. A changed token
 or set of scopes invalidates the cached catalog. On `401`, AgentLane invalidates
@@ -152,8 +159,12 @@ closes idle connections after the idle timeout. When the pool is full, it
 first closes the least recently used idle connection. It does not evict a
 connection with a run lease or work in progress. If no connection can be
 evicted, acquisition raises `MCPPoolCapacityError` from
-`agentlane.harness.mcp`. Connection acquisition and leases are internal;
-applications configure the manager and pass it to a shim.
+`agentlane.harness.mcp`. All eviction waits in one acquisition share one
+`shutdown_timeout_seconds` deadline. If cleanup cannot free capacity before
+that deadline, acquisition raises `MCPPoolCapacityError`; cleanup continues
+and keeps its capacity reserved until it finishes. Connection acquisition
+and leases are internal; applications configure the manager and pass it to
+a shim.
 
 The shim checks catalogs at startup and before each model turn. A fresh catalog
 needs no `tools/list` request. The `max_concurrent_discoveries` parameter on
@@ -167,6 +178,10 @@ caps that lifetime and supplies the fallback when hints are absent or the server
 uses an older protocol. Server TTL hints are also capped at 24 hours.
 Catalogs stay private to the authorization context, including those marked
 `cacheScope="public"` by the server.
+
+Each run receives separate copies of the tool input schemas, including nested
+objects and lists. Changes to a run's schemas do not change the cached catalog
+or another run's schemas.
 
 A tool-list change notification, expiry, or authorization change refreshes the
 tools on the next check, including additions and removals. If returned pages

@@ -49,7 +49,6 @@ class MCPConnectionKey:
 class _PoolEntry:
     key: MCPConnectionKey
     server: MCPServer
-    context: MCPAuthorizationContext
     authorization: MCPAuthorizationState = field(default_factory=MCPAuthorizationState)
     connection: MCPConnection | None = None
     connection_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -66,7 +65,9 @@ class _LeaseManager(Protocol):
     @property
     def closed(self) -> bool: ...
 
-    async def _connection(self, entry: _PoolEntry) -> MCPConnection: ...
+    async def _connection(
+        self, entry: _PoolEntry, *, authorization_context: MCPAuthorizationContext
+    ) -> MCPConnection: ...
 
     async def _release(self, entry: _PoolEntry) -> None: ...
 
@@ -76,9 +77,15 @@ class _LeaseManager(Protocol):
 class MCPClientLease:
     """One run's access to a managed connection and last good catalog."""
 
-    def __init__(self, manager: _LeaseManager, entry: _PoolEntry) -> None:
+    def __init__(
+        self,
+        manager: _LeaseManager,
+        entry: _PoolEntry,
+        authorization_context: MCPAuthorizationContext,
+    ) -> None:
         self._manager = manager
         self._entry = entry
+        self._authorization_context = authorization_context
         self._released = False
         self._release_task: asyncio.Task[None] | None = None
         self._catalog: MCPCatalog | None = None
@@ -122,57 +129,60 @@ class MCPClientLease:
             )
 
     async def _tools(self) -> MCPCatalog:
-        try:
-            # Validate credentials even when reconnecting. A failed open must
-            # never restore a catalog from a previous authorization generation.
-            with mcp_operation():
-                try:
-                    await asyncio.wait_for(
-                        self._entry.authorization.get_token(
-                            self.server, self._entry.context
-                        ),
-                        timeout=self.server.discovery_timeout_seconds,
-                    )
-                except TimeoutError:
-                    self._entry.authorization.reject()
-                    raise MCPAuthorizationError(
-                        "MCP authorization timed out."
-                    ) from None
-            connection = (
-                await self._manager._connection(  # pyright: ignore[reportPrivateUsage]
-                    self._entry
+        with mcp_operation(authorization_context=self._authorization_context):
+            try:
+                # Validate credentials even when reconnecting. A failed open must
+                # never restore a catalog from a previous authorization generation.
+                with mcp_operation() as operation:
+                    try:
+                        await asyncio.wait_for(
+                            self._entry.authorization.get_token(
+                                self.server, self._authorization_context
+                            ),
+                            timeout=self.server.discovery_timeout_seconds,
+                        )
+                    except TimeoutError:
+                        self._entry.authorization.reject()
+                        raise MCPAuthorizationError(
+                            "MCP authorization timed out."
+                        ) from None
+                    assert operation.authorization_generation is not None
+                    generation = operation.authorization_generation
+                connection = await self._manager._connection(  # pyright: ignore[reportPrivateUsage]
+                    self._entry, authorization_context=self._authorization_context
                 )
-            )
-            catalog = await get_catalog(connection)
-        except MCPAuthorizationError:
-            self._catalog = None
-            raise
-        except Exception as exc:
-            if isinstance(exc, MCPDiscoveryError) and not exc.retryable:
+                catalog = await get_catalog(
+                    connection, expected_authorization_generation=generation
+                )
+            except MCPAuthorizationError:
                 self._catalog = None
                 raise
-            failure_kind = exception_kind(exc)
-            if (
-                self._catalog is None
-                or self._manager.closed
-                or self._catalog.authorization_generation
-                != self._entry.authorization.generation
-                or failure_kind not in {"transport", "timeout"}
-            ):
-                raise MCPDiscoveryError(
-                    f"Could not discover tools from MCP server {self.server.name!r}.",
+            except Exception as exc:
+                if isinstance(exc, MCPDiscoveryError) and not exc.retryable:
+                    self._catalog = None
+                    raise
+                failure_kind = exception_kind(exc)
+                if (
+                    self._catalog is None
+                    or self._manager.closed
+                    or self._catalog.authorization_generation
+                    != self._entry.authorization.generation
+                    or failure_kind not in {"transport", "timeout"}
+                ):
+                    raise MCPDiscoveryError(
+                        f"Could not discover tools from MCP server {self.server.name!r}.",
+                        failure_kind=failure_kind,
+                    ) from None
+                logger.warning(
+                    "mcp_catalog_refresh_failed",
+                    server=self.server.name,
+                    status="stale",
                     failure_kind=failure_kind,
-                ) from None
-            logger.warning(
-                "mcp_catalog_refresh_failed",
-                server=self.server.name,
-                status="stale",
-                failure_kind=failure_kind,
-            )
-            return self._catalog
+                )
+                return self._catalog
 
-        self._catalog = catalog
-        return catalog
+            self._catalog = catalog
+            return catalog
 
     async def _call_tool(
         self,
@@ -181,60 +191,65 @@ class MCPClientLease:
         arguments: dict[str, Any],
         token: CancellationToken,
     ) -> str | ToolFailure:
-        if token.is_cancelled:
-            return tool_failure("MCP tool call was cancelled.", "cancelled")
-        if self._released or self._manager.closed:
-            return tool_failure("MCP connection is unavailable.", "mcp_transport")
-        if generation != self._entry.authorization.generation:
-            return tool_failure(
-                "MCP authorization changed after discovery.", "mcp_authorization"
-            )
-
-        self._entry.calls += 1
-        deadline = asyncio.get_running_loop().time() + self.server.tool_timeout_seconds
-        try:
-            # Resolve the live generation once before dispatch. Never replay a
-            # call after its request may have reached a remote side-effect.
-            try:
-                opening = asyncio.create_task(
-                    self._manager._connection(  # pyright: ignore[reportPrivateUsage]
-                        self._entry
-                    )
-                )
-                token.link_future(opening)
-                connection = await asyncio.wait_for(
-                    opening, timeout=self.server.tool_timeout_seconds
-                )
-            except asyncio.CancelledError:
-                if token.is_cancelled:
-                    return tool_failure("MCP tool call was cancelled.", "cancelled")
-                raise
-            except Exception as exc:
-                kind = exception_kind(exc)
-                return tool_failure(
-                    f"MCP {kind} failure.",
-                    "timeout" if kind == "timeout" else f"mcp_{kind}",
-                )
+        with mcp_operation(authorization_context=self._authorization_context):
+            if token.is_cancelled:
+                return tool_failure("MCP tool call was cancelled.", "cancelled")
+            if self._released or self._manager.closed:
+                return tool_failure("MCP connection is unavailable.", "mcp_transport")
             if generation != self._entry.authorization.generation:
                 return tool_failure(
                     "MCP authorization changed after discovery.", "mcp_authorization"
                 )
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return tool_failure("MCP timeout failure.", "timeout")
-            return await call_tool(
-                connection,
-                name,
-                arguments,
-                token,
-                lambda: self._manager.closed,
-                remaining,
+
+            self._entry.calls += 1
+            deadline = (
+                asyncio.get_running_loop().time() + self.server.tool_timeout_seconds
             )
-        finally:
-            self._entry.calls -= 1
-            await self._manager._call_finished(  # pyright: ignore[reportPrivateUsage]
-                self._entry
-            )
+            try:
+                # Resolve the live generation once before dispatch. Never replay a
+                # call after its request may have reached a remote side-effect.
+                try:
+                    opening = asyncio.create_task(
+                        self._manager._connection(  # pyright: ignore[reportPrivateUsage]
+                            self._entry,
+                            authorization_context=self._authorization_context,
+                        )
+                    )
+                    token.link_future(opening)
+                    connection = await asyncio.wait_for(
+                        opening, timeout=self.server.tool_timeout_seconds
+                    )
+                except asyncio.CancelledError:
+                    if token.is_cancelled:
+                        return tool_failure("MCP tool call was cancelled.", "cancelled")
+                    raise
+                except Exception as exc:
+                    kind = exception_kind(exc)
+                    return tool_failure(
+                        f"MCP {kind} failure.",
+                        "timeout" if kind == "timeout" else f"mcp_{kind}",
+                    )
+                if generation != self._entry.authorization.generation:
+                    return tool_failure(
+                        "MCP authorization changed after discovery.",
+                        "mcp_authorization",
+                    )
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return tool_failure("MCP timeout failure.", "timeout")
+                return await call_tool(
+                    connection,
+                    name,
+                    arguments,
+                    token,
+                    lambda: self._manager.closed,
+                    remaining,
+                )
+            finally:
+                self._entry.calls -= 1
+                await self._manager._call_finished(  # pyright: ignore[reportPrivateUsage]
+                    self._entry
+                )
 
     async def release(self) -> None:
         if self._release_task is None:
@@ -282,6 +297,9 @@ class MCPClientManager:
         self, server: MCPServer, context: MCPAuthorizationContext
     ) -> MCPClientLease:
         key = _connection_key(server, context)
+        eviction_deadline = (
+            asyncio.get_running_loop().time() + self._limits.shutdown_timeout_seconds
+        )
         while True:
             retirement: asyncio.Task[None] | None = None
             async with self._lock:
@@ -300,11 +318,13 @@ class MCPClientManager:
                         ]
                         if not idle:
                             raise MCPPoolCapacityError()
+                        if asyncio.get_running_loop().time() >= eviction_deadline:
+                            raise MCPPoolCapacityError()
                         retirement = self._retire_locked(
                             min(idle, key=lambda candidate: candidate.idle_since)
                         )
                     else:
-                        entry = _PoolEntry(key=key, server=server, context=context)
+                        entry = _PoolEntry(key=key, server=server)
                         self._connections[key] = entry
                 if entry is not None:
                     entry.leases += 1
@@ -313,11 +333,14 @@ class MCPClientManager:
             if retirement is not None:
                 # A closing transport still occupies capacity. Do not start its
                 # replacement until the owner has released all SDK resources.
-                await asyncio.shield(retirement)
+                if not await _wait_for_retirements(
+                    (retirement,), deadline=eviction_deadline
+                ):
+                    raise MCPPoolCapacityError()
 
-        lease = MCPClientLease(self, entry)
+        lease = MCPClientLease(self, entry, context)
         try:
-            await self._connection(entry)
+            await self._connection(entry, authorization_context=context)
         except BaseException as exc:
             try:
                 await lease.release()
@@ -326,7 +349,9 @@ class MCPClientManager:
             raise
         return lease
 
-    async def _connection(self, entry: _PoolEntry) -> MCPConnection:
+    async def _connection(
+        self, entry: _PoolEntry, *, authorization_context: MCPAuthorizationContext
+    ) -> MCPConnection:
         async with entry.connection_lock:
             if self._closed:
                 raise MCPError("MCP client manager is closed.")
@@ -343,7 +368,7 @@ class MCPClientManager:
                     raise MCPError("MCP client manager is closed.")
                 connection = MCPConnection(
                     server=entry.server,
-                    context=entry.context,
+                    lifecycle_context=authorization_context,
                     ready=asyncio.get_running_loop().create_future(),
                     authorization=entry.authorization,
                     secrets=entry.authorization.secrets,
@@ -369,16 +394,16 @@ class MCPClientManager:
         if not retirements:
             return
 
-        completed, pending = await asyncio.wait(
-            retirements, timeout=self._limits.shutdown_timeout_seconds
-        )
-        if pending:
+        if not await _wait_for_retirements(
+            retirements,
+            deadline=asyncio.get_running_loop().time()
+            + self._limits.shutdown_timeout_seconds,
+        ):
             # Do not cancel SDK process reaping to satisfy the caller's deadline.
             # A later aclose() observes the same owned cleanup tasks.
             raise MCPShutdownTimeoutError(
                 "MCP shutdown timed out; connection cleanup is still in progress."
             )
-        await asyncio.gather(*completed)
 
     async def _release(self, entry: _PoolEntry) -> None:
         retirement: asyncio.Task[None] | None = None
@@ -396,15 +421,15 @@ class MCPClientManager:
                 else:
                     self._schedule_idle_locked(entry)
         if retirement is not None:
-            _, pending = await asyncio.wait(
-                (retirement,), timeout=self._limits.shutdown_timeout_seconds
-            )
-            if pending:
+            if not await _wait_for_retirements(
+                (retirement,),
+                deadline=asyncio.get_running_loop().time()
+                + self._limits.shutdown_timeout_seconds,
+            ):
                 # Keep the owned retirement alive to finish SDK process reaping.
                 raise MCPShutdownTimeoutError(
                     "MCP shutdown timed out; connection cleanup is still in progress."
                 )
-            await retirement
 
     async def _call_finished(self, entry: _PoolEntry) -> None:
         async with self._lock:
@@ -457,6 +482,23 @@ class MCPClientManager:
         finally:
             async with self._lock:
                 self._retiring.pop(entry, None)
+
+
+async def _wait_for_retirements(
+    tasks: tuple[asyncio.Task[None], ...], *, deadline: float
+) -> bool:
+    """Bound a caller's wait without cancelling SDK reaping or freeing capacity."""
+    if not tasks:
+        return True
+
+    completed, pending = await asyncio.wait(
+        tasks, timeout=max(0.0, deadline - asyncio.get_running_loop().time())
+    )
+    if pending:
+        return False
+
+    await asyncio.gather(*completed)
+    return True
 
 
 def _is_idle(entry: _PoolEntry) -> bool:

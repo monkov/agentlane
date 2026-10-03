@@ -255,8 +255,13 @@ async def test_authorization_change_before_discovery_publication_rejects_catalog
         )
         catalog = get_catalog
 
-        async def invalidate_after_catalog(connection: Any) -> Any:
-            snapshot = await catalog(connection)
+        async def invalidate_after_catalog(
+            connection: Any, *, expected_authorization_generation: int
+        ) -> Any:
+            snapshot = await catalog(
+                connection,
+                expected_authorization_generation=expected_authorization_generation,
+            )
             # Run after the discovery task finishes, before its caller resumes.
             asyncio.get_running_loop().call_soon(connection.authorization.reject)
             return snapshot
