@@ -66,10 +66,32 @@ class _EmptyArgs(BaseModel):
     pass
 
 
+class _FakeManager(MCPClientManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.remote_tools: dict[str, tuple[str, ...]] = {}
+        self.failures: set[str] = set()
+        self.leases: list[_FakeLease] = []
+        self.calls: list[str] = []
+
+    async def _acquire(
+        self, server: MCPServer, context: MCPAuthorizationContext
+    ) -> MCPClientLease:
+        del context
+        assert not self.closed
+        lease = _FakeLease(self, server)
+        self.leases.append(lease)
+        return lease
+
+    async def aclose(self) -> None:
+        await asyncio.gather(*(lease.release() for lease in self.leases))
+        await super().aclose()
+
+
 class _FakeLease(MCPClientLease):
     """Exercise the shim through its internal manager and lease contract."""
 
-    def __init__(self, manager: "_FakeManager", server: MCPServer) -> None:
+    def __init__(self, manager: _FakeManager, server: MCPServer) -> None:
         self.manager = manager
         self.config = server
         self.released = False
@@ -113,28 +135,6 @@ class _FakeLease(MCPClientLease):
 
     async def release(self) -> None:
         self.released = True
-
-
-class _FakeManager(MCPClientManager):
-    def __init__(self) -> None:
-        super().__init__()
-        self.remote_tools: dict[str, tuple[str, ...]] = {}
-        self.failures: set[str] = set()
-        self.leases: list[_FakeLease] = []
-        self.calls: list[str] = []
-
-    async def _acquire(
-        self, server: MCPServer, context: MCPAuthorizationContext
-    ) -> MCPClientLease:
-        del context
-        assert not self.closed
-        lease = _FakeLease(self, server)
-        self.leases.append(lease)
-        return lease
-
-    async def aclose(self) -> None:
-        await asyncio.gather(*(lease.release() for lease in self.leases))
-        await super().aclose()
 
 
 def _mcp(manager: MCPClientManager | None, *, name: str = "remote") -> MCPToolsShim:
