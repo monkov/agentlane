@@ -56,10 +56,10 @@ all = [
   "braintrust>=0.0.168",
   "claude-agent-sdk==0.2.141",
   "litellm>=1.71.1",
-  "mcp>=2,<3",
+  "mcp>=2.2,<3",
 ]
 mcp = [
-  "mcp>=2,<3",
+  "mcp>=2.2,<3",
 ]
 
 [project.urls]
@@ -118,7 +118,7 @@ dev = [
   "yamllint>=1.37.0",
   "vulture>=2.16",
   "pytest-asyncio>=1.4.0",
-  "mcp>=2,<3",
+  "mcp>=2.2,<3",
 ]
 
 [build-system]
