@@ -94,7 +94,7 @@ class BoundShim:
     ) -> tuple[ToolSourceBinding, ...] | None:
         """Return source bindings restricted to visible inherited names.
 
-        ``None`` preserves normal shim inheritance. An empty tuple suppresses
+        `None` preserves normal shim inheritance. An empty tuple suppresses
         inheritance. Returned bindings replace only their source sessions;
         the original definition and its wrappers bind again for the child.
         Sources must not expose names outside the supplied set.
