@@ -313,8 +313,8 @@ class Tool[ArgsT: BaseModel, ResultT](ToolSpec[ArgsT]):
         Args:
             **overrides: Any subset of ``Tool`` constructor keyword arguments
                 (``name``, ``description``, ``args_model``, ``handler``,
-                ``formatter``, ``parameters_schema``, ``strict``,
-                ``retry_on_timeout``).
+                ``formatter``, ``parameters_schema``, `strict`,
+                `retry_on_timeout`).
 
         Returns:
             A new ``Tool`` carrying the merged fields.
