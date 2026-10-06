@@ -83,7 +83,7 @@ Before the model activates any skill, it sees:
 1. the skills system prompt appended by `SkillsShim`,
 2. the available skill names,
 3. the skill descriptions,
-4. the `SKILL.md` paths (absolute for local files, relative for injected readers),
+4. the `SKILL.md` paths in the selected filesystem namespace,
 5. the `activate_skill` tool.
 
 If no skills are discovered, the shim does not modify the system instruction and
@@ -170,7 +170,7 @@ The harness does not hard-code the filesystem as the only source of skills.
 For a different storage backend, pass a `SkillReader` to
 `FilesystemSkillLoader`. AgentLane then retains discovery, its private
 frontmatter parser, resource listing, and activation. See
-[File I/O adapters](filesystem.md) for the contracts and composition.
+[File I/O interfaces](filesystem.md) for the contracts and composition.
 
 Use a custom `SkillLoader` when the application needs different discovery or
 loading behavior, not just different storage. For example:
@@ -260,13 +260,17 @@ Or let it include the standard local roots:
 2. `~/.agents/skills`
 
 Local `SKILL.md` paths are normalized to absolute paths. With an injected
-reader, `roots` are relative POSIX paths in its storage and default to `(".",)`.
+reader, `roots` default to `(".",)` in its storage namespace. Plain readers
+use relative POSIX paths. A reader with `FilePathResolver` normalizes roots in
+its own namespace; mounted roots and manifests use rooted virtual paths.
 `include_default_roots` is ignored for injected readers; no local home or working
 directory is inspected. Earlier roots win when skill names repeat.
 
 To combine local and remote roots, share a `MountedReader` between the loader
-and one read tool. Prefix each loader root with its mount name. See
-[Mixed local and remote readers](filesystem.md#mixed-local-and-remote-readers)
+and one read tool. Use rooted paths such as
+`roots=("/tenant/skills", "/local/skills")`. Relative mounted roots also start
+at `/`, independently of the read tool's cwd. See
+[Mixed local and remote filesystems](filesystem.md#mixed-local-and-remote-filesystems)
 for configuration and resource paths.
 
 Manifest `root` and `skill_file` use `PurePath`: local discovery returns `Path`,
@@ -284,7 +288,7 @@ to the target directory.
 
 Calls run on worker threads; configure storage timeouts and thread safety in
 the reader. See
-[File I/O adapters](filesystem.md#permissions-and-execution).
+[File I/O interfaces](filesystem.md#permissions-and-execution).
 
 ### Filesystem Parsing Policy
 
@@ -397,7 +401,7 @@ the skill root, such as `references/policy.md` or `scripts/run.py`.
 
 `SkillsShim` does not change tool path resolution. Activation renders a
 `read_path` beside each skill-relative display path. For an injected reader
-with the skill at `skills/refund-policy`, it emits:
+with a plain backend and the skill at `skills/refund-policy`, it emits:
 
 ```xml
 <skill_resources>
@@ -405,9 +409,20 @@ with the skill at `skills/refund-policy`, it emits:
 </skill_resources>
 ```
 
-Use `read_path` with a read tool that shares the loader's reader and has
-`cwd="."`. For local skills, `read_path` is absolute and works with the default
-local read tool:
+For this plain backend, use `read_path` with a read tool that shares the
+loader's reader and has `cwd="."`.
+
+A mounted loader emits a rooted path, such as
+`/local/skills/refund-policy/references/policy.md`. This path works with a
+mounted read tool from any cwd, including `/tenant/sessions/session-123`.
+References authored in the skill stay relative. The activation result gives
+the skill directory and tells the model to resolve those references from it.
+Generic file tools do not parse Markdown links or remember an active skill
+as their cwd. Reading resources from two skills leaves subsequent
+`write("notes.md")` calls relative to the tool's captured cwd.
+
+For local skills, `read_path` is absolute and works with the default local
+read tool:
 
 ```python
 from agentlane.harness.skills import (

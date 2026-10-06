@@ -7,16 +7,21 @@ Local filesystem tools use `ToolPathResolver`. Relative paths resolve against th
 as tool inputs, but workspace and path-scope policies still enforce boundaries
 on the resolved target. Paths are normalized with `Path.resolve(strict=False)`.
 
-Injected readers and writers use relative POSIX paths and place `PurePosixPath`
-values in permission requests. `WorkspaceToolPermissionPolicy` and
+Injected readers and writers place normalized logical `PurePosixPath` values
+in permission requests. Plain backends use relative paths. Backends with
+`FilePathResolver`, including mounted filesystems, define their path namespace.
+Mounted requests use rooted paths such as `/tenant/sessions/session-123/notes.md`.
+The permission check and I/O use the same resolved target. Normalize allowed
+mounted roots with `normalize_virtual_path` before containment checks.
+`WorkspaceToolPermissionPolicy` and
 `PathScopeToolPermissionPolicy` deny these non-local paths. Use a custom policy
 for the adapter's storage namespace; operation grants and approval callbacks
-remain available. See [File I/O adapters](filesystem.md).
+remain available. See [File I/O interfaces](filesystem.md).
 
 AgentLane is a framework, so first-party helpers stay permissive unless an
 application passes an explicit policy. With no `permissions=` argument,
 `read`, `find`, `grep`, `patch`, `write`, and `bash` keep their trusted local
-behavior. Injected read and write tools also allow every operation by default,
+behavior. Injected file tools also allow every operation by default,
 subject to the adapter's own access checks. A specific `cwd` only changes path
 resolution; it is not a sandbox:
 
