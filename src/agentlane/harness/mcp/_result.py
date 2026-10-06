@@ -25,7 +25,8 @@ def render_mcp_result(
         else ()
     )
     rendered_blocks = [_safe_content_block(block) for block in blocks]
-    rendered: dict[str, object] = {"content": rendered_blocks}
+    is_error = payload.get("isError", payload.get("is_error", False)) is True
+    rendered: dict[str, object] = {"content": rendered_blocks, "isError": is_error}
     structured = payload.get("structuredContent", payload.get("structured_content"))
     if policy.include_structured_content and structured is not None:
         rendered["structuredContent"] = structured
@@ -40,7 +41,6 @@ def render_mcp_result(
     }
     text = _bounded_json(limited_payload, policy.max_text_chars, source=safe_payload)
 
-    is_error = payload.get("isError", payload.get("is_error", False)) is True
     if is_error:
         return ToolFailure(
             text=text,
@@ -69,7 +69,11 @@ def _bounded_json(
     if len(_compact_json({**payload, **accounting})) <= limit:
         return _with_omission_counts(payload, source_chars, source_blocks)
     structured = payload.get("structuredContent")
-    compact: dict[str, object] = {"content": [], **accounting}
+    compact: dict[str, object] = {
+        "content": [],
+        "isError": payload["isError"],
+        **accounting,
+    }
     if structured is not None:
         compact["structuredContent"] = {"omitted": True}
     content = payload.get("content", [])
