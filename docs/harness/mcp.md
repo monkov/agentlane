@@ -184,8 +184,10 @@ objects and lists. Changes to a run's schemas do not change the cached catalog
 or another run's schemas.
 
 A tool-list change notification, expiry, or authorization change refreshes the
-tools on the next check, including additions and removals. If returned pages
-use different credentials, discovery restarts once within the same timeout.
+tools on the next check, including additions and removals. Confirmation of a
+notification subscription also invalidates catalogs whose discovery started
+before that confirmation. If returned pages use different credentials,
+discovery restarts once within the same timeout.
 Unstable authorization fails discovery without publishing a mixed catalog.
 Authorization is checked again before the first HTTP tool request. Credentials
 must still match discovery before that request is sent. The single refresh and
@@ -207,13 +209,14 @@ There are no background retry attempts. Authorization, configuration, and
 protocol failures disable retries for that server for the current run.
 Failures during tool execution return `ToolFailure`.
 
-A lost connection is reopened at the next catalog check. A lost notification
-subscription causes the next catalog check to reopen the connection, fetch the
-catalog, and restore the subscription. AgentLane does not replay a tool call
-after a transport failure or timeout. Manager shutdown
-cancels active work and closes connections concurrently. The configured
-shutdown timeout bounds each `aclose()` wait. If cleanup is still in progress,
-`aclose()` raises `MCPShutdownTimeoutError` from `agentlane.harness.mcp`.
+A lost connection is reopened at the next catalog check. If a notification
+subscription ends normally or loses its connection, the next catalog check
+reopens the connection, fetches the catalog, and restores the subscription.
+AgentLane does not replay a tool call after a transport failure or timeout.
+Manager shutdown cancels active work and closes connections concurrently.
+The configured shutdown timeout bounds each `aclose()` wait. If cleanup is
+still in progress, `aclose()` raises `MCPShutdownTimeoutError` from
+`agentlane.harness.mcp`.
 Cleanup continues in owned background tasks; another `aclose()` call waits
 for the same cleanup with a new timeout. `manager.closed` means the manager
 rejects new work. It does not mean all transports have finished closing.

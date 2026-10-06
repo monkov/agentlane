@@ -35,7 +35,11 @@ class _SubscriptionPeer:
     tool_name: str = "initial"
     list_calls: int = 0
     listen_calls: int = 0
+    listen_started: asyncio.Event = field(default_factory=asyncio.Event)
+    allow_ack: asyncio.Event = field(default_factory=asyncio.Event)
     acknowledged: asyncio.Event = field(default_factory=asyncio.Event)
+    list_started: asyncio.Event = field(default_factory=asyncio.Event)
+    allow_list: asyncio.Event = field(default_factory=asyncio.Event)
     drop: asyncio.Event = field(default_factory=asyncio.Event)
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     finish: asyncio.Event = field(default_factory=asyncio.Event)
@@ -43,17 +47,31 @@ class _SubscriptionPeer:
 
 @asynccontextmanager
 async def _subscription_peer(
-    port: int, peer: _SubscriptionPeer, *, legacy: bool = False
+    port: int,
+    peer: _SubscriptionPeer,
+    *,
+    legacy: bool = False,
+    graceful_close: bool = False,
+    delayed_ack: bool = False,
+    hold_first_page: bool = False,
 ) -> AsyncIterator[MCPServer]:
+    if not delayed_ack:
+        peer.allow_ack.set()
+    if not hold_first_page:
+        peer.allow_list.set()
+
     async def list_tools(
         context: ServerRequestContext[Any], params: types.PaginatedRequestParams | None
     ) -> types.ListToolsResult:
         del context, params
         peer.list_calls += 1
-        return types.ListToolsResult(
+        result = types.ListToolsResult(
             tools=[types.Tool(name=peer.tool_name, input_schema={"type": "object"})],
             ttl_ms=300_000,
         )
+        peer.list_started.set()
+        await peer.allow_list.wait()
+        return result
 
     async def listen(
         context: ServerRequestContext[Any],
@@ -62,6 +80,8 @@ async def _subscription_peer(
         peer.listen_calls += 1
         attempt = peer.listen_calls
         meta = {SUBSCRIPTION_ID_META_KEY: context.request_id}
+        peer.listen_started.set()
+        await peer.allow_ack.wait()
         await context.session.send_notification(
             types.SubscriptionsAcknowledgedNotification(
                 params=types.SubscriptionsAcknowledgedNotificationParams(
@@ -74,6 +94,9 @@ async def _subscription_peer(
 
         if attempt == 1:
             await peer.drop.wait()
+            if graceful_close:
+                return types.SubscriptionsListenResult(_meta=meta)
+
             raise MCPError(types.CONNECTION_CLOSED, "Subscription transport closed.")
 
         await peer.changed.wait()
@@ -124,6 +147,8 @@ async def _subscription_peer(
                 ),
             )
         finally:
+            peer.allow_ack.set()
+            peer.allow_list.set()
             peer.drop.set()
             peer.changed.set()
             peer.finish.set()
@@ -135,13 +160,25 @@ def _connection(lease: mcp_client.MCPClientLease) -> mcp_connection.MCPConnectio
     return connection
 
 
+async def _wait_for_revision(
+    connection: mcp_connection.MCPConnection, previous: int
+) -> None:
+    # A sent ACK is not a barrier for the client's subscription handler.
+    while connection.catalog_revision == previous:
+        await asyncio.sleep(0)
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("graceful_close", [False, True])
 async def test_lost_http_subscription_reconnects_refetches_and_resubscribes(
     unused_tcp_port: int,
+    graceful_close: bool,
 ) -> None:
     peer = _SubscriptionPeer()
     async with (
-        _subscription_peer(unused_tcp_port, peer) as server,
+        _subscription_peer(
+            unused_tcp_port, peer, graceful_close=graceful_close
+        ) as server,
         MCPClientManager() as manager,
         asyncio.timeout(5),
     ):
@@ -149,8 +186,8 @@ async def test_lost_http_subscription_reconnects_refetches_and_resubscribes(
             manager, server, MCPAuthorizationContext(key="user")
         )
         assert [tool.name for tool in await lease.tools()] == ["notes__initial"]
-        await peer.acknowledged.wait()
         original = _connection(lease)
+        await _wait_for_revision(original, 0)
         listener = next(
             task
             for task in asyncio.all_tasks()
@@ -158,14 +195,13 @@ async def test_lost_http_subscription_reconnects_refetches_and_resubscribes(
         )
 
         peer.tool_name = "replacement"
-        peer.acknowledged.clear()
         peer.drop.set()
         await asyncio.shield(listener)
         assert original.failed
 
         assert [tool.name for tool in await lease.tools()] == ["notes__replacement"]
-        await peer.acknowledged.wait()
         replacement = _connection(lease)
+        await _wait_for_revision(replacement, 0)
         assert replacement is not original
         assert original.owner_task is not None and original.owner_task.done()
         assert peer.list_calls == 2
@@ -174,11 +210,98 @@ async def test_lost_http_subscription_reconnects_refetches_and_resubscribes(
         peer.tool_name = "notified"
         revision = replacement.catalog_revision
         peer.changed.set()
-        while replacement.catalog_revision == revision:
-            await asyncio.sleep(0)
+        await _wait_for_revision(replacement, revision)
         assert [tool.name for tool in await lease.tools()] == ["notes__notified"]
         assert peer.list_calls == 3
         assert peer.listen_calls == 2
+        await lease.release()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_flight", [False, True])
+async def test_http_subscription_ack_invalidates_earlier_catalog(
+    unused_tcp_port: int, in_flight: bool
+) -> None:
+    peer = _SubscriptionPeer()
+    async with (
+        _subscription_peer(
+            unused_tcp_port, peer, delayed_ack=True, hold_first_page=in_flight
+        ) as server,
+        MCPClientManager() as manager,
+        asyncio.timeout(5),
+    ):
+        lease = await acquire_lease(
+            manager, server, MCPAuthorizationContext(key="user")
+        )
+        await peer.listen_started.wait()
+        connection = _connection(lease)
+        discovery = asyncio.create_task(lease.tools())
+        try:
+            await peer.list_started.wait()
+            if not in_flight:
+                assert [tool.name for tool in await discovery] == ["notes__initial"]
+
+            assert peer.list_calls == 1
+            assert connection.catalog_revision == 0
+            peer.tool_name = "replacement"
+            peer.allow_ack.set()
+            await peer.acknowledged.wait()
+            await _wait_for_revision(connection, 0)
+
+            # The old response can also arrive after ACK. It must not become a
+            # fresh cached catalog merely because publication happened later.
+            peer.allow_list.set()
+            assert [tool.name for tool in await discovery] == ["notes__initial"]
+            assert [tool.name for tool in await lease.tools()] == ["notes__replacement"]
+            assert [tool.name for tool in await lease.tools()] == ["notes__replacement"]
+            assert peer.list_calls == 2
+            assert peer.listen_calls == 1
+            assert _connection(lease) is connection
+            assert not connection.failed
+        finally:
+            peer.allow_ack.set()
+            peer.allow_list.set()
+            if not discovery.done():
+                discovery.cancel()
+            await asyncio.gather(discovery, return_exceptions=True)
+            await lease.release()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acknowledged", [False, True])
+async def test_http_subscription_shutdown_joins_listener(
+    unused_tcp_port: int, acknowledged: bool
+) -> None:
+    peer = _SubscriptionPeer()
+    async with (
+        _subscription_peer(unused_tcp_port, peer, delayed_ack=True) as server,
+        MCPClientManager() as manager,
+        asyncio.timeout(5),
+    ):
+        lease = await acquire_lease(
+            manager, server, MCPAuthorizationContext(key="user")
+        )
+        await peer.listen_started.wait()
+        connection = _connection(lease)
+        listener = next(
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == "agentlane-mcp-listen-notes"
+        )
+        if acknowledged:
+            peer.allow_ack.set()
+            await _wait_for_revision(connection, 0)
+
+        await manager.aclose()
+        assert listener.done()
+        assert connection.owner_task is not None and connection.owner_task.done()
+        assert connection.closing
+        assert not connection.failed
+        assert peer.listen_calls == 1
+        assert peer.list_calls == 0
+        assert not any(
+            task.get_name().startswith("agentlane-mcp-") for task in asyncio.all_tasks()
+        )
         await lease.release()
 
 

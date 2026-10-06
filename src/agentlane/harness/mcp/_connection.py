@@ -243,6 +243,8 @@ async def _listen_for_tool_changes(connection: MCPConnection) -> None:
             async with connection.get_client().listen(
                 tools_list_changed=True
             ) as subscription:
+                # Changes before acknowledgment may have no notification.
+                connection.catalog_revision += 1
                 async for _event in subscription:
                     connection.catalog_revision += 1
         except Exception as exc:
@@ -254,3 +256,6 @@ async def _listen_for_tool_changes(connection: MCPConnection) -> None:
                     server=connection.server.name,
                     status="unavailable",
                 )
+        else:
+            # Normal completion also requires a new notification stream.
+            connection.failed = True
