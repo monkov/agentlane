@@ -3,17 +3,18 @@
 import asyncio
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from io import BytesIO
+from io import BufferedReader, BytesIO
 from pathlib import Path, PurePath
 
 from pydantic import BaseModel, Field
 
-from agentlane.harness.filesystem import BinaryReader, FileReader, LocalFileSystem
+from agentlane.harness.filesystem import FileReader, LocalFileSystem
+from agentlane.io import buffered_reader
 from agentlane.models import Tool, ToolExecutionContext
 from agentlane.runtime import CancellationToken
 
 from ._output import TEXT_MAX_BYTES, TEXT_MAX_LINES
-from ._paths import RelativeToolPathResolver, ToolPathResolver
+from ._paths import StorageToolPathResolver, ToolPathResolver, tool_path_guideline
 from ._permissions import (
     ToolApprovalCallback,
     ToolOperation,
@@ -78,7 +79,8 @@ def read_tool(
     Args:
         cwd: Optional working directory used to resolve relative paths. When
             omitted, the current working directory is captured at construction
-            time. Injected readers use a relative storage directory instead.
+            time. Mounted readers default to the virtual root; other injected
+            readers default to `.` within their storage namespace.
         reader: Optional binary file reader. Defaults to the local filesystem.
         permissions: Optional policy for read-file permission decisions.
         approval_callback: Optional callback for approval-required decisions.
@@ -89,7 +91,7 @@ def read_tool(
     resolver = (
         ToolPathResolver.for_optional(cwd)
         if reader is None
-        else RelativeToolPathResolver.for_optional(cwd)
+        else StorageToolPathResolver.for_optional(cwd, filesystem=reader)
     )
     file_reader = reader if reader is not None else LocalFileSystem()
 
@@ -122,14 +124,14 @@ def read_tool(
             handler=run_read,
         ),
         prompt_snippet=_TOOL_PROMPT_SNIPPET,
-        prompt_guidelines=(_TOOL_PROMPT_GUIDELINE,),
+        prompt_guidelines=(_TOOL_PROMPT_GUIDELINE, tool_path_guideline(resolver)),
     )
 
 
 async def _read_file(
     args: _ToolArgs,
     *,
-    resolver: ToolPathResolver | RelativeToolPathResolver,
+    resolver: ToolPathResolver | StorageToolPathResolver,
     reader: FileReader,
     cancellation_token: CancellationToken,
     permissions: ToolPermissionPolicy | None,
@@ -187,7 +189,12 @@ def _read_text_slice(
 ) -> _ReadContent:
     """Read and close a bounded text slice in the worker that opens the stream."""
     try:
-        with reader.open_read(str(path)) as binary_file:
+        # Providers need only byte reads. The wrapper supplies line buffering,
+        # and the outer context remains responsible for closing the source.
+        with (
+            reader.open_read(str(path)) as source,
+            buffered_reader(source) as binary_file,
+        ):
             sample = bytearray()
             while len(sample) < _BINARY_SAMPLE_BYTES:
                 chunk = binary_file.read(_BINARY_SAMPLE_BYTES - len(sample))
@@ -199,6 +206,8 @@ def _read_text_slice(
                 return _read_error(
                     f"file appears to be binary and cannot be read as text: `{path}`"
                 )
+
+            # Reuse the sampled bytes; remote streams need not support seeking.
             return _collect_text_slice(
                 _replay_lines(bytes(sample), binary_file), offset=offset, limit=limit
             )
@@ -212,12 +221,15 @@ def _read_text_slice(
         return _read_error(f"failed to read file: `{path}`")
 
 
-def _replay_lines(sample: bytes, stream: BinaryReader) -> Iterator[bytes]:
+def _replay_lines(sample: bytes, stream: BufferedReader) -> Iterator[bytes]:
     """Replay sampled bytes and complete the last line without seeking the stream."""
     buffered = BytesIO(sample)
     while line := buffered.readline():
         if not line.endswith(b"\n"):
+            # Sampling can stop inside a line or UTF-8 character. Complete the
+            # line before decoding so that sampling does not change its text.
             line += stream.readline()
+
         yield line
 
     while line := stream.readline():
@@ -277,6 +289,8 @@ def _collect_text_slice(
         output_lines.append(decoded_line)
         output_bytes += line_byte_count
 
+    # No output can mean either an invalid offset or a valid but oversized line.
+    # Preserve the continuation diagnostic in the latter case.
     if (
         not output_lines
         and continuation_message is None
