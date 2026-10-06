@@ -1,6 +1,6 @@
 # find Tool
 
-`find_tool()` exposes a `find` tool for local file search by glob pattern.
+`find_tool()` exposes a `find` tool for file search by glob pattern.
 
 Parameters:
 
@@ -10,7 +10,7 @@ Parameters:
 
 ## Permissions
 
-`find` resolves `path` through `ToolPathResolver` and checks
+`find` resolves `path` from its captured cwd in the selected filesystem and checks
 `ToolOperation.SEARCH_FILES` before directory validation or traversal. A denied
 request returns:
 
@@ -62,8 +62,11 @@ src/**/*.spec.ts
 
 ## Search root, ordering, and traversal
 
-By default `path` is the configured `cwd`. If `path` is provided, output paths
-are relative to that search directory.
+By default `path` is the configured `cwd`. Result paths are relative to the
+resolved `Search directory` shown in the output. To read a result from another
+search directory, combine that directory and the result name. For example,
+`Search directory: /library/docs` with result `guide.md` gives the read path
+`/library/docs/guide.md`. The search does not change the read tool's cwd.
 
 Results are sorted by **modification time, newest first**, with ties broken
 alphabetically. This mirrors the ordering used by editor file pickers and is
@@ -107,3 +110,19 @@ Output truncated at 51200 bytes; refine the pattern or narrow `path`.
 
 The tool returns clear text errors for empty patterns, empty paths, invalid
 limits, and paths that do not resolve to a directory.
+
+## Injected Storage
+
+Pass `reader=storage` with read, listing, and metadata capabilities. Paths use
+the reader's namespace and `cwd` defaults to its root. Mounted readers accept
+rooted virtual paths; their displayed search directory is canonical and rooted.
+Plain injected readers retain relative POSIX syntax. Local and supplied filesystems
+use the same traversal, ignore matching, and result limits. Results sort by
+`DirectoryEntry.modified_time`, newest first; missing timestamps count as zero.
+Ties sort alphabetically. Directory symlinks are not followed. Permission
+requests use `SEARCH_FILES` with logical paths. See
+[File I/O interfaces](./filesystem.md).
+
+Traversal skips missing, non-directory, and permission-denied entries. Other
+listing failures return `failed to find files`; they do not produce empty or
+partial success results.
