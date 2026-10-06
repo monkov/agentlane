@@ -13,7 +13,7 @@ Parameters:
 
 ## Permissions
 
-`patch` resolves `path` through `ToolPathResolver` and checks
+`patch` resolves `path` from its captured cwd in the selected filesystem and checks
 `ToolOperation.MODIFY_FILE` before parsing or applying edits. A denied request
 returns:
 
@@ -31,7 +31,7 @@ An approval-required request returns:
 approval required: patch requires application approval for `/workspace/notes.txt` before execution
 ```
 
-`path` is structured tool input and resolves through `ToolPathResolver`.
+`path` is structured tool input and resolves in the selected filesystem.
 `edits` should contain one or more bare SEARCH/REPLACE blocks without path
 lines:
 
@@ -60,3 +60,21 @@ missing files, directory targets, malformed SEARCH/REPLACE blocks, invalid
 UTF-8 edit text, invalid UTF-8 files, permission failures, and failed writes.
 Unexpected implementation errors return a stable generic failure message so the
 agent loop can continue.
+
+## Injected Storage
+
+Pass `reader=storage, writer=storage` for one storage namespace. Supply both
+capabilities together in the same namespace. Paths use that namespace and
+`cwd` defaults to its root. Mounted filesystems accept rooted virtual paths;
+relative paths resolve from the captured cwd. Plain injected backends retain
+relative POSIX syntax. The tool checks `MODIFY_FILE` before reading the target.
+The patch engine applies all edits to content and preserves matching, BOMs, line
+endings, and error behavior. The tool opens a writer only after all edits
+succeed. No remote-to-local copy is made.
+
+The writer context completes replacement on success and preserves the target
+on failure. One tool instance serializes the complete read-edit-write operation.
+Separate tool instances and external writers require application coordination
+of the whole operation; serialized commits alone do not prevent lost updates.
+Started writes settle before cancellation propagates and the lock is released.
+See [File I/O interfaces](./filesystem.md).
