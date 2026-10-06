@@ -25,7 +25,7 @@ from .helpers import acquire_lease, http_server
 @dataclass
 class _SchemaTarget:
     url: str = ""
-    requests: list[str] = field(default_factory=list)
+    requests: list[str] = field(default_factory=list[str])
 
 
 @pytest.fixture(name="schema_target")
