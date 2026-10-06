@@ -6,10 +6,12 @@ from pathlib import Path, PurePath
 
 from agentlane.harness.filesystem import (
     DirectoryEntry,
+    FilePathResolver,
     LocalFileSystem,
     SkillReader,
     normalize_relative_path,
 )
+from agentlane.io import read_all
 
 from ._discovery import default_skill_roots
 from ._loader import SkillLoader
@@ -20,8 +22,9 @@ from ._types import LoadedSkill, SkillManifest, SkillResource
 class FilesystemSkillLoader(SkillLoader):
     """Discover skills through the default filesystem or an injected reader.
 
-    Injected readers own their storage root. Their paths remain relative to
-    that root and never pass through local filesystem resolution. Readers must
+    Injected readers own their path namespace. Readers with a FilePathResolver
+    provide canonical paths; other injected readers use root-relative paths.
+    Injected paths never pass through local filesystem resolution. Readers must
     permit blocking calls from a worker thread.
     """
 
@@ -35,8 +38,9 @@ class FilesystemSkillLoader(SkillLoader):
         """Set the directories in which to discover skill folders.
 
         Args:
-            roots: Local directories, or relative paths within an injected
-                reader. An injected reader defaults to its own root (`.`).
+            roots: Local directories, or paths within an injected reader's
+                namespace. An injected reader defaults to its own root (`.`).
+                Mounted readers resolve roots from the virtual root (`/`).
             include_default_roots: Add standard home and working-directory
                 skill roots for local I/O only. Ignored for injected readers.
             reader: File reading and directory listing implementation. Omit
@@ -50,9 +54,15 @@ class FilesystemSkillLoader(SkillLoader):
                 include_default_roots=include_default_roots,
             )
         else:
+            # Discovery and file tools must expose the same canonical namespace.
+            resolve_root = (
+                reader.resolve_path
+                if isinstance(reader, FilePathResolver)
+                else normalize_relative_path
+            )
             self._roots = tuple(
                 dict.fromkeys(
-                    normalize_relative_path(root)
+                    resolve_root(str(root))
                     for root in (roots if roots is not None else (".",))
                 )
             )
@@ -79,6 +89,7 @@ class FilesystemSkillLoader(SkillLoader):
 
                 parsed = self._parse_file(root / child.name / "SKILL.md")
                 if parsed is not None:
+                    # Root order defines precedence when two skills share a name.
                     parsed_by_name.setdefault(parsed.manifest.name, parsed)
 
         return parsed_by_name
@@ -107,7 +118,8 @@ class FilesystemSkillLoader(SkillLoader):
     def _parse_file(self, path: PurePath) -> ParsedSkillFile | None:
         try:
             with self._reader.open_read(str(path)) as stream:
-                text = stream.read().decode("utf-8")
+                # A short read is not EOF; parse only after the full transfer.
+                text = read_all(stream).decode("utf-8")
         except (OSError, UnicodeDecodeError):
             return None
 
@@ -139,6 +151,7 @@ class FilesystemSkillLoader(SkillLoader):
             for child in self._list_directory(directory):
                 path = directory / child.name
                 if child.is_directory:
+                    # Resource discovery must not loop through directory links.
                     if not child.is_symlink:
                         pending.append(path)
                 elif path != root / "SKILL.md":
