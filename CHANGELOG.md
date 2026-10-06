@@ -7,22 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-06
+
+AgentLane `0.18.0` gives mounted file tools a fixed virtual working directory and consistent rooted paths. Custom mounted permission policies must use rooted scopes.
+
 ### Added
 
-- Added the optional `FilePathResolver` protocol and `normalize_virtual_path`
-  helper for logical filesystem path resolution without host filesystem access.
+- Added the optional `FilePathResolver` protocol and `normalize_virtual_path` helper to resolve logical filesystem paths without host filesystem access ([`eadfedb`](https://github.com/yasik/agentlane/commit/eadfedb)).
 
 ### Changed
 
-- Mounted file tools resolve relative paths from a captured virtual working
-  directory and accept rooted paths such as `/tenant/skills/guide.md` from any
-  cwd. Mounted skill manifests, permission requests, and tool results use
-  canonical rooted paths. Update custom mounted policies to use rooted scopes.
-  Relative mount paths still start at the tool's cwd; use a leading `/` to
-  select a mount explicitly from a non-root cwd.
-- File-tool prompt guidance includes each tool's cwd and path rules. Skill
-  activation explains relative resource references without changing tool cwd.
-  Find guidance uses the displayed search directory to anchor result paths.
+- Mounted file tools resolve relative paths from their captured working directory and accept rooted paths such as `/tenant/skills/guide.md` from any working directory. Skill manifests, permission requests, and tool results use canonical rooted paths. Update custom mounted policies to use rooted scopes; use a leading `/` to select a mount from a non-root working directory ([`eadfedb`](https://github.com/yasik/agentlane/commit/eadfedb)).
+- Tool guidance states each tool's working directory and path rules. Skill activation explains relative resource references without changing the tool's working directory, and find guidance anchors result paths to the displayed search directory ([`eadfedb`](https://github.com/yasik/agentlane/commit/eadfedb)).
 
 ## [0.17.0] - 2026-10-04
 
@@ -365,7 +361,8 @@ AgentLane `0.3.0` is the initial public release. It ships the runtime and distri
 
 - Final pre-release cleanup removed dead code and added repo-level `vulture` configuration for ongoing dead-code checks ([`f009e5d`](https://github.com/yasik/agentlane/commit/f009e5d523a84d3e6747329522582d3196906534))
 
-[Unreleased]: https://github.com/yasik/agentlane/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/yasik/agentlane/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/yasik/agentlane/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/yasik/agentlane/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/yasik/agentlane/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/yasik/agentlane/compare/v0.14.0...v0.15.0
