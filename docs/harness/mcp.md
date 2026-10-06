@@ -8,6 +8,9 @@ and stdio. Install the optional dependency:
 uv add 'agentlane[mcp]'
 ```
 
+The extra requires MCP SDK 2.2 or later within major version 2. Output-schema
+validation supports local references and does not fetch external schemas.
+
 ## Connect an agent
 
 Attach the shim through `AgentDescriptor.shims`. This example uses an HTTPS
@@ -289,12 +292,22 @@ either order. See [shims](./shims.md) for preparation and inheritance callbacks.
 
 ## Results and data handling
 
-Results contain text and structured content as JSON. `MCPResultPolicy` defaults
-to 32 content blocks and 51,200 output characters. Set `MCPServer.result_policy`
-to change these limits or disable structured content with
+Rendered server results contain text and structured content as JSON. Each
+rendered server result includes the server's `isError` flag, including truncated
+results. `MCPResultPolicy` defaults to 32 content blocks and 51,200 output
+characters. Set `MCPServer.result_policy` to change these limits or disable
+structured content with
 `include_structured_content=False`. `max_text_chars` must be at least 128.
-Truncated results remain valid JSON and include omission counts. Image, audio,
-and resource bodies are replaced with metadata.
+Truncated results remain valid JSON and include `truncated` and `omittedBlocks`.
+They do not report an omitted-character count. Image, audio, and resource bodies
+are replaced with metadata.
+
+Rendering inspects a bounded portion of the decoded result. Strings that exceed
+the inspection budget are replaced with an omission marker. An oversized key
+causes its entire entry to be omitted. Retained strings are redacted before
+output truncation. Text that starts with `{` or `[` and cannot be safely parsed
+or rendered as JSON is replaced with an omission marker. These rendering limits
+do not bound SDK response decoding or schema validation.
 
 AgentLane redacts known provider token values and credential-shaped fields
 from results and framework errors. Managed SDK and transport logs are

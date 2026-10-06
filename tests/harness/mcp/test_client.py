@@ -1,5 +1,6 @@
 """MCP transport, authorization, and native tool integration."""
 
+import json
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -205,7 +206,7 @@ async def test_stdio_discovery_and_tool_call_use_native_agentlane_tool() -> None
 
         result = await tool.run(args, CancellationToken())
 
-        assert '"result": 7' in str(result)
+        assert json.loads(str(result))["structuredContent"]["result"] == 7
         assert tool.schema["parameters"]["properties"].keys() == {"left", "right"}
     finally:
         await lease.release()

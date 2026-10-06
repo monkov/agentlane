@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Require MCP SDK 2.2 or later within major version 2 to prevent external schema
+  requests during tool-result validation.
+- Bound MCP result rendering before redaction and serialization. Omit oversized
+  values and retain `truncated` and `omittedBlocks` without a full-result
+  omitted-character count.
+- Preserve the MCP server's `isError` flag in model-facing results, including
+  truncated output.
 - Reject a tool request if its authorization changes between discovery and the
   first HTTP send.
 - Clean up started shims after partial startup, continue later cleanup after a

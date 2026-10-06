@@ -142,7 +142,9 @@ def test_result_structured_and_json_text_redact_credentials(
 
 @pytest.mark.parametrize("limit", [128, 129, 180, 256, 1024])
 @pytest.mark.parametrize(
-    "text", ['A useful answer "with quotes"\n' * 1000, "答案🙂" * 1000]
+    "text",
+    ['A useful answer "with quotes"\n' * 1000, "答案🙂" * 1000],
+    ids=["escaped-text", "unicode-text"],
 )
 def test_result_truncation_keeps_valid_json_and_previews(limit: int, text: str) -> None:
     rendered = render_mcp_result(
@@ -159,7 +161,7 @@ def test_result_truncation_keeps_valid_json_and_previews(limit: int, text: str) 
         assert payload["content"][0]["text"]
     else:
         assert payload["omittedBlocks"] >= 0
-    assert payload["omittedChars"] > 0
+    assert "omittedChars" not in payload
     assert "structuredContent" in payload
     assert payload["structuredContent"]["summary"] == "useful"
 
@@ -186,7 +188,7 @@ def test_resource_blocks_return_only_metadata() -> None:
     assert resource["uri"] == "resource://notes/1"
 
 
-def test_result_omission_counts_exclude_accounting_fields() -> None:
+def test_result_omission_counts_only_omitted_blocks() -> None:
     original = {
         "content": [
             {"type": "text", "text": "one"},
@@ -196,11 +198,8 @@ def test_result_omission_counts_exclude_accounting_fields() -> None:
     }
     rendered = render_mcp_result(original, MCPResultPolicy(max_content_blocks=1))
     payload = json.loads(rendered)
-    kept = {"content": payload["content"]}
-    expected = len(json.dumps(original, sort_keys=True, separators=(",", ":"))) - len(
-        json.dumps(kept, sort_keys=True, separators=(",", ":"))
-    )
-    assert payload["omittedChars"] == expected
+    assert payload["content"] == [{"type": "text", "text": "one"}]
+    assert "omittedChars" not in payload
     assert payload["omittedBlocks"] == 2
 
 
