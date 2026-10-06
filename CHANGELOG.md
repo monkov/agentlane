@@ -17,6 +17,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Omit tool arguments and results from function spans when tracing uses
   `ModelTracing.ENABLED_WITHOUT_DATA`.
 
+## [0.18.0] - 2026-10-06
+
+AgentLane `0.18.0` gives mounted file tools a fixed virtual working directory and consistent rooted paths. Custom mounted permission policies must use rooted scopes.
+
+### Added
+
+- Added the optional `FilePathResolver` protocol and `normalize_virtual_path` helper to resolve logical filesystem paths without host filesystem access ([`eadfedb`](https://github.com/yasik/agentlane/commit/eadfedb)).
+
+### Changed
+
+- Mounted file tools resolve relative paths from their captured working directory and accept rooted paths such as `/tenant/skills/guide.md` from any working directory. Skill manifests, permission requests, and tool results use canonical rooted paths. Update custom mounted policies to use rooted scopes; use a leading `/` to select a mount from a non-root working directory ([`eadfedb`](https://github.com/yasik/agentlane/commit/eadfedb)).
+- Tool guidance states each tool's working directory and path rules. Skill activation explains relative resource references without changing the tool's working directory, and find guidance anchors result paths to the displayed search directory ([`eadfedb`](https://github.com/yasik/agentlane/commit/eadfedb)).
+
+## [0.17.0] - 2026-10-04
+
+AgentLane `0.17.0` gives read, write, find, and patch a shared filesystem interface, adds writable mounts, and adds a searchable documentation portal. Custom writer adapters must migrate to the stream interface described below.
+
+### Added
+
+- Added `MountedFileSystem` for read and write operations across local and client-supplied storage, with the same logical paths for read, write, find, patch, and skill loading. A runnable example demonstrates mounted file tools alongside process tools ([`1c58142`](https://github.com/yasik/agentlane/commit/1c58142)).
+- Added small `Reader` and `Writer` byte-stream protocols in `agentlane.io`, with separate buffering, whole-file read, and complete-write helpers. Reader implementations no longer need `readline`; `BinaryReader` remains an alias for `Reader` ([`1c58142`](https://github.com/yasik/agentlane/commit/1c58142)).
+- Added a documentation portal with search, navigation, and code examples, built from the repository's public documentation ([`0285081`](https://github.com/yasik/agentlane/commit/0285081)).
+
+### Changed
+
+- Custom writers must implement `open_write(path)` as a context manager that yields a byte-stream writer, replacing the `write(path, bytes)` contract. Keep `stat(path)` for write-tool permission decisions. Failed write contexts must preserve the target; successful exit must complete the write. See the [writer migration guide](https://github.com/yasik/agentlane/blob/v0.17.0/docs/harness/filesystem.md#writer-migration) ([`1c58142`](https://github.com/yasik/agentlane/commit/1c58142)).
+- `base_harness_tools` separates process `cwd` from injected `storage_cwd`. Grep and bash use their process filesystem; injected file tools use relative POSIX paths. Find uses one traversal for local and supplied filesystems, including directory-entry timestamps. Custom bash executors receive explicit working directories without host path resolution or local existence checks ([`1c58142`](https://github.com/yasik/agentlane/commit/1c58142)).
+- Injected patch uses the content API from `llm-patch-tool>=0.2.0` and serializes read-edit-write operations within one tool instance. Write and patch wait for active writes to settle before propagating cancellation; applications still coordinate separate instances and external writers ([`1c58142`](https://github.com/yasik/agentlane/commit/1c58142)).
+
+### Fixed
+
+- Write helpers handle short writes. Local file writes preserve existing file modes and use bounded temporary filenames so valid long target names remain writable ([`1c58142`](https://github.com/yasik/agentlane/commit/1c58142)).
+
+### Security
+
+- Relative storage paths and roots reject components that start with `~`, including `~user` and mounted paths such as `local/~/file`, before a local backend can expand them into home-directory paths. Embedded tildes remain valid ([`1c58142`](https://github.com/yasik/agentlane/commit/1c58142)).
+
 ## [0.16.0] - 2026-10-01
 
 AgentLane `0.16.0` adds file I/O adapters for native tools and skills, combines local and remote skill roots through one reader, and removes known credentials from LiteLLM request debug logs.
@@ -334,7 +371,9 @@ AgentLane `0.3.0` is the initial public release. It ships the runtime and distri
 
 - Final pre-release cleanup removed dead code and added repo-level `vulture` configuration for ongoing dead-code checks ([`f009e5d`](https://github.com/yasik/agentlane/commit/f009e5d523a84d3e6747329522582d3196906534))
 
-[Unreleased]: https://github.com/yasik/agentlane/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/yasik/agentlane/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/yasik/agentlane/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/yasik/agentlane/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/yasik/agentlane/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/yasik/agentlane/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/yasik/agentlane/compare/v0.13.1...v0.14.0

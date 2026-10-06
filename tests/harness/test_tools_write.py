@@ -65,6 +65,25 @@ def test_write_tool_accepts_absolute_paths(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == "absolute"
 
 
+def test_write_tool_without_cwd_uses_captured_local_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = tmp_path / "original"
+    elsewhere = tmp_path / "elsewhere"
+    original.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.chdir(original)
+    tool = write_tool()
+
+    # Later host cwd changes must not redirect an existing tool instance.
+    monkeypatch.chdir(elsewhere)
+    output = run_tool(tool, path="notes.md", content="notes")
+
+    assert output == f"Wrote 5 bytes to {original / 'notes.md'}."
+    assert (original / "notes.md").read_text(encoding="utf-8") == "notes"
+    assert not (elsewhere / "notes.md").exists()
+
+
 def test_write_tool_denies_create_outside_workspace_policy(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -200,11 +219,13 @@ def test_write_tool_sanitizes_os_error_text(
         del kwargs
         raise OSError("Traceback (most recent call last): private details")
 
-    monkeypatch.setattr(Path, "write_bytes", raise_os_error)
+    # Fail at commit to cover both error sanitization and temp-file cleanup.
+    monkeypatch.setattr(Path, "replace", raise_os_error)
 
     output = run_tool(write_tool(cwd=tmp_path), path="notes.txt", content="content")
 
     assert output == f"failed to write file: `{tmp_path / 'notes.txt'}`"
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_write_tool_executes_through_runner_tool_loop(tmp_path: Path) -> None:
@@ -336,6 +357,7 @@ def test_write_tool_prompt_metadata_renders_through_shim(tmp_path: Path) -> None
             "- write: Create or overwrite files\n\n"
             "Guidelines:\n"
             "- Use write only for new files or complete rewrites.\n"
+            f"- Relative paths resolve from the working directory `{tmp_path}`. Absolute paths refer to the local filesystem.\n"
             "</default_tools>"
         )
 
