@@ -1,6 +1,5 @@
 """Redact credentials from server-controlled schemas and tool results."""
 
-import json
 import re
 from collections.abc import Collection, Mapping, Sequence
 from typing import cast
@@ -35,7 +34,8 @@ _SECRET_KEYS = frozenset(
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
 
 
-def _is_secret_key(key: str) -> bool:
+def is_secret_key(key: str) -> bool:
+    """Return whether a JSON key identifies a credential value."""
     normalized = key.lower().replace("-", "_")
     return normalized in _SECRET_KEYS or normalized.endswith(
         ("_token", "_secret", "_password", "_credentials", "_api_key", "_private_key")
@@ -102,42 +102,3 @@ def contains_secret_key(value: object, secrets: Collection[str]) -> bool:
         )
 
     return False
-
-
-def redact_sensitive_data(value: object, secrets: Sequence[str] = ()) -> object:
-    """Copy server-controlled data and remove credentials from every branch."""
-    if isinstance(value, Mapping):
-        mapping = cast(Mapping[object, object], value)
-        return {
-            str(redact_known_secrets(str(key), secrets)): (
-                "[redacted]"
-                if _is_secret_key(str(key))
-                else redact_sensitive_data(item, secrets)
-            )
-            for key, item in mapping.items()
-        }
-
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [
-            redact_sensitive_data(item, secrets)
-            for item in cast(Sequence[object], value)
-        ]
-
-    if isinstance(value, str):
-        for secret in sorted(secrets, key=len, reverse=True):
-            if secret:
-                value = value.replace(secret, "[redacted]")
-
-        if value.lstrip().startswith(("{", "[")):
-            try:
-                parsed: object = json.loads(value)
-            except (ValueError, RecursionError):
-                pass
-            else:
-                safe = redact_sensitive_data(parsed, secrets)
-                if safe != parsed:
-                    value = json.dumps(safe, ensure_ascii=False)
-
-        return _URL_PATTERN.sub(_redact_url, value)
-
-    return value

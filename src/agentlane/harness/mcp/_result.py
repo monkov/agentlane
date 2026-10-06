@@ -1,13 +1,34 @@
-"""Convert MCP tool results to safe model-facing text."""
+"""Convert MCP tool results to bounded, safe model-facing text."""
 
 import json
-from collections.abc import Collection, Mapping, Sequence
-from typing import Any, Protocol, cast, runtime_checkable
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from math import isfinite
+from typing import Protocol, cast
+
+from pydantic import BaseModel
 
 from agentlane.models import ToolError, ToolFailure
 
-from ._redaction import redact_sensitive_data
+from ._redaction import is_secret_key, redact_known_secrets
 from ._types import MCPResultPolicy
+
+_OMISSION = "[omitted: exceeds processing limit]"
+_MAX_NODES = 4096
+_MAX_DEPTH = 32
+
+
+class _SDKResult(Protocol):
+    content: Sequence[object]
+    structured_content: object
+    is_error: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _Result:
+    content: Sequence[object]
+    structured_content: object
+    is_error: bool
 
 
 def render_mcp_result(
@@ -16,210 +37,330 @@ def render_mcp_result(
     *,
     secrets: Collection[str] = (),
 ) -> str | ToolFailure:
-    """Render one SDK CallToolResult without exposing binary payloads."""
-    payload = _model_payload(result)
-    blocks_value = payload.get("content", [])
-    blocks: Sequence[object] = (
-        cast(Sequence[object], blocks_value)
-        if isinstance(blocks_value, Sequence)
-        else ()
+    """Render a bounded preview without processing omitted server content."""
+    source = _read_result(result)
+    renderer = _Renderer(policy.max_text_chars, secrets)
+    structured = (
+        source.structured_content if policy.include_structured_content else None
     )
-    rendered_blocks = [_safe_content_block(block) for block in blocks]
-    is_error = payload.get("isError", payload.get("is_error", False)) is True
-    rendered: dict[str, object] = {"content": rendered_blocks, "isError": is_error}
-    structured = payload.get("structuredContent", payload.get("structured_content"))
-    if policy.include_structured_content and structured is not None:
-        rendered["structuredContent"] = structured
-    safe_payload = cast(
-        dict[str, object], redact_sensitive_data(rendered, tuple(secrets))
-    )
-    limited_payload = {
-        **safe_payload,
-        "content": cast(list[object], safe_payload["content"])[
-            : policy.max_content_blocks
-        ],
+    reserved: dict[str, object] = {
+        "content": [],
+        "isError": source.is_error,
+        "truncated": True,
+        "omittedBlocks": len(source.content),
     }
-    text = _bounded_json(limited_payload, policy.max_text_chars, source=safe_payload)
+    if structured is not None:
+        reserved["structuredContent"] = {"omitted": True}
 
-    if is_error:
+    available = policy.max_text_chars - len(_json(reserved))
+    content_budget = 2 + (int(available * 0.6) if structured is not None else available)
+    content, kept = renderer.content(
+        source.content, max(2, content_budget), policy.max_content_blocks
+    )
+    fields = [f'"content":{content}', f'"isError":{_json(source.is_error)}']
+    if structured is not None:
+        structured_budget = len(_json(reserved["structuredContent"])) + (
+            available - (len(content) - 2)
+        )
+        preview = renderer.value(structured, structured_budget) or '{"omitted":true}'
+        fields.append(f'"structuredContent":{preview}')
+
+    omitted_blocks = len(source.content) - kept
+    if renderer.truncated or omitted_blocks:
+        fields.extend(['"truncated":true', f'"omittedBlocks":{omitted_blocks}'])
+
+    text = "{" + ",".join(fields) + "}"
+    if source.is_error:
         return ToolFailure(
             text=text,
             error=ToolError(
                 message="MCP server reported a tool failure.", kind="mcp_server"
             ),
         )
+
     return text
 
 
-def _bounded_json(
-    payload: dict[str, object], limit: int, *, source: dict[str, object]
-) -> str:
-    """Keep a useful preview and valid JSON within the character limit."""
-    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    if len(text) <= limit and payload == source:
-        return text
-
-    source_chars = len(_compact_json(source))
-    source_blocks = len(cast(list[object], source["content"]))
-    accounting = {
-        "truncated": True,
-        "omittedChars": source_chars,
-        "omittedBlocks": source_blocks,
-    }
-    if len(_compact_json({**payload, **accounting})) <= limit:
-        return _with_omission_counts(payload, source_chars, source_blocks)
-    structured = payload.get("structuredContent")
-    compact: dict[str, object] = {
-        "content": [],
-        "isError": payload["isError"],
-        **accounting,
-    }
-    if structured is not None:
-        compact["structuredContent"] = {"omitted": True}
-    content = payload.get("content", [])
-    available = limit - len(_compact_json(compact))
-    # Keep room for both text and structured output. The final pass gives the
-    # text any unused structured-output budget.
-    text_budget = max(2, int(available * (0.6 if structured is not None else 1)) + 2)
-    preview = _preview(content, text_budget)
-    compact["content"] = [] if preview is _OMITTED else preview
-    if structured is not None:
-        previous = compact.pop("structuredContent")
-        remaining = limit - len(_compact_json(compact)) - len(',"structuredContent":')
-        preview = _preview(structured, remaining)
-        compact["structuredContent"] = (
-            previous if preview is _OMITTED or preview in ({}, []) else preview
+def _read_result(value: object) -> _Result:
+    if isinstance(value, Mapping):
+        raw = cast(Mapping[str, object], value)
+        content = raw.get("content", [])
+        return _Result(
+            content=_sequence(content),
+            structured_content=raw.get(
+                "structuredContent", raw.get("structured_content")
+            ),
+            is_error=raw.get("isError", raw.get("is_error", False)) is True,
         )
-    previous_content = compact.pop("content")
-    remaining = limit - len(_compact_json(compact)) - len(',"content":')
-    preview = _preview(content, remaining)
-    compact["content"] = previous_content if preview is _OMITTED else preview
-    return _with_omission_counts(compact, source_chars, source_blocks)
+
+    source = cast(_SDKResult, value)
+    return _Result(source.content, source.structured_content, source.is_error)
 
 
-def _with_omission_counts(
-    payload: dict[str, object], source_chars: int, source_blocks: int
-) -> str:
-    data = {
-        key: value
-        for key, value in payload.items()
-        if key not in {"truncated", "omittedChars", "omittedBlocks"}
-    }
-    return _compact_json(
-        {
-            **data,
-            "truncated": True,
-            "omittedChars": max(0, source_chars - len(_compact_json(data))),
-            "omittedBlocks": source_blocks
-            - len(cast(list[object], data.get("content", []))),
-        }
-    )
+def _sequence(value: object) -> Sequence[object]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return cast(Sequence[object], value)
+
+    return ()
 
 
-def _compact_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def _json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-_OMITTED = object()
+def _fields(value: Mapping[str, object] | BaseModel) -> Iterator[tuple[str, str]]:
+    if isinstance(value, BaseModel):
+        for name, field in type(value).model_fields.items():
+            yield name, field.serialization_alias or field.alias or name
+
+        for name in value.model_extra or {}:
+            yield name, name
+
+        return
+
+    for name in value:
+        yield name, name
 
 
-def _preview(value: object, budget: int) -> object:
-    """Return the leading portion of a JSON value that fits the budget."""
-    if len(_compact_json(value)) <= budget:
-        return value
-    if isinstance(value, str):
-        low, high = 0, len(value)
-        if len(_compact_json("…")) > budget:
-            return _OMITTED
+def _field(value: Mapping[str, object] | BaseModel, name: str) -> object:
+    if isinstance(value, BaseModel):
+        return getattr(value, name)
+
+    return value[name]
+
+
+class _Renderer:
+    """Own the input and output budgets for one result, including JSON text."""
+
+    def __init__(self, output_limit: int, secrets: Collection[str]) -> None:
+        self.characters = max(64 * 1024, output_limit)
+        self.nodes = _MAX_NODES
+        self.secrets = tuple(secrets)
+        self.truncated = False
+
+    def _take_text(self, value: str) -> bool:
+        if len(value) > self.characters:
+            self.truncated = True
+            return False
+
+        self.characters -= len(value)
+        return True
+
+    def _omission(self, available: int) -> str | None:
+        self.truncated = True
+        return self._text(_OMISSION, available)
+
+    def _text(self, value: str, available: int) -> str | None:
+        if available < 2:
+            self.truncated = True
+            return None
+
+        # Only serialize a prefix of already sanitized text. Raw strings must
+        # pass the complete-string processing budget before this method runs.
+        prefix = value[:available]
+        encoded = _json(prefix)
+        if len(prefix) == len(value) and len(encoded) <= available:
+            return encoded
+
+        self.truncated = True
+        if available < 3:
+            return '""'
+
+        low, high = 0, len(prefix)
         while low < high:
             midpoint = (low + high + 1) // 2
-            if len(_compact_json(value[:midpoint] + "…")) <= budget:
+            if len(_json(prefix[:midpoint] + "…")) <= available:
                 low = midpoint
             else:
                 high = midpoint - 1
-        return value[:low] + "…"
-    if isinstance(value, Mapping):
-        mapping = cast(Mapping[str, object], value)
-        partial: dict[str, object] = {}
-        if budget < 2:
-            return _OMITTED
-        for key, item in mapping.items():
-            remaining = (
-                budget - len(_compact_json(partial)) - len(_compact_json(key)) - 1
+
+        return _json(prefix[:low] + "…")
+
+    def value(
+        self,
+        value: object,
+        available: int,
+        depth: int = 0,
+        *,
+        resource: bool = False,
+        block: bool = False,
+    ) -> str | None:
+        if available < 2:
+            self.truncated = True
+            return None
+
+        if self.nodes <= 0:
+            return self._omission(available)
+
+        self.nodes -= 1
+        if depth >= _MAX_DEPTH:
+            return self._omission(available)
+
+        if isinstance(value, (Mapping, BaseModel)):
+            return self._object(
+                cast(Mapping[str, object] | BaseModel, value),
+                available,
+                depth,
+                resource=resource,
+                block=block,
             )
-            if partial:
-                remaining -= 1
-            preview = _preview(item, remaining)
-            if preview is _OMITTED:
+
+        if isinstance(value, str):
+            if not self._take_text(value):
+                return self._omission(available)
+
+            if value.lstrip().startswith(("{", "[")):
+                try:
+                    parsed: object = json.loads(value)
+                except (ValueError, RecursionError):
+                    return self._omission(available)
+
+                safe = self.value(parsed, max(2, available - 2), depth + 1) or "null"
+            else:
+                safe = cast(str, redact_known_secrets(value, self.secrets))
+
+            return self._text(safe, available)
+
+        if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+            return self._array(cast(Sequence[object], value), available, depth)
+
+        if value is None or isinstance(value, (bool, int, float)):
+            if isinstance(value, int) and value.bit_length() > available * 3:
+                return self._omission(available)
+
+            if isinstance(value, float) and not isfinite(value):
+                return self._omission(available)
+
+            encoded = _json(value)
+            if len(encoded) <= available:
+                return encoded
+
+        return self._omission(available)
+
+    def _object(
+        self,
+        value: Mapping[str, object] | BaseModel,
+        available: int,
+        depth: int,
+        *,
+        resource: bool,
+        block: bool,
+    ) -> str | None:
+        kind = _field(value, "type") if block else None
+        fields = _fields(value)
+        if block:
+            fields = self._content_fields(fields, text=kind == "text")
+
+        parts: list[str] = []
+        used = 2
+        kept: set[str] = set()
+        for name, alias in fields:
+            if self.nodes <= 0 or available - used < 5:
+                self.truncated = True
                 break
-            partial[key] = preview
-            if preview != item:
-                break
-        return partial
-    if isinstance(value, list):
-        sequence = cast(list[object], value)
-        items: list[object] = []
-        if budget < 2:
-            return _OMITTED
-        for item in sequence:
-            remaining = budget - len(_compact_json(items)) - (1 if items else 0)
-            preview = _preview(item, remaining)
-            if preview is _OMITTED or preview in ({}, []):
-                break
-            if isinstance(preview, dict):
-                block = cast(dict[str, object], preview)
-                if block.get("type") == "text" and "text" not in block:
-                    break
-            items.append(cast(object, preview))  # type: ignore[redundant-cast]
-            if preview != item:
-                break
-        return items
-    return _OMITTED
 
+            self.nodes -= 1
+            if not self._take_text(alias):
+                continue
 
-@runtime_checkable
-class _ModelDumpable(Protocol):
-    def model_dump(self, **kwargs: object) -> dict[str, Any]: ...
+            if len(alias) > available - used - 5:
+                self.truncated = True
+                continue
 
-
-def _model_payload(value: object) -> dict[str, Any]:
-    if isinstance(value, _ModelDumpable):
-        dumped = value.model_dump(mode="json", by_alias=True)
-        return dumped
-    if isinstance(value, Mapping):
-        mapping = cast(Mapping[object, object], value)
-        return {str(key): item for key, item in mapping.items()}
-    raise TypeError(f"Unsupported MCP result type: {type(value).__qualname__}.")
-
-
-def _safe_content_block(value: object) -> object:
-    block: dict[str, Any]
-    if isinstance(value, Mapping):
-        mapping = cast(Mapping[object, object], value)
-        block = {str(key): item for key, item in mapping.items()}
-    else:
-        block = _model_payload(value)
-    block_type = block.get("type")
-    if block_type in {"image", "audio"}:
-        data = block.pop("data", None)
-        block["encodedBytesOmitted"] = len(data) if isinstance(data, str) else 0
-    if block_type == "resource":
-        resource_value = block.get("resource")
-        if isinstance(resource_value, Mapping):
-            resource_mapping = cast(Mapping[object, object], resource_value)
-            resource = {str(key): item for key, item in resource_mapping.items()}
-            blob = resource.pop("blob", None)
-            if blob is not None:
-                resource["encodedBytesOmitted"] = (
-                    len(blob) if isinstance(blob, str) else 0
+            output_name = alias
+            omitted_body = (resource and alias in {"blob", "text"}) or (
+                block and kind in {"image", "audio"} and alias == "data"
+            )
+            if omitted_body:
+                output_name = (
+                    "textCharsOmitted" if alias == "text" else "encodedBytesOmitted"
                 )
-            resource_text = resource.pop("text", None)
-            if resource_text is not None:
-                resource["textCharsOmitted"] = (
-                    len(resource_text) if isinstance(resource_text, str) else 0
+
+            safe_key = cast(str, redact_known_secrets(output_name, self.secrets))
+            if len(safe_key) > available - used - 5:
+                self.truncated = True
+                continue
+
+            encoded_key = _json(safe_key)
+            remaining = available - used - len(encoded_key) - 1 - bool(parts)
+            if remaining < 2:
+                self.truncated = True
+                break
+
+            if is_secret_key(alias):
+                encoded = self._text("[redacted]", remaining)
+            else:
+                item = _field(value, name)
+                if omitted_body:
+                    item = len(item) if isinstance(item, str) else 0
+
+                encoded = self.value(
+                    item,
+                    remaining,
+                    depth + 1,
+                    resource=block and kind == "resource" and alias == "resource",
                 )
-            block["resource"] = resource
-    # Put the useful text before optional metadata when a preview is needed.
-    if block_type == "text":
-        return {"type": block_type, "text": block.get("text", ""), **block}
-    return block
+
+            if encoded is None:
+                break
+
+            part = encoded_key + ":" + encoded
+            used += len(part) + bool(parts)
+            parts.append(part)
+            kept.add(alias)
+
+        if block and ("type" not in kept or (kind == "text" and "text" not in kept)):
+            self.truncated = True
+            return None
+
+        return "{" + ",".join(parts) + "}"
+
+    @staticmethod
+    def _content_fields(
+        fields: Iterator[tuple[str, str]], *, text: bool
+    ) -> Iterator[tuple[str, str]]:
+        yield "type", "type"
+        if text:
+            yield "text", "text"
+
+        for name, alias in fields:
+            if alias != "type" and not (text and alias == "text"):
+                yield name, alias
+
+    def _array(self, value: Sequence[object], available: int, depth: int) -> str:
+        parts: list[str] = []
+        used = 2
+        for index in range(len(value)):
+            remaining = available - used - bool(parts)
+            if self.nodes <= 0 or remaining < 2:
+                self.truncated = True
+                break
+
+            encoded = self.value(value[index], remaining, depth + 1)
+            if encoded is None:
+                break
+
+            used += len(encoded) + bool(parts)
+            parts.append(encoded)
+
+        return "[" + ",".join(parts) + "]"
+
+    def content(
+        self, value: Sequence[object], available: int, max_blocks: int
+    ) -> tuple[str, int]:
+        parts: list[str] = []
+        used = 2
+        for index in range(min(len(value), max_blocks)):
+            remaining = available - used - bool(parts)
+            if self.nodes <= 0 or remaining < 2:
+                self.truncated = True
+                break
+
+            encoded = self.value(value[index], remaining, block=True)
+            if encoded is None:
+                break
+
+            used += len(encoded) + bool(parts)
+            parts.append(encoded)
+
+        return "[" + ",".join(parts) + "]", len(parts)

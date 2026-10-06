@@ -1,5 +1,6 @@
 """SDK output validation uses local schema references without extra requests."""
 
+import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -161,7 +162,7 @@ async def test_local_output_schema_reference_still_validates_results(
     assert calls == 1
     if valid:
         assert not isinstance(result, ToolFailure)
-        assert '"count": 7' in str(result)
+        assert json.loads(str(result))["structuredContent"]["count"] == 7
     else:
         assert isinstance(result, ToolFailure)
         assert result.error.kind == "mcp_protocol"
