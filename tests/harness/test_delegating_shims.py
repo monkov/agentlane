@@ -8,6 +8,7 @@ compose with the delegated default.
 
 import asyncio
 import inspect
+from dataclasses import dataclass, field
 from typing import Any
 
 from agentlane.harness import RunResult, RunState
@@ -19,13 +20,16 @@ from agentlane.harness.shims import (
     PreparedTurn,
     Shim,
     ShimBindingContext,
+    ToolSourceBinding,
 )
+from agentlane.harness.shims._manager import BoundShimManager
 from agentlane.messaging import AgentId
 from agentlane.models import MessageDict, ModelResponse
 from agentlane.models.run import DefaultRunContext, RunContext
 from agentlane.runtime import SingleThreadedRuntimeEngine
 
 from .test_shims import make_assistant_response
+from .tools_test_utils import named_tool
 
 
 def _public_callbacks(cls: type) -> set[str]:
@@ -305,5 +309,242 @@ def test_delegating_shim_bind_can_wrap_inner_bound_session() -> None:
         assert bound.injected == 1
         # The wrapped bound session still forwarded prepare_turn to the inner.
         assert inner.bound.calls == ["prepare_turn"]
+
+    asyncio.run(scenario())
+
+
+def test_delegating_shims_forward_dynamic_tool_inheritance() -> None:
+    """Source replacement results and name restrictions cross both wrappers."""
+    names = frozenset({"remote__read"})
+    seen: list[frozenset[str]] = []
+
+    class SourceSession(BoundShim):
+        def inherit_tools(
+            self, names: frozenset[str]
+        ) -> tuple[ToolSourceBinding, ...] | None:
+            seen.append(names)
+            return ()
+
+    class SourceDefinition(Shim):
+        @property
+        def name(self) -> str:
+            return "source"
+
+        def inherit_tools(
+            self, names: frozenset[str]
+        ) -> tuple[ToolSourceBinding, ...] | None:
+            seen.append(names)
+            return ()
+
+    assert DelegatingBoundShim(SourceSession()).inherit_tools(names) == ()
+    assert DelegatingShim(SourceDefinition()).inherit_tools(names) == ()
+    assert seen == [names, names]
+
+
+@dataclass
+class _BoundToolSource(BoundShim):
+    source: object
+    names: frozenset[str]
+
+    async def prepare_turn(self, turn: PreparedTurn) -> None:
+        turn.add_tools(tuple(named_tool(name) for name in sorted(self.names)))
+
+    def inherit_tools(self, names: frozenset[str]) -> tuple[ToolSourceBinding, ...]:
+        allowed = self.names & names
+
+        async def bind_restricted(context: ShimBindingContext) -> BoundShim:
+            del context
+            return _BoundToolSource(self.source, allowed)
+
+        return (ToolSourceBinding(source=self.source, bind=bind_restricted),)
+
+
+@dataclass
+class _EqualToolSource(Shim):
+    """Equal, unhashable definitions still denote separate source identities."""
+
+    group: str
+    names: frozenset[str] = field(compare=False)
+
+    @property
+    def name(self) -> str:
+        return self.group
+
+    async def bind(self, context: ShimBindingContext) -> BoundShim:
+        for binding in context.tool_source_bindings:
+            if binding.source is self:
+                return await binding.bind(context)
+
+        if context.tool_source_bindings:
+            return BoundShim()
+
+        return _BoundToolSource(self, self.names)
+
+
+@dataclass
+class _CombinedSourcesBound(BoundShim):
+    sessions: tuple[BoundShim, ...]
+
+    async def prepare_turn(self, turn: PreparedTurn) -> None:
+        for session in self.sessions:
+            await session.prepare_turn(turn)
+
+    def inherit_tools(self, names: frozenset[str]) -> tuple[ToolSourceBinding, ...]:
+        return tuple(
+            binding
+            for session in self.sessions
+            for binding in session.inherit_tools(names) or ()
+        )
+
+
+@dataclass
+class _CombinedSources(Shim):
+    sources: tuple[_EqualToolSource, ...]
+    contexts: list[ShimBindingContext] = field(default_factory=list[ShimBindingContext])
+
+    @property
+    def name(self) -> str:
+        return "combined-sources"
+
+    async def bind(self, context: ShimBindingContext) -> BoundShim:
+        self.contexts.append(context)
+        return _CombinedSourcesBound(
+            tuple([await source.bind(context) for source in self.sources])
+        )
+
+
+class _CountingWrapper(DelegatingShim):
+    def __init__(self, inner: Shim) -> None:
+        super().__init__(inner)
+        self.sessions: list[BoundShim] = []
+
+    async def bind(self, context: ShimBindingContext) -> BoundShim:
+        session = DelegatingBoundShim(await self.inner.bind(context))
+        self.sessions.append(session)
+        return session
+
+
+async def _visible_source_names(manager: BoundShimManager) -> set[str]:
+    turn = _make_prepared_turn()
+    await manager.prepare_turn(turn)
+    return (
+        {tool.name for tool in turn.tools.normalized_tools}
+        if turn.tools is not None
+        else set()
+    )
+
+
+def test_tool_source_unmatched_binding_exposes_no_tools() -> None:
+    async def scenario() -> None:
+        included = _EqualToolSource("same", frozenset({"read"}))
+        excluded = _EqualToolSource("same", frozenset({"write"}))
+        assert included == excluded
+        assert type(included).__hash__ is None
+        parent = await included.bind(_make_binding_context())
+        bindings = parent.inherit_tools(frozenset({"read"}))
+        assert bindings
+
+        context = _make_binding_context()
+        context.tool_source_bindings = bindings
+        child = await BoundShimManager.bind(shims=(excluded,), context=context)
+
+        assert await _visible_source_names(child) == set()
+
+    asyncio.run(scenario())
+
+
+def test_multiple_source_bindings_keep_identity_and_bind_wrapper_once() -> None:
+    async def scenario() -> None:
+        first = _EqualToolSource("same", frozenset({"alpha", "alpha_extra"}))
+        second = _EqualToolSource("same", frozenset({"beta", "beta_extra"}))
+        assert first == second
+        assert type(first).__hash__ is None
+        combined = _CombinedSources((first, second))
+        wrapper = _CountingWrapper(combined)
+        parent = await BoundShimManager.bind(
+            shims=(wrapper,), context=_make_binding_context()
+        )
+        child_definitions = parent.child_shims(
+            frozenset({"alpha", "beta"}), inherit_definitions=True
+        )
+        assert len(child_definitions) == 1
+        child = await BoundShimManager.bind(
+            shims=child_definitions, context=_make_binding_context()
+        )
+
+        assert await _visible_source_names(child) == {"alpha", "beta"}
+        assert await _visible_source_names(parent) == {
+            "alpha",
+            "alpha_extra",
+            "beta",
+            "beta_extra",
+        }
+        assert len(wrapper.sessions) == len(combined.contexts) == 2
+        assert wrapper.sessions[0] is not wrapper.sessions[1]
+        bindings = combined.contexts[1].tool_source_bindings
+        assert len(bindings) == 2
+        assert bindings[0].source is first
+        assert bindings[1].source is second
+
+    asyncio.run(scenario())
+
+
+def test_source_binding_none_and_empty_keep_distinct_inheritance_semantics() -> None:
+    class SuppressedShim(_RecordingShim):
+        def inherit_tools(self, names: frozenset[str]) -> tuple[ToolSourceBinding, ...]:
+            del names
+            return ()
+
+        async def bind(self, context: ShimBindingContext) -> BoundShim:
+            return await Shim.bind(self, context)
+
+    async def scenario() -> None:
+        normal = _RecordingShim()
+        suppressed = SuppressedShim()
+        source = _EqualToolSource("dynamic", frozenset({"read"}))
+        parent = await BoundShimManager.bind(
+            shims=(normal, suppressed, source), context=_make_binding_context()
+        )
+
+        inherited = parent.child_shims(frozenset({"read"}), inherit_definitions=True)
+        assert len(inherited) == 2
+        assert inherited[0] is normal
+        assert all(shim is not suppressed for shim in inherited)
+        restricted = parent.child_shims(frozenset({"read"}), inherit_definitions=False)
+        assert len(restricted) == 1
+        assert restricted[0] is not normal
+        child = await BoundShimManager.bind(
+            shims=restricted, context=_make_binding_context()
+        )
+        assert await _visible_source_names(child) == {"read"}
+
+    asyncio.run(scenario())
+
+
+def test_grandchild_source_bindings_replace_older_caps_without_unwrapping() -> None:
+    async def scenario() -> None:
+        first = _EqualToolSource("same", frozenset({"alpha", "alpha_extra"}))
+        second = _EqualToolSource("same", frozenset({"beta", "beta_extra"}))
+        combined = _CombinedSources((first, second))
+        wrapper = _CountingWrapper(combined)
+        parent = await BoundShimManager.bind(
+            shims=(wrapper,), context=_make_binding_context()
+        )
+        child = await BoundShimManager.bind(
+            shims=parent.child_shims(
+                frozenset({"alpha", "beta"}), inherit_definitions=True
+            ),
+            context=_make_binding_context(),
+        )
+        grandchild = await BoundShimManager.bind(
+            shims=child.child_shims(frozenset({"alpha"}), inherit_definitions=True),
+            context=_make_binding_context(),
+        )
+
+        assert await _visible_source_names(grandchild) == {"alpha"}
+        assert await _visible_source_names(child) == {"alpha", "beta"}
+        assert len(wrapper.sessions) == len(combined.contexts) == 3
+        assert len({id(session) for session in wrapper.sessions}) == 3
+        assert len(combined.contexts[2].tool_source_bindings) == 2
 
     asyncio.run(scenario())

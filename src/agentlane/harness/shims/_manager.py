@@ -1,6 +1,7 @@
 """Private shim-session manager for one bound harness agent."""
 
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any, Self
 
 from agentlane.models import MessageDict, ModelResponse
@@ -9,15 +10,44 @@ from agentlane.models.run import RunContext
 from .._cancellation import raise_cleanup_errors
 from .._hooks import RunnerHooks
 from .._run import RunResult, RunState
-from ._base import BoundShim, Shim
-from ._types import PreparedTurn, ShimBindingContext
+from ._base import (
+    BoundShim,
+    DelegatingShim,
+    Shim,
+    ShimBindingContext,
+    ToolSourceBinding,
+)
+from ._types import PreparedTurn
+
+
+class _InheritedShim(DelegatingShim):
+    """Bind the original wrapper chain with restricted source factories."""
+
+    def __init__(
+        self, definition: Shim, bindings: tuple[ToolSourceBinding, ...]
+    ) -> None:
+        # A grandchild must use its new limits, not an older adapter's limits.
+        if isinstance(definition, _InheritedShim):
+            definition = definition.inner
+        super().__init__(definition)
+        self._bindings = bindings
+
+    async def bind(self, context: ShimBindingContext) -> BoundShim:
+        return await self.inner.bind(
+            replace(context, tool_source_bindings=self._bindings)
+        )
 
 
 class BoundShimManager:
     """Ordered bound shim sessions for one concrete agent instance."""
 
-    def __init__(self, sessions: tuple[BoundShim, ...]) -> None:
+    def __init__(
+        self,
+        sessions: tuple[BoundShim, ...],
+        definitions: tuple[Shim, ...] = (),
+    ) -> None:
         self._sessions = sessions
+        self._definitions = definitions
         self._started_sessions: list[BoundShim] = []
         self._runner_hooks = _collect_runner_hooks(sessions)
 
@@ -35,7 +65,7 @@ class BoundShimManager:
         sessions: list[BoundShim] = []
         for shim in shims:
             sessions.append(await shim.bind(context))
-        return cls(tuple(sessions))
+        return cls(tuple(sessions), tuple(shims))
 
     @property
     def sessions(self) -> tuple[BoundShim, ...]:
@@ -102,6 +132,24 @@ class BoundShimManager:
 
         if errors:
             raise_cleanup_errors("Shim cleanup failed.", errors)
+
+    def child_shims(
+        self,
+        names: frozenset[str],
+        *,
+        inherit_definitions: bool,
+    ) -> tuple[Shim, ...]:
+        """Rebind dynamic tool sources without copying executable closures."""
+        shims: list[Shim] = []
+        for definition, session in zip(self._definitions, self._sessions, strict=True):
+            bindings = session.inherit_tools(names)
+            if bindings:
+                shims.append(_InheritedShim(definition, bindings))
+            elif bindings is not None:
+                continue
+            elif inherit_definitions:
+                shims.append(definition)
+        return tuple(shims)
 
 
 def _collect_runner_hooks(
