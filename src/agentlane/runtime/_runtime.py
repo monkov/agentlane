@@ -58,6 +58,7 @@ from ._types import DeliveryTask
 
 _IN_FLIGHT_CANCELED = "Runtime shutdown canceled an in-flight delivery."
 _QUEUED_CANCELED = "Runtime shutdown canceled a queued delivery."
+_DELIVERY_CANCELED = "Delivery execution was canceled."
 
 
 class RuntimeEngine(Engine, abc.ABC):
@@ -709,14 +710,26 @@ class SingleThreadedRuntimeEngine(RuntimeEngine):
                 # Mark inflight before dispatch so stop() can target active work.
                 self._inflight_by_worker[worker_task] = task
             try:
-                outcome = await self._dispatcher.dispatch(task)
+                # A delivery owns its cancellation and task-local resources.
+                # Await its whole lifecycle before releasing the recipient slot.
+                delivery = asyncio.create_task(self._dispatcher.dispatch(task))
+                outcome = await delivery
+                if worker_task is not None and worker_task.cancelling():
+                    # A handler can settle and return after shutdown cancels it.
+                    # The worker must still exit instead of waiting for more work.
+                    raise asyncio.CancelledError
+
                 # RPC path: complete awaiting caller with terminal delivery outcome.
                 if task.response_future is not None and not task.response_future.done():
                     task.response_future.set_result(outcome)
             except asyncio.CancelledError:
-                # Worker cancellation during dispatch maps to a canceled delivery outcome.
-                self._cancel_task(task=task, message=_IN_FLIGHT_CANCELED)
-                raise
+                stopping = worker_task is not None and worker_task.cancelling() > 0
+                self._cancel_task(
+                    task=task,
+                    message=_IN_FLIGHT_CANCELED if stopping else _DELIVERY_CANCELED,
+                )
+                if stopping:
+                    raise
             finally:
                 if worker_task is not None:
                     self._inflight_by_worker.pop(worker_task, None)

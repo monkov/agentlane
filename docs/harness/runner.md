@@ -285,6 +285,13 @@ Two scope contracts matter for consumers that aggregate run telemetry:
 
 ## Stream Cancellation And Closure
 
+For `DefaultAgent`, a cancelled `run(...)` reports a `RuntimeError` with
+delivery status `canceled`. The `run_stream(...)` and `run_events(...)`
+interfaces report cancellation with `asyncio.CancelledError`. Cancelled runs
+do not commit partial `RunState`. Cancelling a run on a shared runtime leaves
+that runtime available for later runs. Shim cleanup finishes before the next
+delivery for the same agent starts.
+
 `run_events(...)` and `run_stream(...)` both return a stream handle that
 exposes `aclose()` (inherited from the shared
 [`BaseRunStream`](../../src/agentlane/harness/_stream_base.py)). The

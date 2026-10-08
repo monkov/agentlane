@@ -9,13 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added `ToolSpec.strict` for schema handling and `Tool.retry_on_timeout` for
-  per-tool timeout retry control.
+- Added `PreparedTurn.add_tools(...)`, persistent tool exclusions, and
+  `ToolNameCollisionError` for shim tool contributions.
 
 ### Fixed
 
-- Omit tool arguments and results from function spans when tracing uses
-  `ModelTracing.ENABLED_WITHOUT_DATA`.
+- Clean up started shims after partial startup, continue later cleanup after a
+  callback fails, and preserve the primary startup or run error.
+- Apply tool exclusions and execution budgets after all shim contributions,
+  preserve tool settings through empty name filters, and remove required tool
+  choice when the final tool set is empty.
 
 ## [0.18.0] - 2026-10-06
 
