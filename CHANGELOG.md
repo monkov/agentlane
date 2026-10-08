@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `ToolSpec.strict` for schema handling and `Tool.retry_on_timeout` for
+  per-tool timeout retry control.
+
+### Fixed
+
+- Omit tool arguments and results from function spans when tracing uses
+  `ModelTracing.ENABLED_WITHOUT_DATA`.
+
 ## [0.18.0] - 2026-10-06
 
 AgentLane `0.18.0` gives mounted file tools a fixed virtual working directory and consistent rooted paths. Custom mounted permission policies must use rooted scopes.
