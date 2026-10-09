@@ -73,7 +73,8 @@ unchanged; adapters receive the strictness setting with the tool definition.
 
 `Tool.retry_on_timeout` defaults to `True`. Set it to `False` to disable
 automatic timeout retries in `ToolExecutor`, even when
-`Tools.tool_call_max_retries` allows retries.
+`Tools.tool_call_max_retries` allows retries. [MCP tools](../harness/mcp.md)
+use `strict=False` and `retry_on_timeout=False`.
 
 ### Wrapping And Copying Tools
 

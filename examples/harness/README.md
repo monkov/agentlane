@@ -24,6 +24,7 @@ harness directly.
 17. [persistent_agent_quickstart](./persistent_agent_quickstart/): path-backed `DefaultAgent` that restores its address and conversation across separate process runs.
 18. [claude_agent_sdk_coworker](./claude_agent_sdk_coworker/): real OpenAI-to-Claude-to-OpenAI proof where a native AgentLane agent sends an addressed task to a Claude Agent SDK participant and completes the original run.
 19. [mounted_filesystem](./mounted_filesystem/): read, write, find, and patch mounted files; run grep and bash in a separate process workspace, without a model.
+20. [mcp_meeting_assistant](./mcp_meeting_assistant/): `DefaultAgent` that uses OpenRouter and MCP tools to search and read local meeting notes.
 
 ## Run
 
@@ -31,7 +32,8 @@ Most harness demos require `OPENAI_API_KEY` in the environment:
 
 The `process_bridge_stdio` and `mounted_filesystem` demos do not call a model
 provider and need no API key. The `claude_agent_sdk_coworker` demo also needs
-`ANTHROPIC_API_KEY` and the `claude-agent-sdk` extra.
+`ANTHROPIC_API_KEY` and the `claude-agent-sdk` extra. The MCP meeting assistant
+uses `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` instead.
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -57,4 +59,6 @@ uv sync --extra claude-agent-sdk
 export ANTHROPIC_API_KEY=...
 uv run python examples/harness/claude_agent_sdk_coworker/main.py
 (cd examples/harness/process_bridge_stdio && bun install && bun run client.ts)
+uv run --env-file .env.local --extra mcp --extra litellm \
+  python examples/harness/mcp_meeting_assistant/main.py
 ```

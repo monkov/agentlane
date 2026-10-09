@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added `agentlane[mcp]` with Streamable HTTP and stdio servers, native tools,
+  and application-managed bearer authorization through `MCPToolsShim`.
+- Added `ToolSpec.strict` for schema handling and `Tool.retry_on_timeout` for
+  per-tool timeout retry control.
 - Added `PreparedTurn.add_tools(...)`, persistent tool exclusions, and
   `ToolNameCollisionError` for shim tool contributions.
 - Added `ToolSourceBinding` and restricted dynamic tool inheritance for generic
@@ -17,11 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Require MCP SDK 2.2 or later within major version 2 to prevent external schema
+  requests during tool-result validation.
+- Bound MCP result rendering before redaction and serialization. Omit oversized
+  values and retain `truncated` and `omittedBlocks` without a full-result
+  omitted-character count.
+- Preserve the MCP server's `isError` flag in model-facing results, including
+  truncated output.
+- Reject a tool request if its authorization changes between discovery and the
+  first HTTP send.
 - Clean up started shims after partial startup, continue later cleanup after a
   callback fails, and preserve the primary startup or run error.
 - Apply tool exclusions and execution budgets after all shim contributions,
   preserve tool settings through empty name filters, and remove required tool
   choice when the final tool set is empty.
+- Omit tool arguments and results from function spans when tracing uses
+  `ModelTracing.ENABLED_WITHOUT_DATA`.
 
 ## [0.18.0] - 2026-10-06
 

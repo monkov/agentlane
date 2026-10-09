@@ -77,6 +77,7 @@ Build agent loops and extend their behavior:
 - [Shims](./harness/shims.md)
 - [Compaction](./harness/compaction.md)
 - [Tools](./harness/tools.md)
+- [MCP Tools](./harness/mcp.md)
 - [Skills](./harness/skills.md)
 - [Markdown Agent Definitions](./harness/agent-definitions.md)
 - [Runner](./harness/runner.md)
