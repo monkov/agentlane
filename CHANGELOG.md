@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `PreparedTurn.add_tools(...)`, persistent tool exclusions, and
   `ToolNameCollisionError` for shim tool contributions.
+- Added `ToolSourceBinding` and restricted dynamic tool inheritance for generic
+  agents, predefined agents, and handoffs. Child agents bind fresh source and
+  wrapper sessions while preserving visible-name restrictions.
 
 ### Fixed
 

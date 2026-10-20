@@ -87,6 +87,7 @@ from ._run import (
 )
 from ._stream import RunStream
 from ._task import Task
+from ._tooling import InheritTools, RestrictTools, ToolConfig
 from .shims import PreparedTurn, Shim
 from .shims._manager import BoundShimManager
 
@@ -765,6 +766,7 @@ class Runner:
             return await self._execute_agent_tool_call(
                 agent=agent,
                 runner_task=runner_task,
+                tools=tools,
                 tool_call=tool_call,
                 tool_definition=tool_definition,
                 hooks=hooks,
@@ -775,6 +777,7 @@ class Runner:
             return await self._execute_default_agent_tool_call(
                 agent=agent,
                 runner_task=runner_task,
+                tools=tools,
                 tool_call=tool_call,
                 tool_definition=tool_definition,
                 hooks=hooks,
@@ -821,6 +824,7 @@ class Runner:
         *,
         agent: Task,
         runner_task: RunnerTask,
+        tools: Tools,
         tool_call: ToolCall,
         tool_definition: AgentTool,
         hooks: RunnerHooks,
@@ -835,6 +839,7 @@ class Runner:
         delegated_result = await self._run_delegated_sub_agent(
             agent=agent,
             runner_task=runner_task,
+            visible_tools=tools,
             tool_name=tool_definition.name,
             descriptor=tool_definition.descriptor,
             run_input=_agent_tool_run_input(parsed_input),
@@ -853,6 +858,7 @@ class Runner:
         *,
         agent: Task,
         runner_task: RunnerTask,
+        tools: Tools,
         tool_call: ToolCall,
         tool_definition: DefaultAgentTool,
         hooks: RunnerHooks,
@@ -867,6 +873,7 @@ class Runner:
         delegated_result = await self._run_default_agent_tool(
             agent=agent,
             runner_task=runner_task,
+            visible_tools=tools,
             tool_name=tool_definition.name,
             tool_definition=tool_definition,
             parsed_input=parsed_input,
@@ -918,6 +925,17 @@ class Runner:
         handoff_descriptor = _resolved_handoff_descriptor(
             runner_task=runner_task,
             tool_definition=tool_definition,
+        )
+        handoff_descriptor = replace(
+            handoff_descriptor,
+            shims=_child_shims(
+                agent=agent,
+                runner_task=runner_task,
+                visible_tools=tools,
+                policy=handoff_descriptor.tools,
+                inherit_definitions=False,
+            )
+            + tuple(handoff_descriptor.shims or ()),
         )
         await hooks.on_tool_call_start(agent, handoff_call)
         if run_events is not None:
@@ -989,6 +1007,7 @@ class Runner:
         *,
         agent: Task,
         runner_task: RunnerTask,
+        visible_tools: Tools,
         tool_name: str,
         descriptor: AgentDescriptor,
         run_input: list[RunHistoryItem],
@@ -999,6 +1018,17 @@ class Runner:
         child_descriptor = _resolved_child_descriptor(
             runner_task=runner_task,
             descriptor=descriptor,
+        )
+        child_descriptor = replace(
+            child_descriptor,
+            shims=_child_shims(
+                agent=agent,
+                runner_task=runner_task,
+                visible_tools=visible_tools,
+                policy=child_descriptor.tools,
+                inherit_definitions=False,
+            )
+            + tuple(child_descriptor.shims or ()),
         )
         runtime.register_factory(
             delegated_agent_type(agent.id, tool_name, kind="tool"),
@@ -1020,6 +1050,7 @@ class Runner:
         *,
         agent: Task,
         runner_task: RunnerTask,
+        visible_tools: Tools,
         tool_name: str,
         tool_definition: DefaultAgentTool,
         parsed_input: DefaultAgentToolInput,
@@ -1049,7 +1080,13 @@ class Runner:
                 ),
                 schema=tool_definition.output_schema,
                 tools=tool_definition.tools,
-                shims=_default_agent_child_shims(runner_task),
+                shims=_child_shims(
+                    agent=agent,
+                    runner_task=runner_task,
+                    visible_tools=visible_tools,
+                    policy=tool_definition.tools,
+                    inherit_definitions=True,
+                ),
             )
             runtime.register_factory(
                 delegated_agent_type(agent.id, tool_name, kind="tool"),
@@ -1317,9 +1354,27 @@ def _default_agent_tool_run_input(
     return [parsed_input.task]
 
 
-def _default_agent_child_shims(runner_task: RunnerTask) -> tuple[Shim, ...]:
-    """Return parent shims inherited by one generic spawned helper."""
-    return tuple(runner_task.shims or ())
+def _child_shims(
+    *,
+    agent: Task,
+    runner_task: RunnerTask,
+    visible_tools: Tools,
+    policy: ToolConfig,
+    inherit_definitions: bool,
+) -> tuple[Shim, ...]:
+    """Resolve inherited dynamic sources separately from child-local tools."""
+    visible_names = frozenset(tool.name for tool in visible_tools.normalized_tools)
+    names: frozenset[str]
+    if isinstance(policy, InheritTools):
+        names = visible_names
+    elif isinstance(policy, RestrictTools):
+        names = visible_names.intersection(policy.names)
+    else:
+        names = frozenset()
+    manager = _shim_manager(agent)
+    if manager is not None:
+        return manager.child_shims(names, inherit_definitions=inherit_definitions)
+    return tuple(runner_task.shims or ()) if inherit_definitions else ()
 
 
 def _tool_result_message(

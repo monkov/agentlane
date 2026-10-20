@@ -30,12 +30,13 @@ from agentlane.harness.shims import (
     Shim,
     ShimBindingContext,
     ToolNameCollisionError,
+    ToolSourceBinding,
 )
 ```
 
 The public surface is `Shim`, `BoundShim`, `DelegatingBoundShim`,
-`DelegatingShim`, `PreparedTurn`, `ShimBindingContext`, and
-`ToolNameCollisionError`.
+`DelegatingShim`, `PreparedTurn`, `ShimBindingContext`, `ToolNameCollisionError`,
+and `ToolSourceBinding`.
 
 ## Mental Model
 
@@ -282,8 +283,12 @@ leaking mutable state between them. The bind signature is:
 async def bind(self, context: ShimBindingContext) -> BoundShim: ...
 ```
 
-`ShimBindingContext` exposes a single field, `context.task`, the bound
-harness task or agent that owns this shim session.
+`ShimBindingContext.task` identifies the harness task or agent that owns the
+session. `tool_source_bindings` contains restricted factories for inherited
+dynamic tool sources and defaults to an empty tuple. Wrappers must forward
+the complete context to the inner definition's `bind(...)` method.
+When this tuple is nonempty, it is the source allowlist for that definition.
+Dynamic sources without an identity match must stay inactive.
 
 Shims may also contribute additional runner hooks through `runner_hooks()`.
 This is useful when a shim should register tracing, logging, database writes,
@@ -291,6 +296,31 @@ script execution, or other lifecycle-triggered actions automatically with the
 bound agent runtime. A plain `Shim` subclass can override `runner_hooks()`
 directly; the default bound session forwards it automatically. Reserve a custom
 `BoundShim` for cases that also need private per-agent in-memory state.
+
+A bound dynamic tool source can implement `inherit_tools(names)` to bind its
+tools to child agents. `names` contains the parent's visible tool names allowed
+by the child policy. Return a tuple of `ToolSourceBinding` values, an empty
+tuple to suppress inheritance of this definition, or `None` for normal shim
+inheritance.
+
+Each `ToolSourceBinding` has two fields:
+
+- `source`: the original source definition, matched by object identity.
+- `bind`: an async factory that accepts `ShimBindingContext` and returns one
+  fresh `BoundShim` limited to the inherited names. It must create child-owned
+  state and must not copy the parent's leases or executable tool handlers.
+
+The source definition checks `context.tool_source_bindings` in `bind(...)`.
+When `binding.source is self`, it calls `await binding.bind(context)`. A
+matching binding takes precedence over the definition's default source
+configuration, so that configuration cannot broaden the inherited tool set.
+If the tuple is nonempty but has no match, return an inactive `BoundShim()`.
+This also prevents a combined definition from restoring an excluded source.
+The factory constructs the session with its restrictions already applied.
+
+The harness calls the original outer definition's `bind(...)` for each child.
+Its wrapper chain creates fresh bound wrapper state around the restricted
+source. `bind(...)` continues to return one `BoundShim`.
 
 For a runnable example, see
 [examples/harness/default_agent_shims_quickstart](../../examples/harness/default_agent_shims_quickstart/README.md).
@@ -348,6 +378,11 @@ class RunStateInjectingShim(DelegatingShim):
         inner = await self.inner.bind(context)
         return RunStateInjectingBoundShim(inner, self._consumer)
 ```
+
+This pattern also preserves wrappers around inherited dynamic tool sources.
+The outer `bind(...)` runs again for the child and forwards the restricted
+source bindings through `context`. Construct a new wrapper session on each
+call to keep parent and child state separate.
 
 Both bases are reflection-tested against the full `BoundShim`/`Shim` callback
 surface, so a newly added callback cannot silently bypass delegation.

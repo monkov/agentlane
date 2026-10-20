@@ -1,6 +1,8 @@
 """Base shim contracts for the harness."""
 
 import abc
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from agentlane.models import MessageDict, ModelResponse
@@ -8,7 +10,35 @@ from agentlane.models.run import RunContext
 
 from .._hooks import RunnerHooks
 from .._run import RunResult, RunState
-from ._types import PreparedTurn, ShimBindingContext
+from .._task import Task
+from ._types import PreparedTurn
+
+type ToolSourceBinder = Callable[[ShimBindingContext], Awaitable[BoundShim]]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolSourceBinding:
+    """Restricted child binding for one dynamic source definition."""
+
+    source: object
+    """Original source definition, matched by identity during binding."""
+
+    bind: ToolSourceBinder
+    """Create fresh child state without parent leases or tool handlers."""
+
+
+@dataclass(slots=True)
+class ShimBindingContext:
+    """Static binding data for one shim on one bound agent instance."""
+
+    task: Task
+    """Bound harness task or agent that owns this shim session."""
+
+    tool_source_bindings: tuple[ToolSourceBinding, ...] = ()
+    """Source allowlist for this inherited definition, forwarded by wrappers.
+
+    When nonempty, dynamic sources without an identity match must stay inactive.
+    """
 
 
 class BoundShim:
@@ -58,6 +88,19 @@ class BoundShim:
         """Handle the end of one run."""
         _ = result
         _ = transient_state
+
+    def inherit_tools(
+        self, names: frozenset[str]
+    ) -> tuple[ToolSourceBinding, ...] | None:
+        """Return source bindings restricted to visible inherited names.
+
+        `None` preserves normal shim inheritance. An empty tuple suppresses
+        inheritance. Returned bindings replace only their source sessions;
+        the original definition and its wrappers bind again for the child.
+        Sources must not expose names outside the supplied set.
+        """
+        del names
+        return None
 
     def runner_hooks(self) -> tuple[RunnerHooks, ...]:
         """Return additional hooks for this bound shim session."""
@@ -131,6 +174,11 @@ class DelegatingBoundShim(BoundShim):
     ) -> None:
         await self._inner.on_run_end(result, transient_state)
 
+    def inherit_tools(
+        self, names: frozenset[str]
+    ) -> tuple[ToolSourceBinding, ...] | None:
+        return self._inner.inherit_tools(names)
+
     def runner_hooks(self) -> tuple[RunnerHooks, ...]:
         return self._inner.runner_hooks()
 
@@ -171,6 +219,11 @@ class _ForwardingBoundShim(BoundShim):
         transient_state: RunContext[Any],
     ) -> None:
         await self._shim.on_run_end(result, transient_state)
+
+    def inherit_tools(
+        self, names: frozenset[str]
+    ) -> tuple[ToolSourceBinding, ...] | None:
+        return self._shim.inherit_tools(names)
 
     def runner_hooks(self) -> tuple[RunnerHooks, ...]:
         return self._shim.runner_hooks()
@@ -238,6 +291,13 @@ class Shim(abc.ABC):
         """Handle the end of one run."""
         _ = result
         _ = transient_state
+
+    def inherit_tools(
+        self, names: frozenset[str]
+    ) -> tuple[ToolSourceBinding, ...] | None:
+        """Return restricted child source bindings, or normal inheritance."""
+        del names
+        return None
 
     def runner_hooks(self) -> tuple[RunnerHooks, ...]:
         """Return additional runner hooks for this shim definition."""
@@ -318,6 +378,11 @@ class DelegatingShim(Shim):
         transient_state: RunContext[Any],
     ) -> None:
         await self._inner.on_run_end(result, transient_state)
+
+    def inherit_tools(
+        self, names: frozenset[str]
+    ) -> tuple[ToolSourceBinding, ...] | None:
+        return self._inner.inherit_tools(names)
 
     def runner_hooks(self) -> tuple[RunnerHooks, ...]:
         return self._inner.runner_hooks()

@@ -7,7 +7,6 @@ from agentlane.models import Tools, ToolSpec, render_instruction_text
 from agentlane.models.run import DefaultRunContext, RunContext
 
 from .._run import RunHistoryItem, RunInstructions, RunState, copy_history_item
-from .._task import Task
 from .._tooling import merge_tools
 from ._errors import ToolNameCollisionError
 
@@ -15,14 +14,6 @@ from ._errors import ToolNameCollisionError
 def _default_transient_state() -> RunContext[Any]:
     """Return the default per-run transient state container."""
     return DefaultRunContext()
-
-
-@dataclass(slots=True)
-class ShimBindingContext:
-    """Static binding data for one shim on one bound agent instance."""
-
-    task: Task
-    """Bound harness task or agent that owns this shim session."""
 
 
 @dataclass(slots=True)
