@@ -1,0 +1,29 @@
+[
+  {
+    "id": "atlas-launch",
+    "title": "Atlas launch decision",
+    "topics": ["Atlas", "launch", "pilot"],
+    "owner": "Maya Chen",
+    "due_date": "2026-10-09",
+    "decision": "Run the Atlas pilot with five teams.",
+    "quote": "Maya Chen will run the Atlas pilot with five teams by 2026-10-09."
+  },
+  {
+    "id": "website-accessibility",
+    "title": "Website accessibility review",
+    "topics": ["website", "accessibility", "navigation"],
+    "owner": "Jon Bell",
+    "due_date": "2026-10-16",
+    "decision": "Test keyboard navigation on the new website.",
+    "quote": "Jon Bell will test keyboard navigation on the new website by 2026-10-16."
+  },
+  {
+    "id": "support-handbook",
+    "title": "Support handbook update",
+    "topics": ["support", "handbook", "onboarding"],
+    "owner": "Leila Cruz",
+    "due_date": "2026-10-23",
+    "decision": "Publish the revised support handbook.",
+    "quote": "Leila Cruz will publish the revised support handbook by 2026-10-23."
+  }
+]

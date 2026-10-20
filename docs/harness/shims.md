@@ -131,7 +131,8 @@ tools remain, so later contributions keep those settings.
 
 Use `add_tools(...)` to merge tool definitions while preserving tool settings
 and collision checks. Local contributions keep first-wins precedence. A
-source that requires unambiguous names passes `require_unique_names=True`.
+source that requires unambiguous names, such as MCP, passes
+`require_unique_names=True`.
 A conflicting contribution then raises `ToolNameCollisionError` in either
 shim order, even if another shim filtered the earlier tool out of the current
 configuration. Custom shims that assign `turn.tools` directly bypass this

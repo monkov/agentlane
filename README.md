@@ -129,6 +129,7 @@ uv add "agentlane[openai]"            # OpenAI Responses client (default provide
 uv add "agentlane[litellm]"           # any model LiteLLM supports
 uv add "agentlane[claude-agent-sdk]"  # Claude Agent SDK coworkers
 uv add "agentlane[braintrust]"        # export traces to Braintrust
+uv add "agentlane[mcp]"               # discover and call MCP tools
 ```
 
 Working from a checkout of this repo:
