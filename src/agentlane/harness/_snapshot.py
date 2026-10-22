@@ -145,7 +145,7 @@ class RunContinuation(BaseModel):
 
     kind: Literal["external_tool_continuation"] = "external_tool_continuation"
     """Keep pending execution separate from completed snapshots."""
-    format_version: Literal[1] = 1
+    format_version: int = Field(default=1, ge=1, le=1)
     """Version of this continuation format, not a state revision."""
     continuation_id: UUID = Field(default_factory=uuid4)
     """Runtime-generated identity for the host's durable claim."""
@@ -213,15 +213,6 @@ class RunContinuation(BaseModel):
     def _copy_tool_call(cls, value: object) -> object:
         """Detach the pending call from the caller's nested model."""
         return value.model_dump() if isinstance(value, ToolCall) else value
-
-    @field_validator("format_version", mode="before")
-    @classmethod
-    def _check_version(cls, value: object) -> object:
-        """Do not accept booleans as version one."""
-        if type(value) is not int:
-            raise ValueError("Continuation format_version must be an integer.")
-
-        return value
 
     @model_validator(mode="after")
     def _check_pending_run(self) -> Self:

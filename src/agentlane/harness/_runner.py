@@ -138,11 +138,7 @@ class Runner:
             model=model,
             state=state,
             external_tool_agent_id=self._external_tool_agent_id,
-            external_input=(
-                self._external_input
-                if agent.id == self._external_tool_agent_id
-                else None
-            ),
+            external_input=self._external_input,
             hooks=coerce_runner_hooks(hooks),
             cancellation_token=cancellation_token,
         ).run()
@@ -252,11 +248,7 @@ class Runner:
                 model=model,
                 state=state,
                 external_tool_agent_id=self._external_tool_agent_id,
-                external_input=(
-                    self._external_input
-                    if agent.id == self._external_tool_agent_id
-                    else None
-                ),
+                external_input=self._external_input,
                 emit=emit,
                 run_events=event_emitter,
                 control_stream=stream,

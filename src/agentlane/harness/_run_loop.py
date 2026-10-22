@@ -299,7 +299,7 @@ class RunLoop:
         self.run_events = run_events
         self.control_stream = control_stream
         self.external_tool_agent_id = external_tool_agent_id
-        self.external_input = external_input
+        self.external_input = external_input if self._external_tools_enabled else None
         self._external_resume_applied = False
 
         # Keep tool budgets and pending results local to this run.
@@ -353,9 +353,6 @@ class RunLoop:
                     pause = exc
                 finally:
                     await self._cancel_pending_calls()
-            raise pause
-        except RunPaused:
-            raise
         except BaseException as exc:
             run_error = exc
 
@@ -371,6 +368,8 @@ class RunLoop:
             raise
         finally:
             await self._finish_run(model_scope, result, run_error)
+
+        raise pause
 
     async def _run_turns(
         self, model: Model[ModelResponse], span: Span[Any]
@@ -409,7 +408,6 @@ class RunLoop:
             or saved.checkpoint.agent_id != self.agent.id
         ):
             raise ValueError("External tool continuation belongs to a different root.")
-        RunContinuation.from_json(saved.model_dump())
         current = AgentSnapshot.capture(agent_id=self.agent.id, run_state=self.state)
         if (
             current.revision != saved.checkpoint.revision
