@@ -43,19 +43,24 @@ async def test_no_writer_keeps_existing_response(size: int) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("size", [200, 10_000])
 async def test_exact_fit_is_inline_and_overflow_saves_the_same_text(
     tmp_path: Path,
+    size: int,
 ) -> None:
     filesystem = LocalFileSystem(tmp_path)
-    result = types.CallToolResult(content=[types.TextContent(text="x" * 200)])
-    inline = await _prepare(result, filesystem, limit=1000)
+    result = types.CallToolResult(content=[types.TextContent(text="x" * size)])
+    inline = render_mcp_result(
+        result, MCPResultPolicy(max_text_chars=size + 1000), complete=True
+    )
+    assert await _prepare(result, filesystem, limit=size + 1000) == inline
     assert await _prepare(result, filesystem, limit=len(inline)) == inline
     assert not tuple(tmp_path.iterdir())
 
     response = await _prepare(result, filesystem, limit=len(inline) - 1)
     (path,) = tmp_path.rglob("*.txt")
     notice = f"\n\n[Full MCP result: {json.dumps(str(path.relative_to(tmp_path)))}]"
-    assert path.read_text() == inline
+    assert "".join(path.read_text().splitlines()) == inline
     assert len(response) <= len(inline) - 1
     assert response.endswith(notice)
     assert inline.startswith(response.removesuffix(notice).removesuffix("…"))

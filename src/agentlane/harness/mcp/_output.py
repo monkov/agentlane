@@ -29,12 +29,7 @@ async def render_mcp_result_with_storage(
 
     is_error = read_result(result).is_error
     try:
-        serialized = render_mcp_result(result, policy, secrets=secrets, complete=True)
-
-        # Short TXT lines let the existing read tool page through long strings.
-        text = "\n".join(
-            serialized[i : i + 4096] for i in range(0, len(serialized), 4096)
-        )
+        text = render_mcp_result(result, policy, secrets=secrets, complete=True)
     except Exception:
         return result_response(
             "[MCP result unavailable: could not prepare readable text.]", is_error
@@ -52,7 +47,9 @@ async def render_mcp_result_with_storage(
             or redact_secret_pairs(read_path) != read_path
         ):
             raise ValueError("MCP output path contains credentials.")
-        await write_content(writer, read_path, text.encode("utf-8"))
+        # read cannot return a single line larger than its byte limit.
+        file_text = "\n".join(text[i : i + 4096] for i in range(0, len(text), 4096))
+        await write_content(writer, read_path, file_text.encode("utf-8"))
         notice = f"\n\n[Full MCP result: {json.dumps(read_path, ensure_ascii=False)}]"
     except Exception:
         notice = _UNAVAILABLE
