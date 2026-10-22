@@ -2332,7 +2332,14 @@ async def test_streamed_handoff_observes_child_error(
     loop = asyncio.get_running_loop()
     previous_handler = loop.get_exception_handler()
     unhandled: list[dict[str, Any]] = []
-    loop.set_exception_handler(lambda loop, context: unhandled.append(context))
+
+    def record_exception(
+        loop: asyncio.AbstractEventLoop, context: dict[str, Any]
+    ) -> None:
+        del loop
+        unhandled.append(context)
+
+    loop.set_exception_handler(record_exception)
     try:
         await scenario()
         await asyncio.sleep(0)
