@@ -176,10 +176,9 @@ Image, audio, and resource bodies are returned as metadata.
 ## Store full results
 
 Pass an existing `FileWriter` as `result_writer` and set `result_directory`
-on `MCPToolsShim`. AgentLane writes the supported result content as JSON and
-readable text, waits for both writes, then returns a preview with file paths.
-Both options default to `None` and must be configured together. Without a
-writer, result handling stays unchanged.
+on `MCPToolsShim`. AgentLane writes one readable `.txt` file, waits for the
+write to finish, then returns its path with the preview. Configure both
+options together; they default to `None`.
 
 AgentLane saves a result when the preview loses supported content. This includes
 size or block limits, text hidden by structured content, embedded resource
@@ -205,20 +204,16 @@ reader = read_tool(reader=filesystem)
 shims = (shim, HarnessToolsShim((reader,)))
 ```
 
-Pass `shims` to `AgentDescriptor`. MCP storage and the reader use the same paths.
-AgentLane generates a UUID basename for each result, writes `.json` first,
-then writes `.txt`. A plain writer uses relative paths; a writer with
+Pass `shims` to `AgentDescriptor`. The writer and reader must use the same
+paths. AgentLane generates a UUID filename. A plain writer uses relative
+paths; a writer with
 `FilePathResolver`, such as `MountedFileSystem`, uses its own path rules.
 See [File I/O interfaces](../filesystem.md) for backend contracts and mounts.
 
-The default `preserve_tools=frozenset()` saves only results whose supported
-content does not fit the preview. Selection uses `("notes", "get_transcript")`,
-not the model-visible name `notes__get_transcript`. Selection has no effect
-without a writer.
-
-The writer and directory belong to the shim. Catalog refreshes and inherited
-MCP tools keep them. Shared client connections keep each shim's storage
-configuration separate.
+The default `preserve_tools=frozenset()` saves only results that lose supported
+content in the preview. Without a writer, result handling stays unchanged.
+Storage settings belong to each shim and survive catalog refresh and tool
+inheritance, including when shims share a client connection.
 
 ### Read saved content
 
@@ -230,14 +225,12 @@ The returned preview includes an `output` object:
   "isError": false,
   "truncated": true,
   "output": {
-    "source_path": "/workspace/tool-results/example.json",
     "read_path": "/workspace/tool-results/example.txt"
   }
 }
 ```
 
-Configure a reader that can access these paths. For example, with the native
-[`read`](./read.md) tool, the model can request:
+With the native [`read`](./read.md) tool, the model can request:
 
 ```text
 read(path="/workspace/tool-results/example.txt", offset=1, limit=200)
@@ -245,60 +238,41 @@ read(path="/workspace/tool-results/example.txt", offset=1, limit=200)
 
 Use the reader's continuation offset to read more content. Each text line has
 at most 4 KiB of UTF-8 content, plus its newline. Control characters are
-escaped. The JSON file is the source for further processing; the text file
-is a view for reading in parts.
+escaped. Line wrapping does not truncate text or limit the file size.
 
 ### Stored content
 
-The JSON source contains `schema_version` (`1`), `server_name`, `tool_name`,
-`content`, `structuredContent`, `isError`, and `omissions`. It keeps both text
-and structured content. It also keeps embedded resource text. Image, audio,
-and resource blob bodies are replaced with omission metadata; `omissions`
-includes `"binary"` when this occurs.
+The file contains labeled values for the server name, tool name, error status,
+text blocks, structured content, and embedded resource text. Known credentials
+and values under credential keys are redacted. Image, audio, and resource blob
+bodies have `[omitted: binary]` markers. Request arguments are not stored.
 
-AgentLane removes known credentials and values under credential keys before
-writing. The files contain result content and tool names. Request arguments
-are not added to the files.
+JSON text is parsed into readable values. Duplicate keys or incomplete JSON
+with quoted fields make storage unavailable, because they can hide credential
+keys. Plain bracketed transcript text remains supported. The text layout is
+for reading; it does not define a structured ingestion format.
 
-Source preparation rejects JSON text with duplicate keys or incomplete
-objects and arrays that contain quoted fields. This prevents ambiguous JSON
-from bypassing credential redaction. Plain bracketed transcript text remains
-supported. Rejected source text produces `output.status="unavailable"`.
-
-Saved content has no additional AgentLane size, node, or nesting limit.
-The existing preview limits apply only to the model response. Serialization
-and backend write failures use the failure behavior below. Text line wrapping
-does not truncate the saved text or limit the file size.
-
-File paths share the configured preview budget, which defaults to 51,200
-characters and 32 content blocks. AgentLane keeps each returned path complete.
-If the paths cannot fit, the preview reports `"output":{"status":"unavailable"}`.
-Files can already exist when their paths cannot fit the preview.
+Saved content has no additional AgentLane size, node, or nesting limit. The
+existing preview limits still apply, including to the returned path. If the
+complete path cannot fit, the preview reports `"output":{"status":"unavailable"}`.
+The file can already exist in that case.
 
 ### Host responsibilities and failures
 
-Supply a writer and reader in the same namespace. The host owns backend
-deadlines, access control, and retention. Remote storage uses the application's
-existing filesystem adapter.
+Writes use the same helper as native write and patch tools. The host owns the
+filesystem adapter, write deadlines, access control, and retention. The MCP
+tool timeout covers the provider call. Successful `open_write` context exit
+completes the file.
 
-Writes use the same helper as native write and patch tools. Adapter methods
-run in worker threads. Successful `open_write` context exit completes one
-file. `FileWriter` has no two-file transaction, create-only option, or deletion
-method. If the second write fails, the completed first file can remain. The
-host must handle cleanup and protect saved files if later processing requires
-immutable input.
+The MCP call handler cancels active storage on run cancellation or manager
+shutdown. The shared write helper waits for a started worker-thread write to
+settle. Manager shutdown remains subject to its configured timeout. A
+cancelled write can leave a file without a returned path.
 
-The MCP tool timeout covers the provider call. Configure write deadlines in
-the backend. Cancellation cannot stop a blocking writer: run cancellation
-waits for a started write to settle before returning a cancelled tool result.
-Client manager shutdown also cancels active storage and waits for it to settle,
-subject to the manager's shutdown timeout.
-
-If source preparation or storage fails, the model still gets the bounded
-preview with `"output":{"status":"unavailable"}`. AgentLane does not repeat
-the MCP call. A provider error keeps its `ToolFailure` classification even
-when storage fails. Storage exceptions, source bodies, and request arguments
-are not added to storage failure messages.
+If preparation or storage fails, the model gets the bounded preview with
+`"output":{"status":"unavailable"}`. AgentLane does not repeat the MCP call
+or expose the storage exception. Provider errors keep their `ToolFailure`
+classification.
 
 ## Troubleshooting
 
@@ -315,7 +289,7 @@ Use the symptom or error to choose the next step:
 | `MCPPoolCapacityError` | Reduce concurrent runs or increase `MCPClientLimits.max_connections`. |
 | `MCPShutdownTimeoutError` | Check for a server that does not stop. Increase `shutdown_timeout_seconds` if needed; call `aclose()` again to wait for ongoing cleanup. |
 | Results contain `truncated` or `omittedBlocks` | Read `output.read_path` when present. Otherwise, configure `result_writer` and `result_directory`, request less data, or increase the relevant `MCPResultPolicy` limit. `max_text_chars` must be at least 128. |
-| `output.status` is `unavailable` | Check source preparation, write failures, and whether both paths fit the preview budget. The provider call is not repeated. |
+| `output.status` is `unavailable` | Check content preparation, write failures, and whether the path fits the preview budget. The provider call is not repeated. |
 
 Tool execution failures return `ToolFailure`. Treat server results as
 untrusted input, and keep secrets out of tool arguments and results.

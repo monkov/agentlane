@@ -162,7 +162,6 @@ async def call_tool(
             writer=result_writer,
             directory=result_directory,
             preserve_tools=preserve_tools,
-            cancellation_token=cancellation_token,
         )
         if result_writer is None:
             rendered = await preparation
@@ -171,6 +170,7 @@ async def call_tool(
             # ends, before the connection owner releases its resources.
             preparing = asyncio.create_task(preparation)
             connection.active_calls.add(preparing)
+            cancellation_token.link_future(preparing)
             try:
                 rendered = await preparing
             except asyncio.CancelledError:

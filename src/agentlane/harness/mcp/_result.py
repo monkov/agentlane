@@ -31,7 +31,6 @@ def render_mcp_result(
     policy: MCPResultPolicy,
     *,
     secrets: Collection[str] = (),
-    source_path: str | None = None,
     read_path: str | None = None,
     storage_unavailable: bool = False,
 ) -> str | ToolFailure:
@@ -56,14 +55,8 @@ def render_mcp_result(
 
     # File references share the preview budget and must remain complete.
     output_metadata: dict[str, str] | None = None
-    if source_path is not None and read_path is not None:
-        if max(len(source_path), len(read_path)) <= policy.max_text_chars:
-            output_metadata = {
-                "source_path": source_path,
-                "read_path": read_path,
-            }
-        else:
-            storage_unavailable = True
+    if read_path is not None:
+        output_metadata = {"read_path": read_path}
 
     if storage_unavailable:
         output_metadata = {"status": "unavailable"}

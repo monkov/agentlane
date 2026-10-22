@@ -1,8 +1,6 @@
-"""Preserve complete MCP sources with the existing file writer."""
+"""Save readable MCP results with the existing file writer."""
 
-import asyncio
 import json
-import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,7 +15,6 @@ from agentlane.harness.mcp._output import prepare_mcp_response
 from agentlane.harness.mcp._result import render_mcp_result
 from agentlane.io import Writer
 from agentlane.models import ToolFailure
-from agentlane.runtime import CancellationToken
 
 
 class _RecordingFileSystem(LocalFileSystem):
@@ -27,21 +24,21 @@ class _RecordingFileSystem(LocalFileSystem):
         super().__init__(root)
         self.root = root
         self.paths: list[str] = []
-        self.fail_suffix: str | None = None
+        self.fail_write = False
 
     @contextmanager
     def open_write(self, path: str) -> Generator[Writer, None, None]:
         self.paths.append(path)
-        if self.fail_suffix is not None and path.endswith(self.fail_suffix):
+        if self.fail_write:
             raise TimeoutError("private-host-detail")
         with super().open_write(path) as stream:
             yield stream
 
-    def texts(self, suffix: str) -> list[str]:
+    def texts(self) -> list[str]:
         return [
             (self.root / path).read_text()
             for path in self.paths
-            if path.endswith(suffix) and (self.root / path).exists()
+            if (self.root / path).exists()
         ]
 
 
@@ -56,13 +53,16 @@ async def _prepare(
     *,
     limit: int = 512,
     selected: bool = False,
+    include_structured_content: bool = True,
     directory: str = "results",
     secrets: tuple[str, ...] = (),
-    token: CancellationToken | None = None,
 ) -> str | ToolFailure:
     return await prepare_mcp_response(
         result,
-        policy=MCPResultPolicy(max_text_chars=limit),
+        policy=MCPResultPolicy(
+            max_text_chars=limit,
+            include_structured_content=include_structured_content,
+        ),
         secrets=secrets,
         server_name="notes",
         tool_name="get/document",
@@ -71,7 +71,6 @@ async def _prepare(
         preserve_tools=(
             frozenset({("notes", "get/document")}) if selected else frozenset()
         ),
-        cancellation_token=token if token is not None else CancellationToken(),
     )
 
 
@@ -100,32 +99,38 @@ async def test_large_text_is_saved_before_preview_processing_can_omit_it(
     response = await _prepare(result, filesystem)
     payload = json.loads(response)
     assert len(response) <= 512
-    assert payload["output"] == dict(
-        zip(("source_path", "read_path"), filesystem.paths, strict=True)
-    )
-    source_path, read_path = map(Path, filesystem.paths)
-    assert source_path.parent == read_path.parent == Path("results")
-    assert source_path.stem == read_path.stem == str(UUID(source_path.stem))
-    assert source_path.suffix == ".json"
+    (read_path,) = map(Path, filesystem.paths)
+    assert payload["output"] == {"read_path": str(read_path)}
+    assert read_path.parent == Path("results")
+    assert read_path.stem == str(UUID(read_path.stem))
     assert read_path.suffix == ".txt"
-    assert json.loads(filesystem.texts(".json")[0])["content"][0]["text"] == transcript
-    readable = filesystem.texts(".txt")[0]
+    readable = filesystem.texts()[0]
+    assert "".join(transcript.splitlines()) in "".join(readable.splitlines())
     assert "final words" in readable
     assert all(len(line.encode("utf-8")) <= 4096 for line in readable.splitlines())
 
 
 @pytest.mark.asyncio
-async def test_distinct_text_and_structured_content_are_both_preserved(
-    filesystem: _RecordingFileSystem,
+@pytest.mark.parametrize("include_structured_content", [True, False])
+async def test_content_hidden_by_preview_policy_is_preserved(
+    filesystem: _RecordingFileSystem, include_structured_content: bool
 ) -> None:
     result = types.CallToolResult(
-        content=[types.TextContent(text="Transcript details")],
+        content=(
+            [types.TextContent(text="Transcript details")]
+            if include_structured_content
+            else []
+        ),
         structured_content={"meeting_id": "meeting-123"},
     )
-    await _prepare(result, filesystem)
-    source = json.loads(filesystem.texts(".json")[0])
-    assert source["content"][0]["text"] == "Transcript details"
-    assert source["structuredContent"] == {"meeting_id": "meeting-123"}
+    await _prepare(
+        result, filesystem, include_structured_content=include_structured_content
+    )
+    readable = filesystem.texts()[0]
+    if include_structured_content:
+        assert "Transcript details" in readable
+    assert "meeting_id" in readable
+    assert "meeting-123" in readable
 
 
 @pytest.mark.asyncio
@@ -139,9 +144,9 @@ async def test_embedded_text_is_saved_but_binary_only_omission_does_not_trigger_
     assert filesystem.paths == []
 
     await _prepare(binary, filesystem, selected=True)
-    source = filesystem.texts(".json")[0]
-    assert "binary-canary" not in source + filesystem.texts(".txt")[0]
-    assert json.loads(source)["omissions"] == ["binary"]
+    readable = filesystem.texts()[0]
+    assert "binary-canary" not in readable
+    assert "binary" in readable
 
     resource = types.CallToolResult(
         content=[
@@ -153,11 +158,7 @@ async def test_embedded_text_is_saved_but_binary_only_omission_does_not_trigger_
         ]
     )
     await _prepare(resource, filesystem)
-    assert (
-        json.loads(filesystem.texts(".json")[1])["content"][0]["resource"]["text"]
-        == "Complete embedded text"
-    )
-    assert "Complete embedded text" in filesystem.texts(".txt")[1]
+    assert "Complete embedded text" in filesystem.texts()[1]
 
 
 @pytest.mark.asyncio
@@ -183,27 +184,12 @@ async def test_files_remove_credentials_without_clipping_source_ids(
         structured_content={"authorization": canary, "transcript": transcript},
     )
     response = await _prepare(result, filesystem, secrets=(canary,))
-    source = filesystem.texts(".json")[0]
-    combined = response + source + filesystem.texts(".txt")[0]
+    readable = filesystem.texts()[0]
+    combined = response + readable
     assert canary not in combined
     assert "unknown-secret-canary" not in combined
-    document = json.loads(source)
-    assert json.loads(document["content"][0]["text"])["meeting_id"] == meeting_id
-    assert "arguments" not in document
-    assert "[redacted]" in source
-
-
-@pytest.mark.asyncio
-async def test_json_text_with_no_redactions_preserves_original_formatting(
-    filesystem: _RecordingFileSystem,
-) -> None:
-    original = '{\n  "id": "meeting-1", "value": 1.00\n}'
-    await _prepare(
-        types.CallToolResult(content=[types.TextContent(text=original)]),
-        filesystem,
-        selected=True,
-    )
-    assert json.loads(filesystem.texts(".json")[0])["content"][0]["text"] == original
+    assert meeting_id in "".join(readable.splitlines())
+    assert "[redacted]" in readable
 
 
 @pytest.mark.asyncio
@@ -244,7 +230,7 @@ async def test_bracketed_transcript_prose_is_saved_unchanged(
         filesystem,
         selected=True,
     )
-    assert json.loads(filesystem.texts(".json")[0])["content"][0]["text"] == text
+    assert text in filesystem.texts()[0]
 
 
 @pytest.mark.asyncio
@@ -279,9 +265,7 @@ async def test_paths_share_preview_budget_and_preserve_server_errors(
     payload = json.loads(response)
     assert payload["isError"] is is_error
     if limit == 512:
-        assert payload["output"] == dict(
-            zip(("source_path", "read_path"), filesystem.paths, strict=True)
-        )
+        assert payload["output"] == {"read_path": filesystem.paths[0]}
     else:
         assert payload["output"] == {"status": "unavailable"}
     assert isinstance(response, ToolFailure) is is_error
@@ -290,12 +274,11 @@ async def test_paths_share_preview_budget_and_preserve_server_errors(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fail_suffix", [".json", ".txt"])
 @pytest.mark.parametrize("is_error", [False, True])
 async def test_write_failure_keeps_bounded_result_without_publishing_paths(
-    fail_suffix: str, is_error: bool, filesystem: _RecordingFileSystem
+    is_error: bool, filesystem: _RecordingFileSystem
 ) -> None:
-    filesystem.fail_suffix = fail_suffix
+    filesystem.fail_write = True
     result = types.CallToolResult(
         content=[types.TextContent(text="x" * 5000)], is_error=is_error
     )
@@ -303,10 +286,8 @@ async def test_write_failure_keeps_bounded_result_without_publishing_paths(
     assert len(response) <= 512
     assert json.loads(response)["output"] == {"status": "unavailable"}
     assert "private-host-detail" not in response
-    assert len(filesystem.paths) == (1 if fail_suffix == ".json" else 2)
-    # FileWriter has no multi-file transaction: the first commit can remain.
-    assert len(filesystem.texts(".json")) == (0 if fail_suffix == ".json" else 1)
-    assert filesystem.texts(".txt") == []
+    assert len(filesystem.paths) == 1
+    assert filesystem.texts() == []
     assert isinstance(response, ToolFailure) is is_error
     if isinstance(response, ToolFailure):
         assert response.error.kind == "mcp_server"
@@ -342,10 +323,9 @@ async def test_long_output_paths_save_files_without_exceeding_preview_budget(
         filesystem,
         directory=directory,
     )
-    assert len(filesystem.paths) == 2
+    assert len(filesystem.paths) == 1
     assert all(len(path) > 512 for path in filesystem.paths)
-    assert json.loads(filesystem.texts(".json")[0])["content"][0]["text"] == transcript
-    assert "Complete transcript." in filesystem.texts(".txt")[0]
+    assert transcript in "".join(filesystem.texts()[0].splitlines())
     assert json.loads(response)["output"] == {"status": "unavailable"}
     assert len(response) <= 512
 
@@ -363,8 +343,7 @@ async def test_text_beyond_eight_mib_is_saved_in_full_with_bounded_preview(
     response = await _prepare(result, filesystem)
     assert len(response) <= 512
     assert "read_path" in json.loads(response)["output"]
-    assert json.loads(filesystem.texts(".json")[0])["content"][0]["text"] == transcript
-    assert transcript in "".join(filesystem.texts(".txt")[0].splitlines())
+    assert transcript in "".join(filesystem.texts()[0].splitlines())
 
 
 @pytest.mark.asyncio
@@ -397,87 +376,4 @@ async def test_sources_beyond_preview_structure_limits_are_saved_in_full(
     response = await _prepare(result, filesystem)
     assert len(response) <= 512
     assert "read_path" in json.loads(response)["output"]
-    source = json.loads(filesystem.texts(".json")[0])
-    assert source["content"] == content
-    assert source["structuredContent"] == structured
-    assert final_value in filesystem.texts(".txt")[0]
-
-
-class _BlockedFileSystem(LocalFileSystem):
-    """Hold a real write at context exit until the test permits its commit."""
-
-    def __init__(self, root: Path) -> None:
-        super().__init__(root)
-        self.started = threading.Event()
-        self.release = threading.Event()
-        self.finished = threading.Event()
-        self.paths: list[str] = []
-
-    @contextmanager
-    def open_write(self, path: str) -> Generator[Writer, None, None]:
-        self.paths.append(path)
-        with super().open_write(path) as stream:
-            yield stream
-            self.started.set()
-            if not self.release.wait(timeout=5):
-                raise TimeoutError("Test did not release the blocked writer.")
-        self.finished.set()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("use_token", [True, False])
-async def test_cancellation_waits_for_active_write_and_does_not_return_paths(
-    use_token: bool, tmp_path: Path
-) -> None:
-    token = CancellationToken()
-    filesystem = _BlockedFileSystem(tmp_path)
-    task = asyncio.create_task(
-        _prepare(
-            {"content": [{"type": "text", "text": "x" * 5000}]},
-            filesystem,
-            token=token,
-        )
-    )
-    try:
-        assert await asyncio.to_thread(filesystem.started.wait, 2)
-        if use_token:
-            token.cancel()
-        else:
-            task.cancel()
-        # Let cancellation reach the shared helper, then cancel the owner again.
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-        assert not filesystem.finished.is_set()
-    finally:
-        filesystem.release.set()
-
-    if use_token:
-        response = await asyncio.wait_for(task, timeout=2)
-        assert isinstance(response, ToolFailure)
-        assert response.error.kind == "cancelled"
-    else:
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=2)
-    assert filesystem.finished.is_set()
-    assert len(filesystem.paths) == 1
-    assert (tmp_path / filesystem.paths[0]).is_file()
-    assert list(tmp_path.rglob("*.txt")) == []
-
-
-@pytest.mark.asyncio
-async def test_cancelled_token_does_not_start_a_write(
-    filesystem: _RecordingFileSystem,
-) -> None:
-    token = CancellationToken()
-    token.cancel()
-    response = await _prepare(
-        {"content": [{"type": "text", "text": "x" * 5000}]},
-        filesystem,
-        token=token,
-    )
-    assert isinstance(response, ToolFailure)
-    assert response.error.kind == "cancelled"
-    assert filesystem.paths == []
+    assert final_value in filesystem.texts()[0]

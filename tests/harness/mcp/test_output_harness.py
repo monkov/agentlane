@@ -109,12 +109,9 @@ def fixture_output_peer(install_connection: ConnectionInstaller) -> _Peer:
 class _BlockedFileSystem(LocalFileSystem):
     """Pause a real file write before its context manager commits it."""
 
-    def __init__(
-        self, root: Path, gate: threading.Event, *, suffix: str = ".json"
-    ) -> None:
+    def __init__(self, root: Path, gate: threading.Event) -> None:
         super().__init__(root)
         self.gate = gate
-        self.suffix = suffix
         self.started = threading.Event()
         self.finished = threading.Event()
         self.completed: list[str] = []
@@ -125,14 +122,12 @@ class _BlockedFileSystem(LocalFileSystem):
             yield stream
 
             # Hold context exit so cancellation must wait for the actual commit.
-            if path.endswith(self.suffix):
-                self.started.set()
-                if not self.gate.wait(timeout=10):
-                    raise TimeoutError("The test did not release the file write.")
+            self.started.set()
+            if not self.gate.wait(timeout=10):
+                raise TimeoutError("The test did not release the file write.")
 
         self.completed.append(path)
-        if path.endswith(self.suffix):
-            self.finished.set()
+        self.finished.set()
 
 
 def _server(*, max_chars: int = 512) -> MCPServer:
@@ -231,7 +226,7 @@ async def test_runner_reads_complete_saved_output_through_native_pagination(
                         servers=(_server(),),
                         client_manager=manager,
                         result_writer=filesystem,
-                        result_directory="/saved/tool-results",
+                        result_directory="saved/./sessions/../tool-results",
                     ),
                     HarnessToolsShim(definitions=(read_tool(reader=filesystem),)),
                 ),
@@ -248,9 +243,6 @@ async def test_runner_reads_complete_saved_output_through_native_pagination(
     # Resolve only paths published by the MCP tool, in the configured namespace.
     reference = json.loads(model.preview)["output"]
     read_path = tmp_path / PurePosixPath(reference["read_path"]).relative_to("/saved")
-    source_path = tmp_path / PurePosixPath(reference["source_path"]).relative_to(
-        "/saved"
-    )
     readable_text = read_path.read_text(encoding="utf-8")
     assert "\n".join(model.pages) == readable_text.rstrip("\n")
     assert "END_TRANSCRIPT" in "\n".join(model.pages)
@@ -260,19 +252,15 @@ async def test_runner_reads_complete_saved_output_through_native_pagination(
     assert "\x07" not in readable_text
     assert max(len(line.encode("utf-8")) for line in readable_text.splitlines()) <= 4096
     assert output_peer.calls == [(_TOOL_NAME, {"meeting_id": "meeting-7"})]
-    assert len(list((tmp_path / "tool-results").iterdir())) == 2
-    source = json.loads(source_path.read_text(encoding="utf-8"))
-    assert source["server_name"] == _SERVER_NAME
-    assert source["tool_name"] == _TOOL_NAME
-    assert source["content"][0]["text"] == transcript
-    assert source["structuredContent"] == {"separate_fact": "STRUCTURED_ONLY"}
+    assert len(list((tmp_path / "tool-results").iterdir())) == 1
+    assert reference == {"read_path": f"/saved/tool-results/{read_path.name}"}
 
 
 @pytest.mark.asyncio
 async def test_child_inherits_small_result_selection_with_original_names(
     output_peer: _Peer, tmp_path: Path
 ) -> None:
-    filesystem = MountedFileSystem({"saved": LocalFileSystem(tmp_path)})
+    filesystem = LocalFileSystem(tmp_path)
     child_model = SequenceModel(
         [
             make_assistant_response(
@@ -300,7 +288,7 @@ async def test_child_inherits_small_result_selection_with_original_names(
                         servers=(_server(),),
                         client_manager=manager,
                         result_writer=filesystem,
-                        result_directory="/saved/tool-results",
+                        result_directory="./sessions/../tool-results",
                         preserve_tools=frozenset({(_SERVER_NAME, _TOOL_NAME)}),
                     ),
                 ),
@@ -309,8 +297,8 @@ async def test_child_inherits_small_result_selection_with_original_names(
 
     assert output_peer.calls == [(_TOOL_NAME, {"meeting_id": "child-meeting"})]
     (read_path,) = (tmp_path / "tool-results").glob("*.txt")
-    assert f"/saved/tool-results/{read_path.name}" in json.dumps(child_model.calls[-1])
-    assert read_path.with_suffix(".json").is_file()
+    assert f"tool-results/{read_path.name}" in json.dumps(child_model.calls[-1])
+    assert list((tmp_path / "tool-results").iterdir()) == [read_path]
     assert len(output_peer.opened) == 1
     assert output_peer.discoveries > 1
 
@@ -383,14 +371,13 @@ async def test_concurrent_shims_keep_writers_separate_after_catalog_refresh(
             await asyncio.gather(*runs, return_exceptions=True)
 
     for label, backend, model in zip(labels, backends, models, strict=True):
-        assert len(backend.completed) == 4
+        assert len(backend.completed) == 2
         saved = tmp_path / label / label / "tool-results"
         read_paths = list(saved.glob("*.txt"))
         assert len(read_paths) == 2
         history = json.dumps(model.calls[-1])
         for path in read_paths:
             assert f"/saved/{label}/tool-results/{path.name}" in history
-            assert path.with_suffix(".json").is_file()
         other = "second" if label == "first" else "first"
         assert f"/saved/{other}" not in history
         assert not (tmp_path / label / other).exists()
@@ -402,12 +389,14 @@ async def test_concurrent_shims_keep_writers_separate_after_catalog_refresh(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("suffix", [".json", ".txt"])
-async def test_manager_shutdown_waits_for_active_file_write(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, suffix: str
+@pytest.mark.parametrize("cancel", ["shutdown", "token", "task"])
+async def test_tool_cancellation_waits_for_active_file_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cancel: Literal["shutdown", "token", "task"],
 ) -> None:
     gate = threading.Event()
-    backend = _BlockedFileSystem(tmp_path, gate, suffix=suffix)
+    backend = _BlockedFileSystem(tmp_path, gate)
     filesystem = MountedFileSystem({"saved": backend})
     provider_calls: list[str] = []
 
@@ -443,38 +432,48 @@ async def test_manager_shutdown_waits_for_active_file_write(
         result_directory="/saved/tool-results",
         preserve_tools=frozenset({("math", "add")}),
     )
+    token = CancellationToken()
     call_task = asyncio.create_task(
         tool.run(
             tool.args_type().model_validate({"left": 2, "right": 3}),
-            CancellationToken(),
+            token,
         )
     )
     shutdown: asyncio.Task[None] | None = None
     try:
         assert await asyncio.to_thread(backend.started.wait, 5)
-        shutdown = asyncio.create_task(manager.aclose())
+        if cancel == "shutdown":
+            shutdown = asyncio.create_task(manager.aclose())
+        elif cancel == "token":
+            token.cancel()
+        else:
+            call_task.cancel()
 
-        # Wait until the connection owner cancels its active result preparation.
+        # Each cancellation path must reach the same active result preparation.
         async with asyncio.timeout(5):
             while not any(task.cancelling() for task in connection.active_calls):
                 await asyncio.sleep(0.01)
         assert not backend.finished.is_set()
-        assert not shutdown.done()
+        assert shutdown is None or not shutdown.done()
         assert not call_task.done()
 
         gate.set()
-        await asyncio.wait_for(shutdown, timeout=5)
-        result = await asyncio.wait_for(call_task, timeout=5)
+        if shutdown is not None:
+            await asyncio.wait_for(shutdown, timeout=5)
+        if cancel == "task":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(call_task, timeout=5)
+        else:
+            result = await asyncio.wait_for(call_task, timeout=5)
+            assert isinstance(result, ToolFailure)
+            assert result.error.kind == (
+                "cancelled" if cancel == "token" else "mcp_transport"
+            )
+            assert "read_path" not in result
 
         assert backend.finished.is_set()
-        assert len(backend.completed) == (1 if suffix == ".json" else 2)
-        assert len(list((tmp_path / "tool-results").iterdir())) == len(
-            backend.completed
-        )
-        assert isinstance(result, ToolFailure)
-        assert result.error.kind in {"mcp_transport", "cancelled"}
-        assert "source_path" not in result
-        assert "read_path" not in result
+        assert len(backend.completed) == 1
+        assert len(list((tmp_path / "tool-results").iterdir())) == 1
         assert provider_calls == ["add"]
     finally:
         gate.set()
