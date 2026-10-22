@@ -174,7 +174,10 @@ class _TestableAgent(Agent):
     async def queue_for_test(
         self, run_input: str | list[RunHistoryItem] | RunState
     ) -> RunResult:
-        return await self._enqueue_input(run_input)
+        result = await self._enqueue_input(run_input)
+        assert isinstance(result, RunResult)
+
+        return result
 
 
 def test_agent_starts_new_run_with_string_input() -> None:

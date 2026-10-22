@@ -186,14 +186,19 @@ class Agent(Task):
         run_input: RunInput,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> RunResult:
-        """Queue one internal run input and wait for the final result."""
-        return await self._lifecycle.enqueue_input(
-            agent=self,
-            runner=self._runner,
-            run_input=run_input,
-            cancellation_token=cancellation_token,
-        )
+    ) -> RunResult | RunPaused:
+        """Queue one input and preserve a pause across runtime delivery."""
+        try:
+            return await self._lifecycle.enqueue_input(
+                agent=self,
+                runner=self._runner,
+                run_input=run_input,
+                cancellation_token=cancellation_token,
+            )
+        except RunPaused as pause:
+            # Runtime delivery converts exceptions to text. Return the pause
+            # intact so the facade can raise it with its continuation.
+            return pause
 
     async def enqueue_input_stream(
         self,
@@ -250,7 +255,7 @@ class Agent(Task):
     @on_message
     async def handle_str(self, payload: str, context: MessageContext) -> object:
         """Handle one inbound string run input."""
-        return await self._deliver_run_input(
+        return await self._enqueue_input(
             payload, cancellation_token=context.cancellation_token
         )
 
@@ -261,7 +266,7 @@ class Agent(Task):
         context: MessageContext,
     ) -> object:
         """Handle one inbound list-based run input."""
-        return await self._deliver_run_input(
+        return await self._enqueue_input(
             list(payload), cancellation_token=context.cancellation_token
         )
 
@@ -272,19 +277,6 @@ class Agent(Task):
         context: MessageContext,
     ) -> object:
         """Handle one inbound resumable run state."""
-        return await self._deliver_run_input(
+        return await self._enqueue_input(
             payload, cancellation_token=context.cancellation_token
         )
-
-    async def _deliver_run_input(
-        self, run_input: RunInput, *, cancellation_token: CancellationToken | None
-    ) -> RunResult | RunPaused:
-        """Preserve the pause object across the runtime's error boundary."""
-        try:
-            return await self._enqueue_input(
-                run_input, cancellation_token=cancellation_token
-            )
-        except RunPaused as pause:
-            # Runtime delivery converts other exceptions to text. A pause must
-            # retain its continuation so the facade can raise the same signal.
-            return pause
