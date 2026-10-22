@@ -71,8 +71,6 @@ async def prepare_mcp_response(
         source_path = str(PurePosixPath(directory) / f"{basename}.json")
         read_path = str(PurePosixPath(directory) / f"{basename}.txt")
         for path in (source_path, read_path):
-            if len(path) > policy.max_text_chars:
-                raise ValueError("MCP output path exceeds the preview budget.")
             if (
                 redact_known_secrets(path, secrets) != path
                 or redact_secret_pairs(path) != path

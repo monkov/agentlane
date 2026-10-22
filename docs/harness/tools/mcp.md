@@ -248,7 +248,7 @@ at most 4 KiB of UTF-8 content, plus its newline. Control characters are
 escaped. The JSON file is the source for further processing; the text file
 is a view for reading in parts.
 
-### Stored content and limits
+### Stored content
 
 The JSON source contains `schema_version` (`1`), `server_name`, `tool_name`,
 `content`, `structuredContent`, `isError`, and `omissions`. It keeps both text
@@ -265,11 +265,10 @@ objects and arrays that contain quoted fields. This prevents ambiguous JSON
 from bypassing credential redaction. Plain bracketed transcript text remains
 supported. Rejected source text produces `output.status="unavailable"`.
 
-Source processing has fixed limits of 8 MiB per representation, 4,096 nodes,
-and 32 levels of nesting. These bounds apply after the MCP SDK receives the
-result; they do not limit the SDK's initial result allocation. If supported
-content cannot be kept within these bounds, AgentLane does not save a partial
-source.
+Saved content has no additional AgentLane size, node, or nesting limit.
+The existing preview limits apply only to the model response. Serialization
+and backend write failures use the failure behavior below. Text line wrapping
+does not truncate the saved text or limit the file size.
 
 File paths share the configured preview budget, which defaults to 51,200
 characters and 32 content blocks. AgentLane keeps each returned path complete.
@@ -316,7 +315,7 @@ Use the symptom or error to choose the next step:
 | `MCPPoolCapacityError` | Reduce concurrent runs or increase `MCPClientLimits.max_connections`. |
 | `MCPShutdownTimeoutError` | Check for a server that does not stop. Increase `shutdown_timeout_seconds` if needed; call `aclose()` again to wait for ongoing cleanup. |
 | Results contain `truncated` or `omittedBlocks` | Read `output.read_path` when present. Otherwise, configure `result_writer` and `result_directory`, request less data, or increase the relevant `MCPResultPolicy` limit. `max_text_chars` must be at least 128. |
-| `output.status` is `unavailable` | Check source processing limits, write failures, and whether both paths fit the preview budget. The provider call is not repeated. |
+| `output.status` is `unavailable` | Check source preparation, write failures, and whether both paths fit the preview budget. The provider call is not repeated. |
 
 Tool execution failures return `ToolFailure`. Treat server results as
 untrusted input, and keep secrets out of tool arguments and results.

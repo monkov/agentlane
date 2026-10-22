@@ -6,7 +6,6 @@ import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
 from uuid import UUID
 
 import pytest
@@ -14,9 +13,7 @@ from mcp import types
 
 from agentlane.harness.filesystem import FileWriter, LocalFileSystem
 from agentlane.harness.mcp import MCPResultPolicy
-from agentlane.harness.mcp import _source as source_module
 from agentlane.harness.mcp._output import prepare_mcp_response
-from agentlane.harness.mcp._redaction import redact_known_secrets
 from agentlane.harness.mcp._result import render_mcp_result
 from agentlane.io import Writer
 from agentlane.models import ToolFailure
@@ -318,9 +315,9 @@ async def test_write_failure_keeps_bounded_result_without_publishing_paths(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "directory",
-    ["results/" + "x" * 1000, "results/credential-canary", 'results/"token":"hidden"'],
+    ["results/credential-canary", 'results/"token":"hidden"'],
 )
-async def test_invalid_output_paths_are_rejected_before_writing(
+async def test_credential_output_paths_are_rejected_before_writing(
     directory: str, filesystem: _RecordingFileSystem
 ) -> None:
     response = await _prepare(
@@ -335,52 +332,75 @@ async def test_invalid_output_paths_are_rejected_before_writing(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["bytes", "nodes", "depth"])
-async def test_preservation_limits_never_publish_partial_sources(
-    kind: str, filesystem: _RecordingFileSystem
+async def test_long_output_paths_save_files_without_exceeding_preview_budget(
+    filesystem: _RecordingFileSystem,
 ) -> None:
-    value: object
-    if kind == "bytes":
-        value = "x" * (8 * 1024 * 1024 + 1)
-    elif kind == "nodes":
-        value = [0] * 5000
-    else:
-        value = "deep text"
-        for _ in range(40):
-            value = {"nested": value}
-    response = await _prepare({"content": [], "structuredContent": value}, filesystem)
-    assert filesystem.paths == []
+    transcript = "Complete transcript. " * 500
+    directory = "/".join(["results"] + ["x" * 100] * 6)
+    response = await _prepare(
+        types.CallToolResult(content=[types.TextContent(text=transcript)]),
+        filesystem,
+        directory=directory,
+    )
+    assert len(filesystem.paths) == 2
+    assert all(len(path) > 512 for path in filesystem.paths)
+    assert json.loads(filesystem.texts(".json")[0])["content"][0]["text"] == transcript
+    assert "Complete transcript." in filesystem.texts(".txt")[0]
     assert json.loads(response)["output"] == {"status": "unavailable"}
     assert len(response) <= 512
 
 
 @pytest.mark.asyncio
-async def test_oversized_input_is_rejected_before_source_parsing_or_redaction(
-    monkeypatch: pytest.MonkeyPatch, filesystem: _RecordingFileSystem
+async def test_text_beyond_eight_mib_is_saved_in_full_with_bounded_preview(
+    filesystem: _RecordingFileSystem,
 ) -> None:
-    parse = source_module.parse_source_json
-    redact = redact_known_secrets
-
-    def bounded_parse(value: str) -> object:
-        assert len(value) <= 8 * 1024 * 1024
-        return parse(value)
-
-    def bounded_redact(value: object, secrets: Any) -> object:
-        assert not isinstance(value, str) or len(value) <= 8 * 1024 * 1024
-        return redact(value, secrets)
-
-    monkeypatch.setattr(source_module, "parse_source_json", bounded_parse)
-    monkeypatch.setattr(source_module, "redact_known_secrets", bounded_redact)
-    response = await _prepare(
-        {
-            "content": [
-                {"type": "text", "text": ' {"password":"' + "x" * (9 * 1024 * 1024)}
-            ]
-        },
-        filesystem,
+    transcript = "x" * (8 * 1024 * 1024) + "final words beyond eight MiB"
+    result = types.CallToolResult(content=[types.TextContent(text=transcript)])
+    assert await _prepare(result, None) == render_mcp_result(
+        result, MCPResultPolicy(max_text_chars=512)
     )
-    assert filesystem.paths == []
-    assert json.loads(response)["output"] == {"status": "unavailable"}
+
+    response = await _prepare(result, filesystem)
+    assert len(response) <= 512
+    assert "read_path" in json.loads(response)["output"]
+    assert json.loads(filesystem.texts(".json")[0])["content"][0]["text"] == transcript
+    assert transcript in "".join(filesystem.texts(".txt")[0].splitlines())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["nodes", "depth", "blocks", "integer"])
+async def test_sources_beyond_preview_structure_limits_are_saved_in_full(
+    kind: str, filesystem: _RecordingFileSystem
+) -> None:
+    content: list[object] = []
+    structured: object = None
+    if kind == "nodes":
+        structured = [f"node-{index}" for index in range(5000)]
+        final_value = "node-4999"
+    elif kind == "depth":
+        final_value = "deep text"
+        structured = final_value
+        for _ in range(40):
+            structured = {"nested": structured}
+    elif kind == "blocks":
+        content = [{"type": "text", "text": f"block-{index}"} for index in range(4100)]
+        final_value = "block-4099"
+    else:
+        structured = 1 << 5000
+        final_value = str(structured)
+
+    result = {"content": content, "structuredContent": structured}
+    expected = render_mcp_result(result, MCPResultPolicy(max_text_chars=512))
+    assert await _prepare(result, None) == expected
+    assert len(expected) <= 512
+
+    response = await _prepare(result, filesystem)
+    assert len(response) <= 512
+    assert "read_path" in json.loads(response)["output"]
+    source = json.loads(filesystem.texts(".json")[0])
+    assert source["content"] == content
+    assert source["structuredContent"] == structured
+    assert final_value in filesystem.texts(".txt")[0]
 
 
 class _BlockedFileSystem(LocalFileSystem):

@@ -1,4 +1,4 @@
-"""Prepare complete, bounded MCP source files before preview rendering."""
+"""Prepare complete MCP source files independently of preview limits."""
 
 import json
 import re
@@ -20,15 +20,12 @@ from ._result_values import (
 )
 from ._types import MCPResultPolicy
 
-_MAX_BYTES = 8 * 1024 * 1024
-_MAX_NODES = 4096
-_MAX_DEPTH = 32
 _LINE_BYTES = 4096
 _CONTROLS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
 
 
 class SourceUnavailable(ValueError):
-    """The supported source cannot be preserved within its processing limits."""
+    """The source cannot be safely represented in the saved files."""
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -45,8 +42,6 @@ def parse_source_json(text: str) -> object:
     """Reject ambiguous JSON instead of losing values before redaction."""
     try:
         return json.loads(text, object_pairs_hook=_unique_object)
-    except RecursionError:
-        raise SourceUnavailable("MCP JSON text exceeds the depth limit.") from None
     except json.JSONDecodeError:
         # Bracketed prose is valid transcript text. An incomplete JSON object
         # cannot be safely decoded for escaped credential keys.
@@ -76,28 +71,13 @@ class PreparedSource:
 
 
 class _Sanitizer:
-    """Bound work before parsing, copying or sanitizing provider values."""
+    """Remove credentials and binary bodies from supported provider values."""
 
     def __init__(self, secrets: Collection[str]) -> None:
         self.secrets = tuple(secrets)
-        self.bytes_left = _MAX_BYTES
-        self.nodes_left = _MAX_NODES
         self.redactions = 0
         self.omitted_binary = False
         self.has_resource_text = False
-
-    def step(self, depth: int) -> None:
-        if self.nodes_left <= 0 or depth >= _MAX_DEPTH:
-            raise SourceUnavailable("MCP source exceeds the structural limit.")
-        self.nodes_left -= 1
-
-    def take_text(self, value: str) -> None:
-        # Reject by character count before allocating the encoded copy.
-        if len(value) > self.bytes_left:
-            raise SourceUnavailable("MCP source exceeds the input limit.")
-        self.bytes_left -= len(value.encode("utf-8"))
-        if self.bytes_left < 0:
-            raise SourceUnavailable("MCP source exceeds the input limit.")
 
     def safe_text(self, value: str) -> str:
         safe = redact_secret_pairs(cast(str, redact_known_secrets(value, self.secrets)))
@@ -109,29 +89,22 @@ class _Sanitizer:
     def value(
         self,
         value: object,
-        depth: int = 0,
         *,
-        charged: bool = False,
         block: bool = False,
         resource: bool = False,
     ) -> object:
-        self.step(depth)
         if isinstance(value, AnyUrl):
             value = str(value)
 
         if isinstance(value, str):
-            if not charged:
-                self.take_text(value)
             is_json = value.lstrip().startswith(("{", "["))
-            if is_json and charged:
-                self.take_text(value)
 
             # JSON text can hide escaped credential keys. Sanitize the parsed
             # structure, then keep it a string in the source document.
             parsed = parse_source_json(value) if is_json else NOT_JSON
             if parsed is not NOT_JSON:
                 before = self.redactions
-                safe = self.value(parsed, depth + 1, charged=True)
+                safe = self.value(parsed)
                 text = value if self.redactions == before else json_text(safe)
                 return self.safe_text(text)
 
@@ -140,24 +113,17 @@ class _Sanitizer:
         if isinstance(value, (Mapping, BaseModel)):
             return self.object(
                 cast(Mapping[str, object] | BaseModel, value),
-                depth,
-                charged=charged,
                 block=block,
                 resource=resource,
             )
 
         if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
             sequence = cast(Sequence[object], value)
-            if len(sequence) > self.nodes_left:
-                raise SourceUnavailable("MCP source exceeds the node limit.")
-
-            return [self.value(item, depth + 1, charged=charged) for item in sequence]
+            return [self.value(item) for item in sequence]
 
         if value is None or isinstance(value, (bool, int, float)):
             if isinstance(value, float) and not isfinite(value):
                 raise SourceUnavailable("MCP source contains a non-finite number.")
-            if isinstance(value, int) and value.bit_length() > 4096:
-                raise SourceUnavailable("MCP source contains an oversized integer.")
 
             return value
 
@@ -166,20 +132,15 @@ class _Sanitizer:
     def object(
         self,
         value: Mapping[str, object] | BaseModel,
-        depth: int,
         *,
-        charged: bool,
         block: bool,
         resource: bool,
     ) -> dict[str, object]:
         kind = block_type(value) if block else None
         result: dict[str, object] = {}
         for name, alias in value_fields(value):
-            self.step(depth + 1)
             if not isinstance(cast(object, alias), str):
                 raise SourceUnavailable("MCP source has a non-string key.")
-            if not charged:
-                self.take_text(alias)
 
             safe_key = self.safe_text(alias)
             if safe_key in result:
@@ -207,8 +168,6 @@ class _Sanitizer:
                 self.has_resource_text = True
             result[safe_key] = self.value(
                 item,
-                depth + 1,
-                charged=charged,
                 resource=block and kind == "resource" and alias == "resource",
             )
 
@@ -220,15 +179,10 @@ class _ReadableView:
 
     def __init__(self) -> None:
         self.parts: list[str] = []
-        self.bytes_left = _MAX_BYTES
-        self.parse_bytes_left = _MAX_BYTES
-        self.nodes_left = _MAX_NODES
 
     def write(self, value: str) -> None:
         escaped = _CONTROLS.sub(lambda match: f"\\u{ord(match[0]):04x}", value)
         encoded = escaped.encode("utf-8")
-        if len(encoded) > self.bytes_left:
-            raise SourceUnavailable("MCP readable view exceeds the file limit.")
 
         # Chunk the encoded text so one long scalar does not block pagination.
         start = 0
@@ -239,36 +193,24 @@ class _ReadableView:
             part = encoded[start:end].decode("utf-8")
             if not part.endswith("\n"):
                 part += "\n"
-            self.bytes_left -= len(part.encode("utf-8"))
-            if self.bytes_left < 0:
-                raise SourceUnavailable("MCP readable view exceeds the file limit.")
             self.parts.append(part)
             start = end
 
-    def value(self, value: object, path: str, depth: int = 0) -> None:
-        if self.nodes_left <= 0 or depth >= _MAX_DEPTH:
-            raise SourceUnavailable("MCP readable view exceeds the structural limit.")
-        self.nodes_left -= 1
-
+    def value(self, value: object, path: str) -> None:
         # Expand JSON text for the reader while JSON source retains its type.
         if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
-            if len(value) > self.parse_bytes_left:
-                raise SourceUnavailable("MCP readable view exceeds the parse limit.")
-            self.parse_bytes_left -= len(value.encode("utf-8"))
-            if self.parse_bytes_left < 0:
-                raise SourceUnavailable("MCP readable view exceeds the parse limit.")
             parsed = parse_source_json(value)
             if parsed is not NOT_JSON:
-                self.value(parsed, path, depth + 1)
+                self.value(parsed, path)
                 return
 
         scalar = value
         if isinstance(value, dict) and value:
             for key, item in cast(dict[str, object], value).items():
-                self.value(item, f"{path}.{key}", depth + 1)
+                self.value(item, f"{path}.{key}")
         elif isinstance(value, list) and value:
             for index, item in enumerate(cast(list[object], value)):
-                self.value(item, f"{path}[{index}]", depth + 1)
+                self.value(item, f"{path}[{index}]")
         else:
             self.write(f"{path}:")
             self.write(scalar if isinstance(scalar, str) else json_text(scalar))
@@ -285,14 +227,10 @@ def prepare_source(
     """Keep supported content independently of the model preview's limits."""
     source = read_result(result)
     sanitizer = _Sanitizer(secrets)
-    sanitizer.take_text(server_name)
-    sanitizer.take_text(tool_name)
     safe_server = sanitizer.safe_text(server_name)
     safe_tool = sanitizer.safe_text(tool_name)
     if safe_server != server_name or safe_tool != tool_name:
         raise SourceUnavailable("MCP source identity contains credentials.")
-    if len(source.content) > _MAX_NODES:
-        raise SourceUnavailable("MCP source exceeds the block limit.")
 
     content = [sanitizer.value(block, block=True) for block in source.content]
     structured = sanitizer.value(source.structured_content)
@@ -306,8 +244,6 @@ def prepare_source(
         omissions=["binary"] if sanitizer.omitted_binary else [],
     )
     source_json = json_text(document)
-    if len(source_json.encode("utf-8")) > _MAX_BYTES:
-        raise SourceUnavailable("MCP source exceeds the file limit.")
 
     # Include every supported field when assessing the full inline size.
     full_preview: dict[str, object] = {"content": content, "isError": source.is_error}
