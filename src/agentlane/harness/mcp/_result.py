@@ -1,29 +1,38 @@
 """Convert MCP tool results to bounded, safe model-facing text."""
 
+import json
+import sys
 from collections.abc import Collection, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from math import isfinite
-from typing import cast
+from typing import Protocol, cast
 
-from pydantic import BaseModel
+from pydantic import AnyUrl, BaseModel
 
 from agentlane.models import ToolError, ToolFailure
 
 from ._errors import MCP_SERVER_TOOL_ERROR_KIND
 from ._redaction import is_secret_key, redact_known_secrets, redact_secret_pairs
-from ._result_values import (
-    NOT_JSON,
-    block_type,
-    get_field,
-    json_text,
-    parse_json,
-    read_result,
-    value_fields,
-)
 from ._types import MCPResultPolicy
 
 _OMISSION = "[omitted: exceeds processing limit]"
 _MAX_NODES = 4096
 _MAX_DEPTH = 32
+_NOT_JSON = object()
+"""Returned by `_parse_json` when text is not valid JSON."""
+
+
+class _SDKResult(Protocol):
+    content: Sequence[object]
+    structured_content: object
+    is_error: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _Result:
+    content: Sequence[object]
+    structured_content: object
+    is_error: bool
 
 
 def render_mcp_result(
@@ -31,15 +40,16 @@ def render_mcp_result(
     policy: MCPResultPolicy,
     *,
     secrets: Collection[str] = (),
+    complete: bool = False,
 ) -> str | ToolFailure:
-    """Render a bounded preview without processing omitted server content."""
+    """Use the same serializer for bounded previews and complete saved text."""
     source = read_result(result)
-    renderer = _Renderer(policy.max_text_chars, secrets)
+    renderer = _Renderer(policy.max_text_chars, secrets, complete=complete)
 
     # An empty structured result carries no data, so it does not replace text.
     structured = (
         source.structured_content
-        if policy.include_structured_content and source.structured_content
+        if complete or (policy.include_structured_content and source.structured_content)
         else None
     )
     reserved: dict[str, object] = {
@@ -51,7 +61,9 @@ def render_mcp_result(
     if structured is not None:
         reserved["structuredContent"] = {"omitted": True}
 
-    available = policy.max_text_chars - len(json_text(reserved))
+    available = (
+        sys.maxsize if complete else policy.max_text_chars - len(_json(reserved))
+    )
     content_budget = 2 + (int(available * 0.6) if structured is not None else available)
 
     # Servers repeat structured content in text blocks for clients that cannot
@@ -60,12 +72,12 @@ def render_mcp_result(
     content, kept = renderer.content(
         source.content,
         max(2, content_budget),
-        policy.max_content_blocks,
-        skip_text=structured is not None and not source.is_error,
+        len(source.content) if complete else policy.max_content_blocks,
+        skip_text=not complete and structured is not None and not source.is_error,
     )
-    fields = [f'"content":{content}', f'"isError":{json_text(source.is_error)}']
+    fields = [f'"content":{content}', f'"isError":{_json(source.is_error)}']
     if structured is not None:
-        structured_budget = len(json_text(reserved["structuredContent"])) + (
+        structured_budget = len(_json(reserved["structuredContent"])) + (
             available - (len(content) - 2)
         )
         preview = renderer.value(structured, structured_budget) or '{"omitted":true}'
@@ -92,12 +104,78 @@ def result_response(text: str, is_error: bool) -> str | ToolFailure:
     return text
 
 
+def read_result(value: object) -> _Result:
+    if isinstance(value, Mapping):
+        raw = cast(Mapping[str, object], value)
+        content = raw.get("content", [])
+        return _Result(
+            content=_sequence(content),
+            structured_content=raw.get(
+                "structuredContent", raw.get("structured_content")
+            ),
+            is_error=raw.get("isError", raw.get("is_error", False)) is True,
+        )
+
+    source = cast(_SDKResult, value)
+    return _Result(source.content, source.structured_content, source.is_error)
+
+
+def _parse_json(text: str) -> object:
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        return _NOT_JSON
+
+
+def _sequence(value: object) -> Sequence[object]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return cast(Sequence[object], value)
+
+    return ()
+
+
+def _json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _fields(value: Mapping[str, object] | BaseModel) -> Iterator[tuple[str, str]]:
+    if isinstance(value, BaseModel):
+        for name, field in type(value).model_fields.items():
+            yield name, field.serialization_alias or field.alias or name
+
+        for name in value.model_extra or {}:
+            yield name, name
+
+        return
+
+    for name in value:
+        yield name, name
+
+
+def _field(value: Mapping[str, object] | BaseModel, name: str) -> object:
+    if isinstance(value, BaseModel):
+        return getattr(value, name)
+
+    return value[name]
+
+
+def _block_type(block: object) -> object | None:
+    if isinstance(block, (Mapping, BaseModel)):
+        return _field(cast(Mapping[str, object] | BaseModel, block), "type")
+
+    return None
+
+
 class _Renderer:
     """Own the input and output budgets for one result, including JSON text."""
 
-    def __init__(self, output_limit: int, secrets: Collection[str]) -> None:
-        self.characters = max(64 * 1024, output_limit)
-        self.nodes = _MAX_NODES
+    def __init__(
+        self, output_limit: int, secrets: Collection[str], *, complete: bool = False
+    ) -> None:
+        # sys.maxsize removes preview budgets for complete, in-memory strings.
+        self.complete = complete
+        self.characters = sys.maxsize if complete else max(64 * 1024, output_limit)
+        self.nodes = sys.maxsize if complete else _MAX_NODES
         self.secrets = tuple(secrets)
         self.truncated = False
 
@@ -121,7 +199,7 @@ class _Renderer:
         # Only serialize a prefix of already sanitized text. Raw strings must
         # pass the complete-string processing budget before this method runs.
         prefix = value[:available]
-        encoded = json_text(prefix)
+        encoded = _json(prefix)
         if len(prefix) == len(value) and len(encoded) <= available:
             return encoded
 
@@ -132,12 +210,12 @@ class _Renderer:
         low, high = 0, len(prefix)
         while low < high:
             midpoint = (low + high + 1) // 2
-            if len(json_text(prefix[:midpoint] + "…")) <= available:
+            if len(_json(prefix[:midpoint] + "…")) <= available:
                 low = midpoint
             else:
                 high = midpoint - 1
 
-        return json_text(prefix[:low] + "…")
+        return _json(prefix[:low] + "…")
 
     def value(
         self,
@@ -157,7 +235,7 @@ class _Renderer:
             return self._omission(available)
 
         self.nodes -= 1
-        if depth >= _MAX_DEPTH:
+        if not self.complete and depth >= _MAX_DEPTH:
             return self._omission(available)
 
         if isinstance(value, (Mapping, BaseModel)):
@@ -170,6 +248,9 @@ class _Renderer:
                 charged=charged,
             )
 
+        if self.complete and isinstance(value, AnyUrl):
+            value = str(value)
+
         if isinstance(value, str):
             # Charge JSON text before each parse. A string parsed from charged
             # JSON text is part of that text, so do not charge it again.
@@ -179,8 +260,8 @@ class _Renderer:
 
             # Render JSON text as structure, so credential keys are redacted.
             # Text that does not parse is text, so redact it as text.
-            parsed = parse_json(value) if is_json else NOT_JSON
-            if parsed is not NOT_JSON:
+            parsed = _parse_json(value) if is_json else _NOT_JSON
+            if parsed is not _NOT_JSON:
                 safe = (
                     self.value(parsed, max(2, available - 2), depth + 1, charged=True)
                     or "null"
@@ -203,7 +284,7 @@ class _Renderer:
             if isinstance(value, float) and not isfinite(value):
                 return self._omission(available)
 
-            encoded = json_text(value)
+            encoded = _json(value)
             if len(encoded) <= available:
                 return encoded
 
@@ -219,8 +300,8 @@ class _Renderer:
         block: bool,
         charged: bool,
     ) -> str | None:
-        kind = get_field(value, "type") if block else None
-        fields = value_fields(value)
+        kind = _field(value, "type") if block else None
+        fields = _fields(value)
         if block:
             fields = self._content_fields(fields, text=kind == "text")
 
@@ -241,9 +322,10 @@ class _Renderer:
                 continue
 
             output_name = alias
-            omitted_body = (resource and alias in {"blob", "text"}) or (
-                block and kind in {"image", "audio"} and alias == "data"
-            )
+            omitted_body = (
+                resource
+                and (alias == "blob" or (alias == "text" and not self.complete))
+            ) or (block and kind in {"image", "audio"} and alias == "data")
             if omitted_body:
                 output_name = (
                     "textCharsOmitted" if alias == "text" else "encodedBytesOmitted"
@@ -254,7 +336,7 @@ class _Renderer:
                 self.truncated = True
                 continue
 
-            encoded_key = json_text(safe_key)
+            encoded_key = _json(safe_key)
             remaining = available - used - len(encoded_key) - 1 - bool(parts)
             if remaining < 2:
                 self.truncated = True
@@ -263,7 +345,7 @@ class _Renderer:
             if is_secret_key(alias):
                 encoded = self._text("[redacted]", remaining)
             else:
-                item = get_field(value, name)
+                item = _field(value, name)
                 if omitted_body:
                     item = len(item) if isinstance(item, str) else 0
 
@@ -336,7 +418,7 @@ class _Renderer:
             block = value[index]
 
             # A skipped text block is a repeated copy, not an omitted block.
-            if skip_text and block_type(block) == "text":
+            if skip_text and _block_type(block) == "text":
                 kept += 1
                 continue
 

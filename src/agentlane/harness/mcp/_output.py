@@ -1,5 +1,6 @@
 """Prepare MCP text once, then return it inline or save it for later reads."""
 
+import json
 from collections.abc import Collection
 from pathlib import PurePosixPath
 from uuid import uuid4
@@ -9,9 +10,7 @@ from agentlane.models import ToolFailure
 
 from .._storage_write import write_content
 from ._redaction import redact_known_secrets, redact_secret_pairs
-from ._result import render_mcp_result, result_response
-from ._result_values import json_text, read_result
-from ._source import prepare_source
+from ._result import read_result, render_mcp_result, result_response
 from ._types import MCPResultPolicy
 
 _UNAVAILABLE = "\n\n[Full MCP result unavailable.]"
@@ -28,7 +27,7 @@ async def prepare_mcp_response(
     directory: str | None,
     preserve_tools: frozenset[tuple[str, str]],
 ) -> str | ToolFailure:
-    """Use the original renderer only when complete storage is disabled."""
+    """Serialize once, then return the text inline or save it for native reads."""
     if writer is None:
         return render_mcp_result(result, policy, secrets=secrets)
 
@@ -36,8 +35,11 @@ async def prepare_mcp_response(
     # previews use this same text without visiting the provider result again.
     is_error = read_result(result).is_error
     try:
-        text = prepare_source(
-            result, server_name=server_name, tool_name=tool_name, secrets=secrets
+        serialized = render_mcp_result(result, policy, secrets=secrets, complete=True)
+
+        # Short TXT lines let the existing read tool page through long strings.
+        text = "\n".join(
+            serialized[i : i + 4096] for i in range(0, len(serialized), 4096)
         )
     except Exception:
         return result_response(
@@ -62,7 +64,7 @@ async def prepare_mcp_response(
         ):
             raise ValueError("MCP output path contains credentials.")
         await write_content(writer, read_path, text.encode("utf-8"))
-        notice = f"\n\n[Full MCP result: {json_text(read_path)}]"
+        notice = f"\n\n[Full MCP result: {json.dumps(read_path, ensure_ascii=False)}]"
     except Exception:
         notice = _UNAVAILABLE
 

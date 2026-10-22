@@ -3,6 +3,7 @@
 import asyncio
 from collections import Counter
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -10,7 +11,7 @@ from pydantic import BaseModel
 
 from agentlane.harness import AgentDescriptor, RunState, Task
 from agentlane.harness.agents import DefaultAgent
-from agentlane.harness.filesystem import FileWriter
+from agentlane.harness.filesystem import FileWriter, LocalFileSystem
 from agentlane.harness.mcp import (
     MCPAuthorizationContext,
     MCPAuthorizationError,
@@ -129,6 +130,24 @@ def _binding() -> ShimBindingContext:
 @dataclass(init=False)
 class _EqualMCPToolsShim(MCPToolsShim):
     """Distinct definitions can compare equal and have no hash."""
+
+
+@pytest.mark.parametrize(
+    "writer_enabled,directory",
+    [(True, None), (False, "results")]
+    + [(True, path) for path in ("", " ", "../results", "/results", "a\\b", "a\x00b")],
+)
+def test_storage_rejects_incomplete_or_invalid_configuration(
+    tmp_path: Path, writer_enabled: bool, directory: str | None
+) -> None:
+    with pytest.raises(ValueError):
+        MCPToolsShim(
+            servers=(_server("notes"),),
+            result_writer=LocalFileSystem(tmp_path) if writer_enabled else None,
+            result_directory=directory,
+        )
+
+    assert not tuple(tmp_path.iterdir())
 
 
 @pytest.mark.asyncio

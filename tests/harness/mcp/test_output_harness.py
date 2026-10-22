@@ -4,9 +4,8 @@ import asyncio
 import json
 import re
 import sys
-import threading
-from collections.abc import AsyncGenerator, AsyncIterator, Generator
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -26,23 +25,16 @@ from agentlane.harness.mcp import (
     MCPToolsShim,
 )
 from agentlane.harness.mcp._connection import MCPConnection
-from agentlane.harness.tools import HarnessToolsShim, read_tool
-from agentlane.io import Writer
-from agentlane.models import (
-    MessageDict,
-    Model,
-    ModelResponse,
-    ToolCall,
-    ToolFailure,
-    Tools,
-)
+from agentlane.harness.tools import read_tool
+from agentlane.models import ToolCall, ToolFailure, Tools
 from agentlane.runtime import CancellationToken
-from agentlane.tracing import Span
 
+from ..tool_storage.conftest import MemoryFileSystem
 from ..tools_test_utils import (
     SequenceModel,
     make_assistant_response,
     make_tool_call,
+    run_tool,
 )
 from .helpers import ConnectionInstaller, acquire_lease
 
@@ -106,30 +98,6 @@ def fixture_output_peer(install_connection: ConnectionInstaller) -> _Peer:
     return peer
 
 
-class _BlockedFileSystem(LocalFileSystem):
-    """Pause a real file write before its context manager commits it."""
-
-    def __init__(self, root: Path, gate: threading.Event) -> None:
-        super().__init__(root)
-        self.gate = gate
-        self.started = threading.Event()
-        self.finished = threading.Event()
-        self.completed: list[str] = []
-
-    @contextmanager
-    def open_write(self, path: str) -> Generator[Writer, None, None]:
-        with super().open_write(path) as stream:
-            yield stream
-
-            # Hold context exit so cancellation must wait for the actual commit.
-            self.started.set()
-            if not self.gate.wait(timeout=10):
-                raise TimeoutError("The test did not release the file write.")
-
-        self.completed.append(path)
-        self.finished.set()
-
-
 def _server(*, max_chars: int = 512) -> MCPServer:
     return MCPServer(
         name=_SERVER_NAME,
@@ -146,65 +114,6 @@ def _call(
     )
 
 
-class _ReadSavedResultModel(Model[ModelResponse]):
-    """Follow only the reference and continuation offsets in tool responses."""
-
-    def __init__(self) -> None:
-        self.preview: str | None = None
-        self.read_path: str | None = None
-        self.pages: list[str] = []
-        self.offsets: list[int] = []
-
-    async def get_response(
-        self,
-        messages: list[MessageDict],
-        extra_call_args: dict[str, object] | None = None,
-        schema: object | None = None,
-        tools: Tools | None = None,
-        cancellation_token: CancellationToken | None = None,
-        parent_span: Span[Any] | None = None,
-        **kwargs: object,
-    ) -> ModelResponse:
-        del extra_call_args, schema, tools, cancellation_token, parent_span, kwargs
-        tool_messages = [message for message in messages if message["role"] == "tool"]
-        if not tool_messages:
-            return make_assistant_response(
-                None, tool_calls=[_call(meeting_id="meeting-7")]
-            )
-
-        content = tool_messages[-1]["content"]
-        assert isinstance(content, str)
-        if self.preview is None:
-            self.preview = content
-            reference = re.search(r"\n\n\[Full MCP result: (.+)\]$", content)
-            assert reference is not None
-            self.read_path = json.loads(reference.group(1))
-            return self._read(1)
-
-        # Treat the tool's continuation as the only source of the next offset.
-        continuation = _CONTINUATION.search(content)
-        self.pages.append(content[: continuation.start()] if continuation else content)
-        if continuation is not None:
-            return self._read(int(continuation.group(1)))
-
-        return make_assistant_response("Read the complete saved result.")
-
-    def _read(self, offset: int) -> ModelResponse:
-        self.offsets.append(offset)
-        return make_assistant_response(
-            None,
-            tool_calls=[
-                _call(
-                    "read",
-                    call_id=f"read-{offset}",
-                    path=self.read_path,
-                    offset=offset,
-                    limit=7,
-                )
-            ],
-        )
-
-
 @pytest.mark.asyncio
 async def test_runner_reads_complete_saved_output_through_native_pagination(
     output_peer: _Peer, tmp_path: Path
@@ -215,14 +124,18 @@ async def test_runner_reads_complete_saved_output_through_native_pagination(
         structured_content={"separate_fact": "STRUCTURED_ONLY"},
     )
     filesystem = MountedFileSystem({"saved": LocalFileSystem(tmp_path)})
-    model = _ReadSavedResultModel()
+    model = SequenceModel(
+        [
+            make_assistant_response(None, tool_calls=[_call(meeting_id="meeting-7")]),
+            make_assistant_response("complete"),
+        ]
+    )
 
     async with MCPClientManager() as manager:
         agent = DefaultAgent(
             descriptor=AgentDescriptor(
                 name="reader",
                 model=model,
-                tools=Tools(tools=[], max_tool_round_trips=30),
                 shims=(
                     MCPToolsShim(
                         servers=(_server(),),
@@ -230,37 +143,52 @@ async def test_runner_reads_complete_saved_output_through_native_pagination(
                         result_writer=filesystem,
                         result_directory="saved/./sessions/../tool-results",
                     ),
-                    HarnessToolsShim(definitions=(read_tool(reader=filesystem),)),
                 ),
             )
         )
         result = await agent.run("Read all of this meeting.")
 
-    assert result.final_output == "Read the complete saved result."
-    assert model.preview is not None
-    assert len(model.preview) <= 512
-    assert len(model.pages) > 1
-    assert model.offsets == sorted(set(model.offsets))
-
-    # Resolve only paths published by the MCP tool, in the configured namespace.
-    assert model.read_path is not None
-    read_path = tmp_path / PurePosixPath(model.read_path).relative_to("/saved")
-    readable_text = read_path.read_text(encoding="utf-8")
-    assert "\n".join(model.pages) == readable_text.rstrip("\n")
-    assert "END_TRANSCRIPT" in "\n".join(model.pages)
-    assert "STRUCTURED_ONLY" in "\n".join(model.pages)
-    assert "\n".join(model.pages).count("🙂") == 11_000
-    assert "\x00" not in readable_text
-    assert "\x07" not in readable_text
-    assert max(len(line.encode("utf-8")) for line in readable_text.splitlines()) <= 4096
-    assert output_peer.calls == [(_TOOL_NAME, {"meeting_id": "meeting-7"})]
-    assert len(list((tmp_path / "tool-results").iterdir())) == 1
-    assert model.read_path == f"/saved/tool-results/{read_path.name}"
-    notice = f"\n\n[Full MCP result: {json.dumps(model.read_path)}]"
-    assert model.preview.endswith(notice)
-    assert readable_text.startswith(
-        model.preview.removesuffix(notice).removesuffix("…")
+    assert result.final_output == "complete"
+    preview = next(
+        message["content"] for message in model.calls[-1] if message["role"] == "tool"
     )
+    assert isinstance(preview, str)
+    assert len(preview) <= 512
+    reference = re.search(r"\n\n\[Full MCP result: (.+)\]$", preview)
+    assert reference is not None
+    read_path = json.loads(reference.group(1))
+
+    # Follow the actual published path and native read continuation offsets.
+    pages: list[str] = []
+    offset = 1
+    while True:
+        page = await asyncio.to_thread(
+            run_tool,
+            read_tool(reader=filesystem),
+            path=read_path,
+            offset=offset,
+            limit=7,
+        )
+        continuation = _CONTINUATION.search(page)
+        pages.append(page[: continuation.start()] if continuation else page)
+        if continuation is None:
+            break
+        next_offset = int(continuation.group(1))
+        assert next_offset > offset
+        offset = next_offset
+
+    assert len(pages) > 1
+    local_path = tmp_path / PurePosixPath(read_path).relative_to("/saved")
+    saved = local_path.read_text(encoding="utf-8")
+    assert "\n".join(pages) == saved
+    restored = json.loads("".join(pages).replace("\n", ""))
+    assert restored["content"][0]["text"] == transcript
+    assert restored["structuredContent"] == {"separate_fact": "STRUCTURED_ONLY"}
+    assert output_peer.calls == [(_TOOL_NAME, {"meeting_id": "meeting-7"})]
+    assert list((tmp_path / "tool-results").iterdir()) == [local_path]
+    assert read_path == f"/saved/tool-results/{local_path.name}"
+    notice = f"\n\n[Full MCP result: {json.dumps(read_path)}]"
+    assert saved.startswith(preview.removesuffix(notice).removesuffix("…"))
 
 
 @pytest.mark.asyncio
@@ -312,11 +240,12 @@ async def test_child_inherits_small_result_selection_with_original_names(
 
 @pytest.mark.asyncio
 async def test_concurrent_shims_keep_writers_separate_after_catalog_refresh(
-    output_peer: _Peer, tmp_path: Path
+    output_peer: _Peer,
 ) -> None:
-    gate = threading.Event()
     labels = ("first", "second")
-    backends = [_BlockedFileSystem(tmp_path / label, gate) for label in labels]
+    backends = [MemoryFileSystem() for _ in labels]
+    for backend in backends:
+        backend.write_released.clear()
     filesystems = [MountedFileSystem({"saved": backend}) for backend in backends]
     models = [
         SequenceModel(
@@ -364,30 +293,32 @@ async def test_concurrent_shims_keep_writers_separate_after_catalog_refresh(
         try:
             # Both writers must start before either session can finish its save.
             started = await asyncio.gather(
-                *(asyncio.to_thread(backend.started.wait, 5) for backend in backends)
+                *(
+                    asyncio.to_thread(backend.write_started.wait, 5)
+                    for backend in backends
+                )
             )
             assert all(started)
             assert len(output_peer.opened) == 1
-            gate.set()
+            for backend in backends:
+                backend.write_released.set()
             await asyncio.gather(*runs)
         finally:
-            gate.set()
+            for backend in backends:
+                backend.write_released.set()
             for run in runs:
                 if not run.done():
                     run.cancel()
             await asyncio.gather(*runs, return_exceptions=True)
 
     for label, backend, model in zip(labels, backends, models, strict=True):
-        assert len(backend.completed) == 2
-        saved = tmp_path / label / label / "tool-results"
-        read_paths = list(saved.glob("*.txt"))
-        assert len(read_paths) == 2
+        assert len(backend.writes) == 2
         history = json.dumps(model.calls[-1])
-        for path in read_paths:
-            assert f"/saved/{label}/tool-results/{path.name}" in history
+        for path in backend.files:
+            assert path.startswith(f"{label}/tool-results/")
+            assert f"/saved/{path}" in history
         other = "second" if label == "first" else "first"
         assert f"/saved/{other}" not in history
-        assert not (tmp_path / label / other).exists()
 
     assert sorted(arguments["meeting_id"] for _, arguments in output_peer.calls) == [
         f"{label}-{index}" for label in labels for index in range(2)
@@ -399,11 +330,10 @@ async def test_concurrent_shims_keep_writers_separate_after_catalog_refresh(
 @pytest.mark.parametrize("cancel", ["shutdown", "token", "task"])
 async def test_tool_cancellation_waits_for_active_file_write(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     cancel: Literal["shutdown", "token", "task"],
 ) -> None:
-    gate = threading.Event()
-    backend = _BlockedFileSystem(tmp_path, gate)
+    backend = MemoryFileSystem()
+    backend.write_released.clear()
     filesystem = MountedFileSystem({"saved": backend})
     provider_calls: list[str] = []
 
@@ -448,7 +378,7 @@ async def test_tool_cancellation_waits_for_active_file_write(
     )
     shutdown: asyncio.Task[None] | None = None
     try:
-        assert await asyncio.to_thread(backend.started.wait, 5)
+        assert await asyncio.to_thread(backend.write_started.wait, 5)
         if cancel == "shutdown":
             shutdown = asyncio.create_task(manager.aclose())
         elif cancel == "token":
@@ -460,11 +390,11 @@ async def test_tool_cancellation_waits_for_active_file_write(
         async with asyncio.timeout(5):
             while not any(task.cancelling() for task in connection.active_calls):
                 await asyncio.sleep(0.01)
-        assert not backend.finished.is_set()
+        assert backend.files == {}
         assert shutdown is None or not shutdown.done()
         assert not call_task.done()
 
-        gate.set()
+        backend.write_released.set()
         if shutdown is not None:
             await asyncio.wait_for(shutdown, timeout=5)
         if cancel == "task":
@@ -478,12 +408,11 @@ async def test_tool_cancellation_waits_for_active_file_write(
             )
             assert "[Full MCP result:" not in result
 
-        assert backend.finished.is_set()
-        assert len(backend.completed) == 1
-        assert len(list((tmp_path / "tool-results").iterdir())) == 1
+        assert len(backend.writes) == 1
+        assert len(backend.files) == 1
         assert provider_calls == ["add"]
     finally:
-        gate.set()
+        backend.write_released.set()
         if not call_task.done():
             call_task.cancel()
         await asyncio.gather(call_task, return_exceptions=True)

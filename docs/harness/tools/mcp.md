@@ -166,9 +166,9 @@ not automatically repeat a tool call after a transport failure or timeout.
 To change output limits, set `MCPServer.result_policy=MCPResultPolicy(...)`.
 Without result storage, the defaults are 32 content blocks and 51,200
 characters. Servers repeat structured content in text blocks for clients
-that cannot read it. If a
-successful result has structured content, the model gets the structured
-content and the other content blocks, but not the text blocks. A failed result
+that cannot read it. If a successful result has structured content, the model
+gets the structured content and the other content blocks, but not the text
+blocks. A failed result
 keeps its text blocks, because they contain the failure details. Set
 `include_structured_content=False` to omit structured results and keep all
 content blocks.
@@ -176,23 +176,10 @@ Image, audio, and resource bodies are returned as metadata.
 
 ## Store full results
 
-Pass an existing `FileWriter` as `result_writer` and set `result_directory`
-on `MCPToolsShim`. Configure both options together; they default to `None`.
-
-With storage enabled, AgentLane redacts credentials and prepares readable text
-once. If that text fits `max_text_chars`, it returns the text inline. Otherwise,
-it writes the same text to one `.txt` file and returns a preview with its path.
-To also save small results from selected tools, set `preserve_tools` to exact
-pairs of original server and tool names:
+Pass an existing `FileWriter` and a directory to `MCPToolsShim`. Give the
+native [`read`](./read.md) tool the same filesystem:
 
 ```python
-from agentlane.harness.filesystem import LocalFileSystem, MountedFileSystem
-from agentlane.harness.mcp import MCPToolsShim
-from agentlane.harness.tools import HarnessToolsShim, read_tool
-
-filesystem = MountedFileSystem({
-    "workspace": LocalFileSystem(root="./workspace"),
-})
 shim = MCPToolsShim(
     servers=(notes,),
     result_writer=filesystem,
@@ -203,76 +190,31 @@ reader = read_tool(reader=filesystem)
 shims = (shim, HarnessToolsShim((reader,)))
 ```
 
-Pass `shims` to `AgentDescriptor`. The writer and reader must use the same
-paths. AgentLane generates a UUID filename. A plain writer uses relative
-paths; a writer with
-`FilePathResolver`, such as `MountedFileSystem`, uses its own path rules.
-See [File I/O interfaces](../filesystem.md) for backend contracts and mounts.
+Import `HarnessToolsShim` and `read_tool` from `agentlane.harness.tools`, and
+pass `shims` to `AgentDescriptor`. Use a directory that the filesystem can
+resolve. See [File I/O interfaces](../filesystem.md) for mounts and backends.
 
-The default `preserve_tools=frozenset()` saves only text over the character
-budget. With storage enabled, all supported content is included before the
-size check; `max_content_blocks` and `include_structured_content` do not apply.
-Without a writer, the existing JSON response and processing limits stay
-unchanged.
-Storage settings belong to each shim and survive catalog refresh and tool
-inheritance, including when shims share a client connection.
+With storage enabled, AgentLane uses its existing serialization and redaction
+for all text blocks, structured content, and embedded resource text. If the
+text fits `max_text_chars`, it returns inline. Otherwise, the same text is
+saved to one UUID-named `.txt` file. `preserve_tools` optionally saves small
+results too; pairs use original server and tool names and default to empty.
 
-### Read saved content
+A saved result returns a preview and `[Full MCP result: "<path>"]`. The model
+calls `read(path="<path>", offset=1, limit=200)` and follows the reader's next
+offset. Text lines wrap at 4,096 characters so large strings remain readable.
+The file contains serialized MCP text with JSON escaping; line wrapping means
+it is not a stable JSON format. Image, audio, and blob bodies remain metadata.
 
-After the write finishes, the response includes a quoted path:
+The response, including its path, stays within `max_text_chars`. Storage uses
+the existing write and cancellation handling. If a write fails or the path
+cannot fit, the preview reports `[Full MCP result unavailable.]`. The provider
+call is not repeated. The host owns write deadlines and file retention.
 
-```text
-Beginning of the result…
-
-[Full MCP result: "/workspace/tool-results/example.txt"]
-```
-
-With the native [`read`](./read.md) tool, the model can request:
-
-```text
-read(path="/workspace/tool-results/example.txt", offset=1, limit=200)
-```
-
-Use the reader's continuation offset to read more content. Each text line has
-at most 4 KiB of UTF-8 content, plus its newline. Control characters are
-escaped. Line wrapping does not truncate text or limit the file size.
-
-### Stored content
-
-The inline text and saved file contain labeled values for the server name,
-tool name, error status, text blocks, structured content, and embedded resource
-text. Known credentials
-and values under credential keys are redacted. Image, audio, and resource blob
-bodies have `[omitted: binary]` markers. Request arguments are not stored.
-
-JSON text is parsed into readable values. Duplicate keys or incomplete JSON
-with quoted fields make text preparation fail, because they can hide credential
-keys. Plain bracketed transcript text remains supported. The text layout is
-for reading; it does not define a structured ingestion format.
-
-This flow processes the complete supported result before checking its size.
-Saved content has no additional AgentLane size, node, or nesting limit. The
-response, including its path notice, stays within `max_text_chars`. If the
-complete path cannot fit, the preview reports `[Full MCP result unavailable.]`.
-The file can already exist in that case.
-
-### Host responsibilities and failures
-
-Writes use the same helper as native write and patch tools. The host owns the
-filesystem adapter, write deadlines, access control, and retention. The MCP
-tool timeout covers the provider call. Successful `open_write` context exit
-completes the file.
-
-The MCP call handler cancels active storage on run cancellation or manager
-shutdown. The shared write helper waits for a started worker-thread write to
-settle. Manager shutdown remains subject to its configured timeout. A
-cancelled write can leave a file without a returned path.
-
-If text preparation fails, the model gets a short unavailable message. If
-storage fails, it gets a preview of the prepared text with
-`[Full MCP result unavailable.]`. AgentLane does not repeat the MCP call or
-expose the storage exception. Provider errors keep their `ToolFailure`
-classification.
+Configure both storage options together. With neither option set, the existing
+response and processing limits are unchanged. With storage enabled, all text
+is processed before budgeting; `max_content_blocks` and
+`include_structured_content` do not apply.
 
 ## Troubleshooting
 
@@ -289,8 +231,6 @@ Use the symptom or error to choose the next step:
 | `MCPPoolCapacityError` | Reduce concurrent runs or increase `MCPClientLimits.max_connections`. |
 | `MCPShutdownTimeoutError` | Check for a server that does not stop. Increase `shutdown_timeout_seconds` if needed; call `aclose()` again to wait for ongoing cleanup. |
 | Results contain `truncated` or `omittedBlocks` | Configure `result_writer` and `result_directory`, request less data, or increase the relevant `MCPResultPolicy` limit. `max_text_chars` must be at least 128. |
-| A result includes `Full MCP result:` | Use `read` with the quoted path and follow its continuation offset. |
-| A result reports unavailable text or storage | Check text preparation, write failures, and whether the path fits the response budget. The provider call is not repeated. |
 
 Tool execution failures return `ToolFailure`. Treat server results as
 untrusted input, and keep secrets out of tool arguments and results.
