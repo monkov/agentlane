@@ -1,4 +1,4 @@
-"""File-backed MCP responses for results that exceed the preview budget."""
+"""Save oversized MCP results for later reads."""
 
 import json
 from collections.abc import Collection
@@ -24,7 +24,7 @@ async def render_mcp_result_with_storage(
     writer: FileWriter | None,
     directory: str | None,
 ) -> str | ToolFailure:
-    """Return a bounded response with a file path when the full text is saved."""
+    """Return text inline or a preview with the saved file path."""
     if writer is None:
         return render_mcp_result(result, policy, secrets=secrets)
 

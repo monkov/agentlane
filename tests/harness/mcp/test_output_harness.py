@@ -1,4 +1,4 @@
-"""Saved MCP output remains readable through the normal agent lifecycle."""
+"""Test saved MCP results across agent runs."""
 
 import asyncio
 import json

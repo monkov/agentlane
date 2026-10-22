@@ -1,4 +1,4 @@
-"""Save complete MCP text with the existing serializer and file writer."""
+"""Test MCP result storage and previews."""
 
 import json
 from pathlib import Path

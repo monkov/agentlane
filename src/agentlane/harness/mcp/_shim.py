@@ -214,10 +214,8 @@ class _BoundMCPToolsShim(BoundShim):
 class MCPToolsShim(Shim):
     """Discover MCP tools and add them to every prepared model turn.
 
-    `result_writer` saves supported content under `result_directory`.
-    Configure both options to prepare complete readable text before applying
-    the response character limit and saving overflow.
-    Storage options remain local to the bound run and inherited helpers.
+    Set result_writer and result_directory to save oversized results and return
+    a preview with the file path.
     """
 
     def __init__(

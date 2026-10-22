@@ -42,7 +42,7 @@ def render_mcp_result(
     secrets: Collection[str] = (),
     complete: bool = False,
 ) -> str | ToolFailure:
-    """Use the same serializer for bounded previews and complete saved text."""
+    """Render sanitized text; complete=True disables preview limits."""
     source = read_result(result)
     renderer = _Renderer(policy.max_text_chars, secrets, complete=complete)
 
