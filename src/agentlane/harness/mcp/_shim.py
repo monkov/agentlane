@@ -218,7 +218,8 @@ class MCPToolsShim(Shim):
     """Discover MCP tools and add them to every prepared model turn.
 
     `result_writer` saves supported content under `result_directory`.
-    Configure both options to preserve content that exceeds the preview limits.
+    Configure both options to prepare complete readable text before applying
+    the response character limit and saving overflow.
     `preserve_tools` also selects small results by original server/tool pairs.
     Storage options remain local to the bound run and inherited helpers.
     """

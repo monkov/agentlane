@@ -1,6 +1,5 @@
-"""Save supported MCP content with the host's existing file writer."""
+"""Prepare MCP text once, then return it inline or save it for later reads."""
 
-import json
 from collections.abc import Collection
 from pathlib import PurePosixPath
 from uuid import uuid4
@@ -10,9 +9,12 @@ from agentlane.models import ToolFailure
 
 from .._storage_write import write_content
 from ._redaction import redact_known_secrets, redact_secret_pairs
-from ._result import render_mcp_result
-from ._source import has_hidden_content, prepare_source
+from ._result import render_mcp_result, result_response
+from ._result_values import json_text, read_result
+from ._source import prepare_source
 from ._types import MCPResultPolicy
+
+_UNAVAILABLE = "\n\n[Full MCP result unavailable.]"
 
 
 async def prepare_mcp_response(
@@ -26,23 +28,31 @@ async def prepare_mcp_response(
     directory: str | None,
     preserve_tools: frozenset[tuple[str, str]],
 ) -> str | ToolFailure:
-    """Write one readable file before returning its path in the preview."""
-    preview = render_mcp_result(result, policy, secrets=secrets)
+    """Use the original renderer only when complete storage is disabled."""
     if writer is None:
-        return preview
+        return render_mcp_result(result, policy, secrets=secrets)
 
-    # Decide before preparing the full document. Failures must not repeat the
-    # provider operation or replace its error kind.
+    # Prepare all supported content once. Inline output, saving, and failure
+    # previews use this same text without visiting the provider result again.
+    is_error = read_result(result).is_error
     try:
-        preview_text = preview.text if isinstance(preview, ToolFailure) else preview
-        if (
-            (server_name, tool_name) not in preserve_tools
-            and json.loads(preview_text).get("truncated") is not True
-            and not has_hidden_content(result, policy)
-        ):
-            return preview
+        text = prepare_source(
+            result, server_name=server_name, tool_name=tool_name, secrets=secrets
+        )
+    except Exception:
+        return result_response(
+            "[MCP result unavailable: could not prepare readable text.]", is_error
+        )
 
-        # The host selects the directory. Provider data never supplies a path.
+    if (
+        len(text) <= policy.max_text_chars
+        and (server_name, tool_name) not in preserve_tools
+    ):
+        return result_response(text, is_error)
+
+    # The host selects the directory. The call handler owns cancellation, and
+    # the shared writer waits for an active write to finish before propagating it.
+    try:
         if not directory:
             raise ValueError("MCP result storage requires a directory.")
         read_path = str(PurePosixPath(directory) / f"{uuid4()}.txt")
@@ -51,16 +61,18 @@ async def prepare_mcp_response(
             or redact_secret_pairs(read_path) != read_path
         ):
             raise ValueError("MCP output path contains credentials.")
-
-        text = prepare_source(
-            result, server_name=server_name, tool_name=tool_name, secrets=secrets
-        )
-        # The call handler owns cancellation. The shared helper waits for a
-        # started thread write to finish before cancellation propagates.
         await write_content(writer, read_path, text.encode("utf-8"))
+        notice = f"\n\n[Full MCP result: {json_text(read_path)}]"
     except Exception:
-        return render_mcp_result(
-            result, policy, secrets=secrets, storage_unavailable=True
-        )
+        notice = _UNAVAILABLE
 
-    return render_mcp_result(result, policy, secrets=secrets, read_path=read_path)
+    # Keep the complete reference inside the response budget. Only the already
+    # sanitized text can be shortened; the saved file retains the full text.
+    if len(notice) > policy.max_text_chars:
+        notice = _UNAVAILABLE
+    available = policy.max_text_chars - len(notice)
+    preview = text[:available]
+    if len(text) > available and available:
+        preview = preview[:-1] + "…"
+
+    return result_response(preview + notice, is_error)

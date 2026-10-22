@@ -176,7 +176,9 @@ class _ReadSavedResultModel(Model[ModelResponse]):
         assert isinstance(content, str)
         if self.preview is None:
             self.preview = content
-            self.read_path = json.loads(content)["output"]["read_path"]
+            reference = re.search(r"\n\n\[Full MCP result: (.+)\]$", content)
+            assert reference is not None
+            self.read_path = json.loads(reference.group(1))
             return self._read(1)
 
         # Treat the tool's continuation as the only source of the next offset.
@@ -241,8 +243,8 @@ async def test_runner_reads_complete_saved_output_through_native_pagination(
     assert model.offsets == sorted(set(model.offsets))
 
     # Resolve only paths published by the MCP tool, in the configured namespace.
-    reference = json.loads(model.preview)["output"]
-    read_path = tmp_path / PurePosixPath(reference["read_path"]).relative_to("/saved")
+    assert model.read_path is not None
+    read_path = tmp_path / PurePosixPath(model.read_path).relative_to("/saved")
     readable_text = read_path.read_text(encoding="utf-8")
     assert "\n".join(model.pages) == readable_text.rstrip("\n")
     assert "END_TRANSCRIPT" in "\n".join(model.pages)
@@ -253,7 +255,12 @@ async def test_runner_reads_complete_saved_output_through_native_pagination(
     assert max(len(line.encode("utf-8")) for line in readable_text.splitlines()) <= 4096
     assert output_peer.calls == [(_TOOL_NAME, {"meeting_id": "meeting-7"})]
     assert len(list((tmp_path / "tool-results").iterdir())) == 1
-    assert reference == {"read_path": f"/saved/tool-results/{read_path.name}"}
+    assert model.read_path == f"/saved/tool-results/{read_path.name}"
+    notice = f"\n\n[Full MCP result: {json.dumps(model.read_path)}]"
+    assert model.preview.endswith(notice)
+    assert readable_text.startswith(
+        model.preview.removesuffix(notice).removesuffix("…")
+    )
 
 
 @pytest.mark.asyncio
@@ -469,7 +476,7 @@ async def test_tool_cancellation_waits_for_active_file_write(
             assert result.error.kind == (
                 "cancelled" if cancel == "token" else "mcp_transport"
             )
-            assert "read_path" not in result
+            assert "[Full MCP result:" not in result
 
         assert backend.finished.is_set()
         assert len(backend.completed) == 1

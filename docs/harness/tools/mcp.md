@@ -164,8 +164,9 @@ servers retry transient discovery failures on later turns. AgentLane does
 not automatically repeat a tool call after a transport failure or timeout.
 
 To change output limits, set `MCPServer.result_policy=MCPResultPolicy(...)`.
-The defaults are 32 content blocks and 51,200 characters. Servers repeat
-structured content in text blocks for clients that cannot read it. If a
+Without result storage, the defaults are 32 content blocks and 51,200
+characters. Servers repeat structured content in text blocks for clients
+that cannot read it. If a
 successful result has structured content, the model gets the structured
 content and the other content blocks, but not the text blocks. A failed result
 keeps its text blocks, because they contain the failure details. Set
@@ -176,15 +177,13 @@ Image, audio, and resource bodies are returned as metadata.
 ## Store full results
 
 Pass an existing `FileWriter` as `result_writer` and set `result_directory`
-on `MCPToolsShim`. AgentLane writes one readable `.txt` file, waits for the
-write to finish, then returns its path with the preview. Configure both
-options together; they default to `None`.
+on `MCPToolsShim`. Configure both options together; they default to `None`.
 
-AgentLane saves a result when the preview loses supported content. This includes
-size or block limits, text hidden by structured content, embedded resource
-text, and structured content excluded by the result policy. To also save
-small results from selected tools, set `preserve_tools` to exact pairs of
-original server and tool names:
+With storage enabled, AgentLane redacts credentials and prepares readable text
+once. If that text fits `max_text_chars`, it returns the text inline. Otherwise,
+it writes the same text to one `.txt` file and returns a preview with its path.
+To also save small results from selected tools, set `preserve_tools` to exact
+pairs of original server and tool names:
 
 ```python
 from agentlane.harness.filesystem import LocalFileSystem, MountedFileSystem
@@ -210,24 +209,22 @@ paths; a writer with
 `FilePathResolver`, such as `MountedFileSystem`, uses its own path rules.
 See [File I/O interfaces](../filesystem.md) for backend contracts and mounts.
 
-The default `preserve_tools=frozenset()` saves only results that lose supported
-content in the preview. Without a writer, result handling stays unchanged.
+The default `preserve_tools=frozenset()` saves only text over the character
+budget. With storage enabled, all supported content is included before the
+size check; `max_content_blocks` and `include_structured_content` do not apply.
+Without a writer, the existing JSON response and processing limits stay
+unchanged.
 Storage settings belong to each shim and survive catalog refresh and tool
 inheritance, including when shims share a client connection.
 
 ### Read saved content
 
-The returned preview includes an `output` object:
+After the write finishes, the response includes a quoted path:
 
-```json
-{
-  "content": [{"type": "text", "text": "Beginning of the result…"}],
-  "isError": false,
-  "truncated": true,
-  "output": {
-    "read_path": "/workspace/tool-results/example.txt"
-  }
-}
+```text
+Beginning of the result…
+
+[Full MCP result: "/workspace/tool-results/example.txt"]
 ```
 
 With the native [`read`](./read.md) tool, the model can request:
@@ -242,19 +239,21 @@ escaped. Line wrapping does not truncate text or limit the file size.
 
 ### Stored content
 
-The file contains labeled values for the server name, tool name, error status,
-text blocks, structured content, and embedded resource text. Known credentials
+The inline text and saved file contain labeled values for the server name,
+tool name, error status, text blocks, structured content, and embedded resource
+text. Known credentials
 and values under credential keys are redacted. Image, audio, and resource blob
 bodies have `[omitted: binary]` markers. Request arguments are not stored.
 
 JSON text is parsed into readable values. Duplicate keys or incomplete JSON
-with quoted fields make storage unavailable, because they can hide credential
+with quoted fields make text preparation fail, because they can hide credential
 keys. Plain bracketed transcript text remains supported. The text layout is
 for reading; it does not define a structured ingestion format.
 
+This flow processes the complete supported result before checking its size.
 Saved content has no additional AgentLane size, node, or nesting limit. The
-existing preview limits still apply, including to the returned path. If the
-complete path cannot fit, the preview reports `"output":{"status":"unavailable"}`.
+response, including its path notice, stays within `max_text_chars`. If the
+complete path cannot fit, the preview reports `[Full MCP result unavailable.]`.
 The file can already exist in that case.
 
 ### Host responsibilities and failures
@@ -269,9 +268,10 @@ shutdown. The shared write helper waits for a started worker-thread write to
 settle. Manager shutdown remains subject to its configured timeout. A
 cancelled write can leave a file without a returned path.
 
-If preparation or storage fails, the model gets the bounded preview with
-`"output":{"status":"unavailable"}`. AgentLane does not repeat the MCP call
-or expose the storage exception. Provider errors keep their `ToolFailure`
+If text preparation fails, the model gets a short unavailable message. If
+storage fails, it gets a preview of the prepared text with
+`[Full MCP result unavailable.]`. AgentLane does not repeat the MCP call or
+expose the storage exception. Provider errors keep their `ToolFailure`
 classification.
 
 ## Troubleshooting
@@ -288,8 +288,9 @@ Use the symptom or error to choose the next step:
 | A tool call times out | Check whether the server completed the operation before retrying. Increase `tool_timeout_seconds` only if the operation needs more time. |
 | `MCPPoolCapacityError` | Reduce concurrent runs or increase `MCPClientLimits.max_connections`. |
 | `MCPShutdownTimeoutError` | Check for a server that does not stop. Increase `shutdown_timeout_seconds` if needed; call `aclose()` again to wait for ongoing cleanup. |
-| Results contain `truncated` or `omittedBlocks` | Read `output.read_path` when present. Otherwise, configure `result_writer` and `result_directory`, request less data, or increase the relevant `MCPResultPolicy` limit. `max_text_chars` must be at least 128. |
-| `output.status` is `unavailable` | Check content preparation, write failures, and whether the path fits the preview budget. The provider call is not repeated. |
+| Results contain `truncated` or `omittedBlocks` | Configure `result_writer` and `result_directory`, request less data, or increase the relevant `MCPResultPolicy` limit. `max_text_chars` must be at least 128. |
+| A result includes `Full MCP result:` | Use `read` with the quoted path and follow its continuation offset. |
+| A result reports unavailable text or storage | Check text preparation, write failures, and whether the path fits the response budget. The provider call is not repeated. |
 
 Tool execution failures return `ToolFailure`. Treat server results as
 untrusted input, and keep secrets out of tool arguments and results.

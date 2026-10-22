@@ -17,7 +17,6 @@ from ._result_values import (
     read_result,
     value_fields,
 )
-from ._types import MCPResultPolicy
 
 _LINE_BYTES = 4096
 _CONTROLS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
@@ -45,31 +44,6 @@ def _parse_json(text: str) -> object:
             raise ValueError("MCP JSON text is incomplete.") from None
 
         return NOT_JSON
-
-
-def has_hidden_content(result: object, policy: MCPResultPolicy) -> bool:
-    """Check intentional preview omissions that do not set `truncated`."""
-    source = read_result(result)
-    if source.structured_content is not None and not policy.include_structured_content:
-        return True
-
-    for block in source.content:
-        kind = block_type(block)
-        if kind == "text" and source.structured_content and not source.is_error:
-            return True
-        if kind == "resource":
-            resource = get_field(
-                cast(Mapping[str, object] | BaseModel, block), "resource"
-            )
-            if isinstance(resource, (Mapping, BaseModel)) and any(
-                alias == "text"
-                for _, alias in value_fields(
-                    cast(Mapping[str, object] | BaseModel, resource)
-                )
-            ):
-                return True
-
-    return False
 
 
 class _ReadableView:

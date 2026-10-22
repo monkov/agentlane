@@ -31,8 +31,6 @@ def render_mcp_result(
     policy: MCPResultPolicy,
     *,
     secrets: Collection[str] = (),
-    read_path: str | None = None,
-    storage_unavailable: bool = False,
 ) -> str | ToolFailure:
     """Render a bounded preview without processing omitted server content."""
     source = read_result(result)
@@ -53,32 +51,6 @@ def render_mcp_result(
     if structured is not None:
         reserved["structuredContent"] = {"omitted": True}
 
-    # File references share the preview budget and must remain complete.
-    output_metadata: dict[str, str] | None = None
-    if read_path is not None:
-        output_metadata = {"read_path": read_path}
-
-    if storage_unavailable:
-        output_metadata = {"status": "unavailable"}
-    if output_metadata is not None:
-        reserved["output"] = output_metadata
-        if len(json_text(reserved)) > policy.max_text_chars:
-            output_metadata = {"status": "unavailable"}
-            reserved["output"] = output_metadata
-
-        if len(json_text(reserved)) > policy.max_text_chars:
-            return _response(
-                json_text(
-                    {
-                        "content": [],
-                        "isError": source.is_error,
-                        "truncated": True,
-                        "output": output_metadata,
-                    }
-                ),
-                source.is_error,
-            )
-
     available = policy.max_text_chars - len(json_text(reserved))
     content_budget = 2 + (int(available * 0.6) if structured is not None else available)
 
@@ -92,8 +64,6 @@ def render_mcp_result(
         skip_text=structured is not None and not source.is_error,
     )
     fields = [f'"content":{content}', f'"isError":{json_text(source.is_error)}']
-    if output_metadata is not None:
-        fields.append(f'"output":{json_text(output_metadata)}')
     if structured is not None:
         structured_budget = len(json_text(reserved["structuredContent"])) + (
             available - (len(content) - 2)
@@ -106,10 +76,10 @@ def render_mcp_result(
         fields.extend(['"truncated":true', f'"omittedBlocks":{omitted_blocks}'])
 
     text = "{" + ",".join(fields) + "}"
-    return _response(text, source.is_error)
+    return result_response(text, source.is_error)
 
 
-def _response(text: str, is_error: bool) -> str | ToolFailure:
+def result_response(text: str, is_error: bool) -> str | ToolFailure:
     if is_error:
         return ToolFailure(
             text=text,
