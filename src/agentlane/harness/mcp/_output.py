@@ -24,7 +24,6 @@ async def render_mcp_result_with_storage(
     writer: FileWriter | None,
     directory: str | None,
 ) -> str | ToolFailure:
-    """Return text inline or a preview with the saved file path."""
     if writer is None:
         return render_mcp_result(result, policy, secrets=secrets)
 

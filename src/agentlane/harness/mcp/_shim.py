@@ -212,11 +212,7 @@ class _BoundMCPToolsShim(BoundShim):
 
 
 class MCPToolsShim(Shim):
-    """Discover MCP tools and add them to every prepared model turn.
-
-    Set result_writer and result_directory to save oversized results and return
-    a preview with the file path.
-    """
+    """Discover MCP tools and add them to every prepared model turn."""
 
     def __init__(
         self,

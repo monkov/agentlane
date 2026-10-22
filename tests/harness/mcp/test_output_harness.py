@@ -334,7 +334,7 @@ async def test_tool_cancellation_waits_for_active_file_write(
     filesystem = MountedFileSystem({"saved": backend})
     provider_calls: list[str] = []
 
-    # Use the real owner: ConnectionInstaller does not implement its cleanup.
+    # A real connection exercises shutdown cleanup, which the test stub omits.
     server = MCPServer(
         name="math",
         result_policy=MCPResultPolicy(max_text_chars=128),
