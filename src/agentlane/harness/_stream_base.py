@@ -7,7 +7,7 @@ from typing import Any, Self, cast
 
 from agentlane.models import SteeringInput, SteeringReceipt
 
-from ._run import RunResult
+from ._run import RunOutcome
 
 
 class BaseRunStream[T](AsyncIterator[T]):
@@ -21,7 +21,7 @@ class BaseRunStream[T](AsyncIterator[T]):
     ) -> None:
         self._steer: Callable[[SteeringInput], Awaitable[SteeringReceipt]] | None = None
         self._queue: asyncio.Queue[object] = asyncio.Queue()
-        self._result_future: asyncio.Future[RunResult] = (
+        self._result_future: asyncio.Future[RunOutcome] = (
             asyncio.get_running_loop().create_future()
         )
         self._closed = False
@@ -56,8 +56,8 @@ class BaseRunStream[T](AsyncIterator[T]):
             raise item
         return cast(T, item)
 
-    async def result(self) -> RunResult:
-        """Return the final harness result for this stream."""
+    async def result(self) -> RunOutcome:
+        """Return the completed result or suspension for this stream."""
         return await self._result_future
 
     async def aclose(self) -> None:
@@ -79,8 +79,8 @@ class BaseRunStream[T](AsyncIterator[T]):
             return
         self._queue.put_nowait(event)
 
-    def finish(self, result: RunResult) -> None:
-        """Resolve the stream successfully with the final run result."""
+    def finish(self, result: RunOutcome) -> None:
+        """Settle the stream with a completed result or suspension."""
         if not self._result_future.done():
             self._result_future.set_result(result)
         if not self._closed:

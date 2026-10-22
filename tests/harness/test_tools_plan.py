@@ -5,6 +5,7 @@ from agentlane.harness import (
     AgentDescriptor,
     RunPlanItem,
     RunPlanUpdatedEvent,
+    RunResult,
 )
 from agentlane.harness.agents import DefaultAgent
 from agentlane.harness.shims import PreparedTurn, ShimBindingContext
@@ -239,6 +240,7 @@ def test_plan_tool_runs_through_normal_runner_execution() -> None:
         )
 
         result = await agent.run("Plan this task.")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         run_state = result.run_state

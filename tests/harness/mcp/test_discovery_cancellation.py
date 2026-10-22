@@ -38,7 +38,9 @@ async def _run(
     agent: DefaultAgent, token: CancellationToken, mode: _RunMode
 ) -> RunResult:
     if mode == "run":
-        return await agent.run("test", cancellation_token=token)
+        result = await agent.run("test", cancellation_token=token)
+        assert isinstance(result, RunResult)
+        return result
     stream = (
         await agent.run_stream("test", cancellation_token=token)
         if mode == "stream"
@@ -47,7 +49,9 @@ async def _run(
     try:
         async for _ in stream:
             pass
-        return await stream.result()
+        result = await stream.result()
+        assert isinstance(result, RunResult)
+        return result
     finally:
         await stream.aclose()
         with suppress(BaseException):

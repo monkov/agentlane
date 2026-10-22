@@ -147,8 +147,9 @@ That split is deliberate:
 
 One streamed harness run may cross multiple model calls because of tools or
 first-class handoff, so one `run_stream(...)` may emit more than one
-`ModelStreamEventKind.COMPLETED`. The final whole-run result is still
-`RunResult`.
+`ModelStreamEventKind.COMPLETED`. The whole-run outcome is `RunResult` on
+completion or `RunSuspension` when an enabled external tool needs a host
+result. Both belong to `RunOutcome`.
 
 Streaming remains local to the harness in this step. The runner and lifecycle
 handle it without changing runtime `send_message(...)` delivery semantics.
@@ -390,6 +391,122 @@ first turn observes `turn_count == 1`; after the run finishes it equals the
 total number of turns that ran (`RunResult.turn_count` is this final value).
 Gate first-turn logic on `turn_count == 1` rather than reading it as a
 completed-turns count.
+
+## External tool continuations
+
+`ExternalTool` declares a tool whose result comes from the host application.
+It has a name, description, and Pydantic argument model. It has no handler.
+The application chooses the tool schema, validates the external answer, and
+controls access to it. For example, a question tool can accept choices and free
+text without adding question semantics to the runner.
+
+Enable this behavior for one stable root agent address:
+
+```python
+from pydantic import BaseModel, Field
+
+from agentlane.harness import AgentDescriptor, ExternalTool, Runner
+from agentlane.harness.agents import DefaultAgent
+from agentlane.messaging import AgentId
+from agentlane.models import Tools
+
+
+class RequestInputArgs(BaseModel):
+    question: str
+    # Suggestions are optional. The host also accepts and validates free text.
+    choices: list[str] = Field(default_factory=list)
+
+
+agent_id = AgentId.from_values("assistant", "main")
+agent = DefaultAgent(
+    agent_id=agent_id,
+    runner=Runner(external_tool_agent_id=agent_id),
+    descriptor=AgentDescriptor(
+        name="Assistant",
+        model=model,
+        tools=Tools(tools=[ExternalTool(
+            name="request_input",
+            description="Ask the user for information needed to continue.",
+            args_model=RequestInputArgs,
+        )]),
+    ),
+)
+```
+
+### Suspend and resume
+
+A supported external call ends the active execution with
+`RunSuspension(continuation=...)`. Streams close normally, and
+`stream.result()` returns that suspension. End hooks receive `None` because
+there is no completed `RunResult`. A suspension does not commit the working
+state or advance the completed revision.
+
+The `RunContinuation` carries a runtime-generated `continuation_id`, the stable
+agent address, the completed baseline revision, the original tool call, its
+validated arguments and schema, working state, and consumed execution limits.
+The model does not generate the continuation ID.
+
+Use `continuation_to_json()` and `continuation_from_json()` to store and restore
+this separate versioned value. Keep the previous completed `AgentSnapshot`
+with it when one exists. On a new process, reconstruct the same agent address,
+completed baseline, descriptor, tools, model, and shims. Then pass the restored
+continuation and validated result text through the existing run surface:
+
+```python
+from agentlane.harness import RunResult, ToolResultInput, continuation_from_json
+
+# The host must claim this pending request before it starts execution.
+continuation = continuation_from_json(saved_payload)
+outcome = await restored_agent.run(
+    ToolResultInput(continuation=continuation, result=validated_answer_text)
+)
+if isinstance(outcome, RunResult):
+    print(outcome.final_output)
+else:
+    # Save the next continuation before presenting the next external request.
+    next_continuation = outcome.continuation
+```
+
+`run_stream(...)` and `run_events(...)` accept the same `ToolResultInput`.
+The result becomes a tool-result message for the original call ID. The next
+model turn continues the saved run. Previous tool execution and consumed
+budgets are retained. Passing a normal user message or raw `RunState` does not
+resolve the pending call.
+
+### Host storage and execution claims
+
+The host must save the continuation before it publishes the external request.
+It must validate and save the answer, then atomically claim the pending
+continuation before it calls the runner. Save the completed snapshot or next
+continuation before marking that attempt complete.
+
+The runtime checks the agent address, baseline revision, pending call, current
+tool schema, and limits. A live agent rejects reused continuations and ordinary
+input while it waits. These checks do not coordinate separate processes.
+If a claimed attempt fails after execution starts, the host must treat its
+outcome as uncertain. Automatic replay can repeat external effects. AgentLane
+does not supply a durable store, distributed claim, or exactly-once guarantee.
+
+The [offline continuation example](../../examples/harness/external_tool_continuation/)
+uses SQLite for a pending request, saved answer, and atomic execution claim.
+It runs the pause and resume in separate processes.
+
+### Supported boundary
+
+The first version supports one root external call at a quiet tool boundary:
+
+- The model response contains exactly one tool call, and it is external.
+- There are no active asynchronous tools or delegated child runs.
+- The configured model uses ordinary request and response turns. Provider
+  modes that require live streaming, steering, or automatic successors are
+  excluded.
+- The root runner has explicit `external_tool_agent_id` configuration.
+- The host owns persistence. `DefaultAgent` rejects `state_path`, `StateStore`,
+  and `fork()` with this mode. The process bridge does not transport a
+  continuation. Child tools and handoffs cannot suspend into the parent.
+
+Unsupported combinations raise errors. Ordinary tools and completed
+`AgentSnapshot` version 1 values keep their existing behavior.
 
 ## Request Ownership
 

@@ -4,13 +4,14 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING
 
+from agentlane.messaging import AgentId
 from agentlane.models import Model, ModelResponse, ModelStreamEvent, ToolExecutor
 from agentlane.runtime import CancellationToken
 
 from ._cancellation import cancel_task_callback
 from ._events import RunEventEmitter, RunEventStream, forward_tool_approval_events
 from ._hooks import RunnerHooks, coerce_runner_hooks
-from ._run import RunResult, RunState
+from ._run import RunOutcome, RunState, ToolResultInput
 from ._run_loop import AgentDelegationState, RunLoop, RunnerTask
 from ._stream import RunStream
 from ._task import Task
@@ -34,6 +35,7 @@ class Runner:
         agent_max_depth: int = 4,
         agent_max_threads: int = 16,
         is_retryable: Callable[[BaseException], bool] | None = None,
+        external_tool_agent_id: AgentId | None = None,
     ) -> None:
         """Initialize retry and loop limits for one reusable runner.
 
@@ -47,6 +49,8 @@ class Runner:
                 spawned ``agent`` tool calls.
             is_retryable: Optional predicate for retry eligibility. Defaults
                 to the standard HTTP-status-code check in ``retry_on_errors``.
+            external_tool_agent_id: Root agent permitted to suspend external
+                tools. The host must persist and claim each continuation.
         """
         if max_attempts < 1:
             raise ValueError("Runner.max_attempts must be at least 1.")
@@ -60,6 +64,7 @@ class Runner:
         self._max_attempts = max_attempts
         self._max_turns = max_turns
         self._is_retryable = is_retryable
+        self._external_tool_agent_id = external_tool_agent_id
 
         # Share execution services and delegation limits across this runner's loops.
         self._tool_executor = ToolExecutor()
@@ -68,6 +73,15 @@ class Runner:
             max_threads=agent_max_threads,
         )
 
+    @property
+    def external_tool_agent_id(self) -> AgentId | None:
+        """Return the root allowed to use host-owned tool continuations."""
+        return self._external_tool_agent_id
+
+    def supports_external_tools(self, agent_id: AgentId) -> bool:
+        """Return whether this runner permits external tools for this root."""
+        return self._external_tool_agent_id == agent_id
+
     async def run(
         self,
         agent: Task,
@@ -75,7 +89,8 @@ class Runner:
         *,
         hooks: RunnerHooks | Sequence[RunnerHooks] | None = None,
         cancellation_token: CancellationToken | None = None,
-    ) -> RunResult:
+        external_input: ToolResultInput | None = None,
+    ) -> RunOutcome:
         """Execute the generic harness loop for the provided run state.
 
         The lifecycle passes a private working copy of ``state``, so the
@@ -97,6 +112,8 @@ class Runner:
             state=state,
             hooks=coerce_runner_hooks(hooks),
             cancellation_token=cancellation_token,
+            external_tool_agent_id=self._external_tool_agent_id,
+            external_input=external_input,
         ).run()
 
     def run_stream(
@@ -106,6 +123,7 @@ class Runner:
         *,
         hooks: RunnerHooks | Sequence[RunnerHooks] | None = None,
         cancellation_token: CancellationToken | None = None,
+        external_input: ToolResultInput | None = None,
     ) -> RunStream:
         """Execute the generic harness loop with live model streaming."""
         resolved_hooks = coerce_runner_hooks(hooks)
@@ -124,6 +142,7 @@ class Runner:
                 emit=stream.emit,
                 hooks=resolved_hooks,
                 cancellation_token=cancellation_token,
+                external_input=external_input,
             )
         )
         stream.add_cleanup(cancel_task_callback(stream_task))
@@ -138,6 +157,7 @@ class Runner:
         hooks: RunnerHooks | Sequence[RunnerHooks] | None = None,
         approval_events: AsyncIterator["ToolApprovalEvent"] | None = None,
         cancellation_token: CancellationToken | None = None,
+        external_input: ToolResultInput | None = None,
     ) -> RunEventStream:
         """Execute the generic harness loop with high-level run events."""
         stream = RunEventStream(
@@ -169,6 +189,7 @@ class Runner:
                 event_emitter=event_emitter,
                 hooks=resolved_hooks,
                 cancellation_token=cancellation_token,
+                external_input=external_input,
             )
         )
         stream.add_cleanup(cancel_task_callback(stream_task))
@@ -185,6 +206,7 @@ class Runner:
         event_emitter: RunEventEmitter | None = None,
         hooks: RunnerHooks,
         cancellation_token: CancellationToken | None,
+        external_input: ToolResultInput | None = None,
     ) -> None:
         """Drive one streamed run and resolve the provided stream handle."""
         try:
@@ -206,6 +228,8 @@ class Runner:
                 control_stream=stream,
                 hooks=hooks,
                 cancellation_token=cancellation_token,
+                external_tool_agent_id=self._external_tool_agent_id,
+                external_input=external_input,
             ).run()
         except Exception as exc:
             stream.fail(exc)

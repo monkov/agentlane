@@ -26,7 +26,7 @@ from ._lifecycle import (
     DefaultHandoffTool,
     HandoffTool,
 )
-from ._run import RunHistoryItem, RunInput, RunResult, RunState
+from ._run import RunHistoryItem, RunInput, RunOutcome, RunState, ToolResultInput
 from ._runner import Runner
 from ._stream import RunStream
 from ._task import Task
@@ -185,7 +185,7 @@ class Agent(Task):
         run_input: RunInput,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> RunResult:
+    ) -> RunOutcome:
         """Queue one internal run input and wait for the final result."""
         return await self._lifecycle.enqueue_input(
             agent=self,
@@ -271,6 +271,17 @@ class Agent(Task):
         context: MessageContext,
     ) -> object:
         """Handle one inbound resumable run state."""
+        return await self._enqueue_input(
+            payload, cancellation_token=context.cancellation_token
+        )
+
+    @on_message
+    async def handle_tool_result(
+        self,
+        payload: ToolResultInput,
+        context: MessageContext,
+    ) -> object:
+        """Deliver a host-admitted result for one saved external tool call."""
         return await self._enqueue_input(
             payload, cancellation_token=context.cancellation_token
         )

@@ -103,7 +103,11 @@ class AgentDelivery:
             async for event in child_stream:
                 emit(event)
 
-            return await child_stream.result()
+            result = await child_stream.result()
+            if not isinstance(result, RunResult):
+                raise RuntimeError("A handoff cannot suspend for an external result.")
+
+            return result
         finally:
             await child_stream.aclose()
 

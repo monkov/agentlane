@@ -1,6 +1,7 @@
 """Strict delivery failures must settle one run and release its resources."""
 
 import asyncio
+import json
 from io import StringIO
 from pathlib import Path
 
@@ -13,7 +14,14 @@ from agentlane_process_bridge import (
     ResetCommand,
 )
 
-from agentlane.harness import RunAgentEndEvent, RunModelStreamEvent, RunResult, RunState
+from agentlane.harness import (
+    RunAgentEndEvent,
+    RunModelStreamEvent,
+    RunResult,
+    RunState,
+    RunSuspension,
+    continuation_from_json,
+)
 from agentlane.harness.tools import (
     ToolOperation,
     ToolPermissionDecision,
@@ -22,6 +30,38 @@ from agentlane.harness.tools import (
 from agentlane.models import ModelResponse, ModelStreamEvent, ModelStreamEventKind
 
 from .helpers import FakeAgent, emitted_events, wait_for_event_count, wait_for_stream
+
+
+def test_external_tool_suspension_errors_once_and_closes_without_completion() -> None:
+    fixture = (
+        Path(__file__).resolve().parents[3]
+        / "tests/harness/fixtures/run_continuation_v1.json"
+    )
+    continuation = continuation_from_json(
+        json.loads(fixture.read_text(encoding="utf-8"))
+    )
+
+    async def scenario() -> None:
+        output = StringIO()
+        agent = FakeAgent()
+        backend = BridgeBackend(agent=agent, events=EventWriter(output))
+        await backend.handle_command(PromptCommand(text="go"))
+        stream = await wait_for_stream(agent)
+
+        # The bridge must reject a native pause before completed-result conversion.
+        stream.finish(RunSuspension(continuation=continuation))
+        await wait_for_event_count(output, 2)
+        await backend.close()
+
+        events = emitted_events(output)
+        assert [event["type"] for event in events] == ["run_start", "error"]
+        assert events[-1]["scope"] == "run"
+        assert "does not support external tool suspension" in events[-1]["message"]
+        assert stream.aclose_calls == 1
+        token = agent.cancellation_tokens[0]
+        assert token is not None and token.is_cancelled
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("location", ["event", "output", "state", "response"])

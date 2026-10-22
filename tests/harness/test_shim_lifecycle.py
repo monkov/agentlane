@@ -86,13 +86,17 @@ class _LifecycleShim(Shim):
 
 async def _run(agent: DefaultAgent, *, stream: bool) -> RunResult:
     if not stream:
-        return await agent.run("test")
+        result = await agent.run("test")
+        assert isinstance(result, RunResult)
+        return result
 
     events = await agent.run_stream("test")
     try:
         async for _event in events:
             pass
-        return await events.result()
+        result = await events.result()
+        assert isinstance(result, RunResult)
+        return result
     finally:
         await events.aclose()
         with suppress(BaseException):

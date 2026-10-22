@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from agentlane.messaging import AgentId, DeliveryOutcome, DeliveryStatus
 from agentlane.models import Model, ModelResponse
@@ -26,8 +26,17 @@ from .._cancellation import cancel_task_callback, cancellation_relay_task
 from .._events import RunEventStream
 from .._hooks import RunnerHooks
 from .._json_file_state_store import JsonFileStateStore
-from .._lifecycle import AgentDescriptor
-from .._run import RunInput, RunResult, RunState, copy_run_state
+from .._lifecycle import AgentDescriptor, validate_external_input
+from .._run import (
+    RunInput,
+    RunOutcome,
+    RunResult,
+    RunState,
+    RunSuspension,
+    ToolResultInput,
+    copy_run_state,
+    copy_tool_result_input,
+)
 from .._runner import Runner
 from .._snapshot import AgentSnapshot
 from .._state_store import StateStore
@@ -165,6 +174,16 @@ class DefaultAgent(AgentBase):
         #    logical conversation is meant to continue in order.
         #
         # The full-run lock is intentional for one stateful agent instance.
+        self._pending_continuation_id: UUID | None = None
+        self._consumed_continuation_ids: set[UUID] = set()
+        self._suspension_generation = 0
+        if (
+            runner is not None
+            and runner.supports_external_tools(self._agent_id)
+            and self._state_store is not None
+        ):
+            raise ValueError("External tool continuations require host-owned storage.")
+
         self._run_lock = asyncio.Lock()
         self._primary_stream_tasks: set[asyncio.Task[None]] = set()
 
@@ -278,8 +297,8 @@ class DefaultAgent(AgentBase):
         input: RunInput,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> RunResult:
-        """Execute one primary-line run and persist the resulting state.
+    ) -> RunOutcome:
+        """Execute one primary-line run and commit only a completed result.
 
         Args:
             input: Raw run input or an explicit ``RunState`` resume payload.
@@ -288,11 +307,17 @@ class DefaultAgent(AgentBase):
             cancellation_token: Optional shared cancellation token.
 
         Returns:
-            RunResult: Final result from the low-level harness run.
+            RunOutcome: The completed result or an external tool suspension.
         """
+        self._check_pending_input(input)
+        admission_generation = self._suspension_generation
         async with self._run_lock:
             effective_runner = self._resolved_runner()
-            run_input, initial_state = self._prepare_primary_run(input)
+            run_input, initial_state = self._prepare_primary_run(
+                input,
+                admission_generation=admission_generation,
+                cancellation_token=cancellation_token,
+            )
 
             if self._runtime is None:
                 async with single_threaded_runtime() as runtime:
@@ -315,7 +340,7 @@ class DefaultAgent(AgentBase):
                         cancellation_token=cancellation_token,
                     )
 
-            self._commit_run_state(result.run_state)
+            self._settle_outcome(result)
             return result
 
     async def fork(
@@ -345,6 +370,12 @@ class DefaultAgent(AgentBase):
             # released before the branch executes because forked runs do not
             # write back into the agent's primary conversation line.
             effective_runner = self._resolved_runner()
+            if (
+                self._pending_continuation_id is not None
+                or isinstance(input, ToolResultInput)
+                or effective_runner.supports_external_tools(self._agent_id)
+            ):
+                raise ValueError("External tool execution cannot be forked.")
             initial_state = (
                 None if isinstance(input, RunState) else copy_run_state(self._run_state)
             )
@@ -353,7 +384,7 @@ class DefaultAgent(AgentBase):
 
         if self._runtime is None:
             async with single_threaded_runtime() as runtime:
-                return await self._run_once(
+                result = await self._run_once(
                     runtime=runtime,
                     runner=effective_runner,
                     input=input,
@@ -362,8 +393,10 @@ class DefaultAgent(AgentBase):
                     cancellation_token=cancellation_token,
                 )
 
+                return _require_completed_result(result)
+
         async with runtime_scope(self._runtime) as runtime:
-            return await self._run_once(
+            result = await self._run_once(
                 runtime=runtime,
                 runner=effective_runner,
                 input=input,
@@ -371,6 +404,8 @@ class DefaultAgent(AgentBase):
                 agent_id=fork_agent_id,
                 cancellation_token=cancellation_token,
             )
+
+            return _require_completed_result(result)
 
     def reset(self) -> None:
         """Clear the stored primary-line run state for future runs.
@@ -390,6 +425,9 @@ class DefaultAgent(AgentBase):
                 self._run_state.revision if self._run_state is not None else None
             )
             self._state_store.delete(expected_revision=expected_revision)
+        if self._pending_continuation_id is not None:
+            self._consumed_continuation_ids.add(self._pending_continuation_id)
+        self._pending_continuation_id = None
         self._run_state = None
 
     async def run_stream(
@@ -399,6 +437,7 @@ class DefaultAgent(AgentBase):
         cancellation_token: CancellationToken | None = None,
     ) -> RunStream:
         """Execute one primary-line run with live model streaming."""
+        self._check_pending_input(input)
         stream_token = CancellationToken()
         relay_task = cancellation_relay_task(
             source=cancellation_token,
@@ -411,6 +450,7 @@ class DefaultAgent(AgentBase):
         stream_task = asyncio.create_task(
             self._run_stream_task(
                 input=input,
+                admission_generation=self._suspension_generation,
                 stream=stream,
                 cancellation_token=stream_token,
             )
@@ -428,6 +468,7 @@ class DefaultAgent(AgentBase):
         cancellation_token: CancellationToken | None = None,
     ) -> RunEventStream:
         """Execute one primary-line run with high-level run events."""
+        self._check_pending_input(input)
         stream_token = CancellationToken()
         relay_task = cancellation_relay_task(
             source=cancellation_token,
@@ -440,6 +481,7 @@ class DefaultAgent(AgentBase):
         stream_task = asyncio.create_task(
             self._run_events_task(
                 input=input,
+                admission_generation=self._suspension_generation,
                 stream=stream,
                 approval_events=approval_events,
                 cancellation_token=stream_token,
@@ -449,6 +491,13 @@ class DefaultAgent(AgentBase):
         stream_task.add_done_callback(self._primary_stream_tasks.discard)
         stream.add_cleanup(cancel_task_callback(stream_task))
         return stream
+
+    def _check_pending_input(self, run_input: RunInput) -> None:
+        """Reject ordinary input before it can queue behind an active resume."""
+        if self._pending_continuation_id is not None and not isinstance(
+            run_input, ToolResultInput
+        ):
+            raise ValueError("An external tool result is still pending.")
 
     def _resolved_runner(self) -> Runner:
         """Return the configured runner, provisioning one lazily if needed."""
@@ -465,7 +514,7 @@ class DefaultAgent(AgentBase):
         initial_state: RunState | None,
         agent_id: AgentId,
         cancellation_token: CancellationToken | None,
-    ) -> RunResult:
+    ) -> RunOutcome:
         """Bind the low-level harness agent, route one input, and unwrap result."""
         runtime_agent = RuntimeAgent.bind(
             runtime,
@@ -480,8 +529,8 @@ class DefaultAgent(AgentBase):
             recipient=agent_id,
             cancellation_token=cancellation_token,
         )
-        result = _require_run_result(outcome)
-        if result.run_state is not None:
+        result = _require_run_outcome(outcome)
+        if isinstance(result, RunSuspension) or result.run_state is not None:
             return result
 
         # Custom runners may omit ``run_state`` on the returned result even
@@ -497,6 +546,7 @@ class DefaultAgent(AgentBase):
         self,
         *,
         input: RunInput,
+        admission_generation: int,
         stream: RunStream,
         cancellation_token: CancellationToken,
     ) -> None:
@@ -504,7 +554,11 @@ class DefaultAgent(AgentBase):
         try:
             async with self._run_lock:
                 effective_runner = self._resolved_runner()
-                run_input, initial_state = self._prepare_primary_run(input)
+                run_input, initial_state = self._prepare_primary_run(
+                    input,
+                    admission_generation=admission_generation,
+                    cancellation_token=cancellation_token,
+                )
 
                 if self._runtime is None:
                     async with single_threaded_runtime() as runtime:
@@ -529,7 +583,7 @@ class DefaultAgent(AgentBase):
                             cancellation_token=cancellation_token,
                         )
 
-                self._commit_run_state(result.run_state)
+                self._settle_outcome(result)
         except Exception as exc:
             stream.fail(exc)
         except BaseException as exc:
@@ -542,6 +596,7 @@ class DefaultAgent(AgentBase):
         self,
         *,
         input: RunInput,
+        admission_generation: int,
         stream: RunEventStream,
         approval_events: AsyncIterator["ToolApprovalEvent"] | None,
         cancellation_token: CancellationToken,
@@ -550,7 +605,11 @@ class DefaultAgent(AgentBase):
         try:
             async with self._run_lock:
                 effective_runner = self._resolved_runner()
-                run_input, initial_state = self._prepare_primary_run(input)
+                run_input, initial_state = self._prepare_primary_run(
+                    input,
+                    admission_generation=admission_generation,
+                    cancellation_token=cancellation_token,
+                )
 
                 if self._runtime is None:
                     async with single_threaded_runtime() as runtime:
@@ -577,7 +636,7 @@ class DefaultAgent(AgentBase):
                             cancellation_token=cancellation_token,
                         )
 
-                self._commit_run_state(result.run_state)
+                self._settle_outcome(result)
         except Exception as exc:
             stream.fail(exc)
         except BaseException as exc:
@@ -596,7 +655,7 @@ class DefaultAgent(AgentBase):
         agent_id: AgentId,
         stream: RunStream,
         cancellation_token: CancellationToken,
-    ) -> RunResult:
+    ) -> RunOutcome:
         """Bind the low-level harness agent and stream one input locally."""
         runtime_agent = RuntimeAgent.bind(
             runtime,
@@ -624,7 +683,7 @@ class DefaultAgent(AgentBase):
             await low_level_stream.aclose()
 
         # Keep a handoff's final state; otherwise use the local runtime state.
-        if result.run_state is not None:
+        if isinstance(result, RunSuspension) or result.run_state is not None:
             return result
 
         return RunResult(
@@ -633,6 +692,16 @@ class DefaultAgent(AgentBase):
             turn_count=result.turn_count,
             run_state=runtime_agent.run_state,
         )
+
+    def _settle_outcome(self, result: RunOutcome) -> None:
+        """Keep paused state separate from the last successful baseline."""
+        if isinstance(result, RunSuspension):
+            self._pending_continuation_id = result.continuation.continuation_id
+            self._suspension_generation += 1
+            return
+
+        self._commit_run_state(result.run_state)
+        self._pending_continuation_id = None
 
     def _commit_run_state(self, run_state: RunState | None) -> None:
         """Keep and, when configured, durably save one committed state."""
@@ -657,8 +726,43 @@ class DefaultAgent(AgentBase):
     def _prepare_primary_run(
         self,
         run_input: RunInput,
+        *,
+        admission_generation: int,
+        cancellation_token: CancellationToken | None,
     ) -> tuple[RunInput, RunState | None]:
         """Prepare one primary input against the durable revision baseline."""
+        if isinstance(run_input, ToolResultInput):
+            # A cancelled queued answer never acquires execution ownership.
+            if cancellation_token is not None and cancellation_token.is_cancelled:
+                raise asyncio.CancelledError()
+            external_input = copy_tool_result_input(run_input)
+            validate_external_input(
+                external_input,
+                agent_id=self._agent_id,
+                baseline=self._run_state,
+                pending_id=self._pending_continuation_id,
+                consumed_ids=self._consumed_continuation_ids,
+            )
+            if (
+                self._state_store is not None
+                or not self._resolved_runner().supports_external_tools(self._agent_id)
+            ):
+                raise ValueError(
+                    "External results require an opted-in host with external storage."
+                )
+
+            # A live object must not replay an attempt after failure or cancellation.
+            self._pending_continuation_id = external_input.continuation.continuation_id
+            self._consumed_continuation_ids.add(self._pending_continuation_id)
+            return external_input, self._run_state
+
+        # Queued ordinary input cannot cross a pause, even if a result ahead of
+        # it in the queue has already completed that paused execution.
+        if (
+            self._pending_continuation_id is not None
+            or admission_generation != self._suspension_generation
+        ):
+            raise ValueError("An external tool result is still pending.")
         if not isinstance(run_input, RunState):
             return run_input, self._run_state
         if self._state_store is None or self._run_state is None:
@@ -681,7 +785,7 @@ class DefaultAgent(AgentBase):
         stream: RunEventStream,
         approval_events: AsyncIterator["ToolApprovalEvent"] | None,
         cancellation_token: CancellationToken,
-    ) -> RunResult:
+    ) -> RunOutcome:
         """Bind the low-level harness agent and stream high-level run events."""
         runtime_agent = RuntimeAgent.bind(
             runtime,
@@ -710,7 +814,7 @@ class DefaultAgent(AgentBase):
             await low_level_stream.aclose()
 
         # Keep a handoff's final state; otherwise use the local runtime state.
-        if result.run_state is not None:
+        if isinstance(result, RunSuspension) or result.run_state is not None:
             return result
 
         return RunResult(
@@ -775,7 +879,7 @@ def _fork_agent_id(agent_id: AgentId) -> AgentId:
     )
 
 
-def _require_run_result(outcome: DeliveryOutcome) -> RunResult:
+def _require_run_outcome(outcome: DeliveryOutcome) -> RunOutcome:
     """Return the delivered run result or raise a useful runtime error."""
     if outcome.status != DeliveryStatus.DELIVERED:
         if outcome.error is None:
@@ -787,9 +891,17 @@ def _require_run_result(outcome: DeliveryOutcome) -> RunResult:
             f"`{outcome.status.value}`: {detail}"
         )
 
-    if not isinstance(outcome.response_payload, RunResult):
+    if not isinstance(outcome.response_payload, (RunResult, RunSuspension)):
         raise TypeError(
-            "Expected the harness runtime delivery to return a `RunResult` "
+            "Expected the harness runtime delivery to return a `RunResult` or `RunSuspension` "
             "response payload."
         )
     return outcome.response_payload
+
+
+def _require_completed_result(result: RunOutcome) -> RunResult:
+    """Keep fork's success-only contract explicit."""
+    if not isinstance(result, RunResult):
+        raise RuntimeError("A fork cannot suspend for an external tool result.")
+
+    return result

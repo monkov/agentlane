@@ -9,6 +9,7 @@ from agentlane.harness import (
     RunResult,
     RunState,
     Task,
+    ToolResultInput,
 )
 from agentlane.harness._run import RunHistoryItem, copy_run_state
 from agentlane.harness.shims import Shim
@@ -110,7 +111,9 @@ class _RecordingRunner(Runner):
         *,
         hooks: RunnerHooks | Sequence[RunnerHooks] | None = None,
         cancellation_token: CancellationToken | None = None,
+        external_input: ToolResultInput | None = None,
     ) -> RunResult:
+        assert external_input is None
         _ = hooks
         _ = cancellation_token
         copied = copy_run_state(state)
@@ -150,7 +153,9 @@ class _HookAwareRecordingRunner(_RecordingRunner):
         *,
         hooks: RunnerHooks | Sequence[RunnerHooks] | None = None,
         cancellation_token: CancellationToken | None = None,
+        external_input: ToolResultInput | None = None,
     ) -> RunResult:
+        assert external_input is None
         if isinstance(hooks, Sequence):
             raise AssertionError("Lifecycle should pass one resolved hook object.")
         self.seen_hooks.append(hooks)
@@ -174,7 +179,9 @@ class _TestableAgent(Agent):
     async def queue_for_test(
         self, run_input: str | list[RunHistoryItem] | RunState
     ) -> RunResult:
-        return await self._enqueue_input(run_input)
+        result = await self._enqueue_input(run_input)
+        assert isinstance(result, RunResult)
+        return result
 
 
 def test_agent_starts_new_run_with_string_input() -> None:

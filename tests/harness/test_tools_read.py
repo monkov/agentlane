@@ -4,7 +4,7 @@ from typing import cast
 
 import pytest
 
-from agentlane.harness import Agent, AgentDescriptor, Runner, RunState
+from agentlane.harness import Agent, AgentDescriptor, Runner, RunResult, RunState
 from agentlane.harness.shims import PreparedTurn, ShimBindingContext
 from agentlane.harness.tools import (
     TEXT_MAX_BYTES,
@@ -340,6 +340,7 @@ def test_read_tool_executes_through_runner_tool_loop(tmp_path: Path) -> None:
         )
 
         result = await runner.run(agent, state)
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         first_turn_tools = model.call_tools[0]
@@ -409,6 +410,7 @@ def test_read_tool_permission_request_includes_runner_correlation_context(
         )
 
         result = await runner.run(agent, state)
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert len(policy.requests) == 1

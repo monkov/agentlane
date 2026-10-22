@@ -11,7 +11,7 @@ from typing import cast
 import pytest
 from pydantic import BaseModel
 
-from agentlane.harness import Agent, AgentDescriptor, Runner, RunState
+from agentlane.harness import Agent, AgentDescriptor, Runner, RunResult, RunState
 from agentlane.harness.filesystem import (
     BinaryReader,
     DirectoryEntry,
@@ -327,6 +327,7 @@ async def test_mounted_tools_run_through_runner(storage: MemoryFileSystem) -> No
         instructions="Use mounted files", history=["Update note"], responses=[]
     )
     result = await runner.run(agent, state)
+    assert isinstance(result, RunResult)
     assert result.final_output == "complete"
     assert storage.files["note"] == b"new\n"
 

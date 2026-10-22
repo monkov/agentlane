@@ -5,7 +5,7 @@ from typing import cast
 import patch_tool as patch_engine
 import pytest
 
-from agentlane.harness import Agent, AgentDescriptor, Runner, RunState
+from agentlane.harness import Agent, AgentDescriptor, Runner, RunResult, RunState
 from agentlane.harness.shims import PreparedTurn, ShimBindingContext
 from agentlane.harness.tools import (
     HarnessToolsShim,
@@ -404,6 +404,7 @@ def test_patch_tool_executes_through_runner_tool_loop(tmp_path: Path) -> None:
         )
 
         result = await runner.run(agent, state)
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert target.read_text(encoding="utf-8") == "after\n"

@@ -21,11 +21,13 @@ from asyncio import Future, get_running_loop
 from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol, Self
+from typing import TYPE_CHECKING, Any, Protocol, Self, runtime_checkable
+from uuid import UUID
 
 from faker import Faker
 from pydantic import BaseModel
 
+from agentlane.messaging import AgentId
 from agentlane.models import (
     Model,
     ModelResponse,
@@ -57,13 +59,17 @@ from ._run import (
     RunHistoryItem,
     RunInput,
     RunInstructions,
-    RunResult,
+    RunOutcome,
     RunState,
+    RunSuspension,
     ShimState,
+    ToolResultInput,
     copy_history_item,
     copy_instructions,
     copy_run_state,
+    copy_tool_result_input,
 )
+from ._snapshot import validate_run_continuation
 from ._stream import RunStream
 from ._stream_base import close_stream_callback
 from ._task import Task
@@ -195,6 +201,14 @@ class AgentDescriptor:
         )
 
 
+class ExternalTool[ArgsT: BaseModel](ToolSpec[ArgsT]):
+    """Declare a tool whose result is supplied later by the host.
+
+    The runner returns a suspension instead of calling a local handler. The
+    host must persist and claim that continuation before supplying its result.
+    """
+
+
 class AgentTool(ToolSpec[Any]):
     """Declarative tool schema that routes one call to another agent run."""
 
@@ -295,7 +309,7 @@ class LifecycleRunner(Protocol):
         *,
         hooks: RunnerHooks | None = None,
         cancellation_token: CancellationToken | None = None,
-    ) -> RunResult: ...
+    ) -> RunOutcome: ...
 
     def run_stream(
         self,
@@ -317,6 +331,47 @@ class LifecycleRunner(Protocol):
     ) -> RunEventStream: ...
 
 
+type _ApprovalEvents = AsyncIterator[ToolApprovalEvent]
+
+
+@runtime_checkable
+class ExternalLifecycleRunner(LifecycleRunner, Protocol):
+    """Optional runner capability for a typed external result input."""
+
+    def supports_external_tools(self, agent_id: AgentId) -> bool: ...
+
+    async def run(
+        self,
+        agent: Task,
+        state: RunState,
+        *,
+        hooks: RunnerHooks | None = None,
+        cancellation_token: CancellationToken | None = None,
+        external_input: ToolResultInput | None = None,
+    ) -> RunOutcome: ...
+
+    def run_stream(
+        self,
+        agent: Task,
+        state: RunState,
+        *,
+        hooks: RunnerHooks | None = None,
+        cancellation_token: CancellationToken | None = None,
+        external_input: ToolResultInput | None = None,
+    ) -> RunStream: ...
+
+    def run_events(
+        self,
+        agent: Task,
+        state: RunState,
+        *,
+        hooks: RunnerHooks | None = None,
+        approval_events: _ApprovalEvents | None = None,
+        cancellation_token: CancellationToken | None = None,
+        external_input: ToolResultInput | None = None,
+    ) -> RunEventStream: ...
+
+
 @dataclass(slots=True)
 class _QueuedRunInput:
     """One pending inbound run input waiting for runner execution.
@@ -328,7 +383,7 @@ class _QueuedRunInput:
     run_input: RunInput
     """Public run input queued for the next runner invocation."""
 
-    completion: Future[RunResult] | RunStream | RunEventStream
+    completion: Future[RunOutcome] | RunStream | RunEventStream
     """Required destination for this input's result or error."""
 
     cancellation_token: CancellationToken | None
@@ -363,6 +418,8 @@ class AgentLifecycle:
 
         # Defensive copy so the caller's original is never mutated.
         self._run_state = copy_run_state(run_state)
+        self._pending_continuation_id: UUID | None = None
+        self._consumed_continuation_ids: set[UUID] = set()
 
         self._pending_inputs: deque[_QueuedRunInput] = deque()
         self._is_running = False
@@ -406,7 +463,7 @@ class AgentLifecycle:
         runner: LifecycleRunner,
         run_input: RunInput,
         cancellation_token: CancellationToken | None = None,
-    ) -> RunResult:
+    ) -> RunOutcome:
         """Queue one run input and wait for the final result.
 
         If the agent is idle, the calling coroutine becomes the drainer and
@@ -415,7 +472,11 @@ class AgentLifecycle:
         active drainer will pick it up after the current turn finishes.
         """
         await self._ensure_bound_extensions(agent=agent)
-        future: Future[RunResult] = get_running_loop().create_future()
+        if self._pending_continuation_id is not None and not isinstance(
+            run_input, ToolResultInput
+        ):
+            raise ValueError("An external tool result is still pending.")
+        future: Future[RunOutcome] = get_running_loop().create_future()
         queued_input = _QueuedRunInput(
             run_input=run_input,
             completion=future,
@@ -447,6 +508,10 @@ class AgentLifecycle:
     ) -> RunStream:
         """Queue one streamed run input and return its live stream handle."""
         await self._ensure_bound_extensions(agent=agent)
+        if self._pending_continuation_id is not None and not isinstance(
+            run_input, ToolResultInput
+        ):
+            raise ValueError("An external tool result is still pending.")
 
         # Give stream closure its own cancellation token and relay caller cancellation.
         internal_token = CancellationToken()
@@ -491,6 +556,10 @@ class AgentLifecycle:
     ) -> RunEventStream:
         """Queue one event-streamed run input and return its live stream handle."""
         await self._ensure_bound_extensions(agent=agent)
+        if self._pending_continuation_id is not None and not isinstance(
+            run_input, ToolResultInput
+        ):
+            raise ValueError("An external tool result is still pending.")
 
         # Give stream closure its own cancellation token and relay caller cancellation.
         internal_token = CancellationToken()
@@ -576,40 +645,91 @@ class AgentLifecycle:
 
                     active_input = self._pending_inputs.popleft()
 
-                # Build working state (outside lock)
-                working_state = _next_run_state(
-                    self._run_state,
-                    active_input.run_input,
-                    initial_instructions=self._descriptor.instructions,
-                )
-
                 if (
                     active_input.cancellation_token is not None
                     and active_input.cancellation_token.is_cancelled
                 ):
-                    # Skip cancelled queued input before opening a model session.
-                    exc = asyncio.CancelledError()
-                    _fail_queued_input(active_input, exc)
+                    # A cancelled queue item never acquires execution ownership.
+                    _fail_queued_input(active_input, asyncio.CancelledError())
                     active_input = None
                     continue
 
-                # Execute one runner turn
                 try:
+                    external_input = None
+                    external_runner = None
+                    if isinstance(active_input.run_input, ToolResultInput):
+                        # Claim locally before runner I/O; a failed attempt must not
+                        # silently become replayable against this live lifecycle.
+                        external_input = copy_tool_result_input(active_input.run_input)
+                        validate_external_input(
+                            external_input,
+                            agent_id=agent.task_id,
+                            baseline=self._run_state,
+                            pending_id=self._pending_continuation_id,
+                            consumed_ids=self._consumed_continuation_ids,
+                        )
+                        if not isinstance(runner, ExternalLifecycleRunner) or not (
+                            runner.supports_external_tools(agent.task_id)
+                        ):
+                            raise ValueError(
+                                "This runner does not allow external results."
+                            )
+                        external_runner = runner
+                        working_state = copy_run_state(
+                            external_input.continuation.run_state
+                        )
+                        self._pending_continuation_id = (
+                            external_input.continuation.continuation_id
+                        )
+                        self._consumed_continuation_ids.add(
+                            self._pending_continuation_id
+                        )
+                    else:
+                        if self._pending_continuation_id is not None:
+                            raise ValueError(
+                                "An external tool result is still pending."
+                            )
+                        working_state = _next_run_state(
+                            self._run_state,
+                            active_input.run_input,
+                            initial_instructions=self._descriptor.instructions,
+                        )
+
+                    # Existing runner implementations get the same arguments.
                     if isinstance(active_input.completion, Future):
-                        result = await runner.run(
-                            agent=agent,
-                            state=working_state,
-                            hooks=hooks,
-                            cancellation_token=active_input.cancellation_token,
-                        )
+                        if external_runner is not None:
+                            result = await external_runner.run(
+                                agent=agent,
+                                state=working_state,
+                                hooks=hooks,
+                                cancellation_token=active_input.cancellation_token,
+                                external_input=external_input,
+                            )
+                        else:
+                            result = await runner.run(
+                                agent=agent,
+                                state=working_state,
+                                hooks=hooks,
+                                cancellation_token=active_input.cancellation_token,
+                            )
                     elif isinstance(active_input.completion, RunEventStream):
-                        event_stream = runner.run_events(
-                            agent=agent,
-                            state=working_state,
-                            hooks=hooks,
-                            approval_events=active_input.approval_events,
-                            cancellation_token=active_input.cancellation_token,
-                        )
+                        if external_runner is not None:
+                            event_stream = external_runner.run_events(
+                                agent=agent,
+                                state=working_state,
+                                hooks=hooks,
+                                approval_events=active_input.approval_events,
+                                cancellation_token=active_input.cancellation_token,
+                                external_input=external_input,
+                            )
+                        else:
+                            event_stream = runner.run_events(
+                                agent=agent,
+                                state=working_state,
+                                hooks=hooks,
+                                approval_events=active_input.approval_events,
+                                cancellation_token=active_input.cancellation_token,
+                            )
 
                         # Relay controls and cleanup to the runner stream that owns
                         # execution.
@@ -625,12 +745,21 @@ class AgentLifecycle:
                         finally:
                             await event_stream.aclose()
                     else:
-                        model_stream = runner.run_stream(
-                            agent=agent,
-                            state=working_state,
-                            hooks=hooks,
-                            cancellation_token=active_input.cancellation_token,
-                        )
+                        if external_runner is not None:
+                            model_stream = external_runner.run_stream(
+                                agent=agent,
+                                state=working_state,
+                                hooks=hooks,
+                                cancellation_token=active_input.cancellation_token,
+                                external_input=external_input,
+                            )
+                        else:
+                            model_stream = runner.run_stream(
+                                agent=agent,
+                                state=working_state,
+                                hooks=hooks,
+                                cancellation_token=active_input.cancellation_token,
+                            )
 
                         # Relay controls and cleanup to the runner stream that owns
                         # execution.
@@ -652,15 +781,37 @@ class AgentLifecycle:
                     # state.
                     _fail_queued_input(active_input, exc)
                 else:
-                    # Commit the working state only after success, ensuring
-                    # the baseline always reflects a completed turn. Handoff
-                    # may complete through a delegated child agent, so the
-                    # runner can return a different final run state than the
-                    # local working copy that started the turn.
-                    committed_state = copy_run_state(result.run_state) or working_state
-                    committed_state.revision = working_state.revision + 1
-                    self._run_state = committed_state
-                    result.run_state = copy_run_state(committed_state)
+                    if isinstance(result, RunSuspension):
+                        # A suspension keeps the completed baseline intact.
+                        self._pending_continuation_id = (
+                            result.continuation.continuation_id
+                        )
+
+                        # Inputs accepted before the pause must not run after a
+                        # queued resume merely because it finishes first.
+                        retained: deque[_QueuedRunInput] = deque()
+                        for queued in self._pending_inputs:
+                            if isinstance(queued.run_input, ToolResultInput):
+                                retained.append(queued)
+                                continue
+                            failure: BaseException = ValueError(
+                                "An external tool result is still pending."
+                            )
+                            if (
+                                queued.cancellation_token is not None
+                                and queued.cancellation_token.is_cancelled
+                            ):
+                                failure = asyncio.CancelledError()
+                            _fail_queued_input(queued, failure)
+                        self._pending_inputs = retained
+                    else:
+                        committed_state = (
+                            copy_run_state(result.run_state) or working_state
+                        )
+                        committed_state.revision = working_state.revision + 1
+                        self._run_state = committed_state
+                        self._pending_continuation_id = None
+                        result.run_state = copy_run_state(committed_state)
                     _resolve_queued_input(active_input, result)
 
                 # Keep the active input until its outcome is delivered. An
@@ -701,6 +852,9 @@ def _next_run_state(
     Resuming into an agent that already has a baseline is an error — the
     caller should create a fresh agent instance instead.
     """
+
+    if isinstance(run_input, ToolResultInput):
+        raise ValueError("External results require native continuation admission.")
 
     # Case 1: resume from a serialized RunState
     if isinstance(run_input, RunState):
@@ -753,14 +907,14 @@ def _copied_run_input_items(
     return history
 
 
-def _set_future_result(future: Future[RunResult], value: RunResult) -> None:
+def _set_future_result(future: Future[RunOutcome], value: RunOutcome) -> None:
     """Resolve a future once, guarding against double-resolution."""
     if not future.done():
         future.set_result(value)
 
 
 def _set_future_exception(
-    future: Future[RunResult],
+    future: Future[RunOutcome],
     exc: BaseException,
 ) -> None:
     """Fail a future once, guarding against double-resolution."""
@@ -771,7 +925,7 @@ def _set_future_exception(
             future.set_exception(exc)
 
 
-def _resolve_queued_input(queued_input: _QueuedRunInput, result: RunResult) -> None:
+def _resolve_queued_input(queued_input: _QueuedRunInput, result: RunOutcome) -> None:
     """Resolve one queued terminal or streaming input successfully."""
     if isinstance(queued_input.completion, Future):
         _set_future_result(queued_input.completion, result)
@@ -795,3 +949,25 @@ def _consume_drain_task_result(task: asyncio.Task[None]) -> None:
     if task.cancelled():
         return
     _ = task.exception()
+
+
+def validate_external_input(
+    run_input: ToolResultInput,
+    *,
+    agent_id: AgentId,
+    baseline: RunState | None,
+    pending_id: UUID | None,
+    consumed_ids: set[UUID],
+) -> None:
+    """Validate correlation against live state before claiming an external input."""
+    continuation = run_input.continuation
+    validate_run_continuation(continuation)
+    if continuation.agent_id != agent_id:
+        raise ValueError("The continuation belongs to another agent.")
+    baseline_revision = baseline.revision if baseline is not None else 0
+    if continuation.base_revision != baseline_revision:
+        raise ValueError("The continuation does not match the completed baseline.")
+    if continuation.continuation_id in consumed_ids:
+        raise ValueError("This continuation has already been consumed.")
+    if pending_id is not None and continuation.continuation_id != pending_id:
+        raise ValueError("The continuation does not match the pending tool call.")

@@ -25,20 +25,24 @@ from ._events import (
 )
 from ._hooks import RunnerHooks
 from ._json_file_state_store import JsonFileStateStore
-from ._lifecycle import AgentDescriptor, DefaultAgentTool, DefaultHandoff
+from ._lifecycle import AgentDescriptor, DefaultAgentTool, DefaultHandoff, ExternalTool
 from ._run import (
     ACTIVE_SKILL_NAMES_STATE_KEY_SUFFIX,
     LiveRunStateView,
+    RunContinuation,
     RunHistoryItem,
     RunInput,
     RunInstructions,
+    RunOutcome,
     RunResult,
     RunResultRecord,
     RunState,
+    RunSuspension,
     ShimState,
+    ToolResultInput,
 )
 from ._runner import Runner
-from ._snapshot import AgentSnapshot
+from ._snapshot import AgentSnapshot, continuation_from_json, continuation_to_json
 from ._state_store import StateStore
 from ._stream import RunStream
 from ._task import Task
@@ -61,6 +65,13 @@ from ._tooling import (
 )
 
 __all__ = [
+    "continuation_to_json",
+    "continuation_from_json",
+    "ToolResultInput",
+    "RunSuspension",
+    "RunOutcome",
+    "RunContinuation",
+    "ExternalTool",
     "ACTIVE_SKILL_NAMES_STATE_KEY_SUFFIX",
     "Agent",
     "AgentDescriptor",

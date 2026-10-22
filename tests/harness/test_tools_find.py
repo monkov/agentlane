@@ -4,7 +4,7 @@ from typing import cast
 
 import pytest
 
-from agentlane.harness import Agent, AgentDescriptor, Runner, RunState
+from agentlane.harness import Agent, AgentDescriptor, Runner, RunResult, RunState
 from agentlane.harness.shims import PreparedTurn, ShimBindingContext
 from agentlane.harness.tools import (
     FIND_DEFAULT_LIMIT,
@@ -298,6 +298,7 @@ def test_find_tool_runs_through_runner_tool_execution(tmp_path: Path) -> None:
         )
 
         result = await runner.run(agent, state)
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "complete"
         first_turn_tools = model.call_tools[0]

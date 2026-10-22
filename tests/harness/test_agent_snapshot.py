@@ -6,7 +6,7 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel
 
-from agentlane.harness import AgentDescriptor, AgentSnapshot, RunState
+from agentlane.harness import AgentDescriptor, AgentSnapshot, RunResult, RunState
 from agentlane.harness.agents import DefaultAgent
 from agentlane.messaging import AgentId
 from agentlane.models import (
@@ -218,6 +218,7 @@ def test_default_agent_snapshot_restores_and_continues_same_address() -> None:
             snapshot=snapshot,
         )
         result = await second_agent.run("second question")
+        assert isinstance(result, RunResult)
 
         assert second_agent.agent_id == agent_id
         assert result.final_output == "second reply"

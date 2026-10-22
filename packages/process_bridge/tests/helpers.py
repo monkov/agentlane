@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from io import StringIO
 from typing import Any, Self, cast
 
-from agentlane.harness import RunEvent, RunResult, RunState
+from agentlane.harness import RunEvent, RunOutcome, RunState
 from agentlane.harness.tools import ToolApprovalEvent
 from agentlane.runtime import CancellationToken
 
@@ -19,7 +19,7 @@ class FakeRunEventStream:
         self.close_error: Exception | None = None
         self.result_awaits = 0
         self._queue: asyncio.Queue[object] = asyncio.Queue()
-        self._result: asyncio.Future[RunResult] = (
+        self._result: asyncio.Future[RunOutcome] = (
             asyncio.get_running_loop().create_future()
         )
 
@@ -34,7 +34,7 @@ class FakeRunEventStream:
             raise item
         return cast(RunEvent, item)
 
-    async def result(self) -> RunResult:
+    async def result(self) -> RunOutcome:
         self.result_awaits += 1
         return await self._result
 
@@ -51,7 +51,7 @@ class FakeRunEventStream:
     def emit(self, event: RunEvent) -> None:
         self._queue.put_nowait(event)
 
-    def finish(self, result: RunResult) -> None:
+    def finish(self, result: RunOutcome) -> None:
         if not self._result.done():
             self._result.set_result(result)
         self._queue.put_nowait(self._END)

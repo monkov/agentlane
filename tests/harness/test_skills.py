@@ -583,6 +583,7 @@ def test_skills_shim_activates_skill_from_custom_loader_and_deduplicates() -> No
 
     async def scenario() -> None:
         result = await agent.run("Can I still return my order?")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert loader.discover_calls == 1
@@ -722,6 +723,7 @@ def test_skills_shim_deduplicates_duplicate_activation_calls_in_same_batch() -> 
 
     async def scenario() -> None:
         result = await agent.run("Can I still return my order?")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert loader.load_calls == ["refund-policy"]
@@ -792,6 +794,7 @@ def test_skills_shim_tools_frontmatter_replaces_visible_tool_pool(
 
     async def scenario() -> None:
         result = await agent.run("Inspect the workspace.")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert _tool_option_names(model.call_options[0]["tools"]) == [
@@ -853,6 +856,7 @@ def test_skills_shim_disallowed_tools_frontmatter_subtracts_visible_tools(
 
     async def scenario() -> None:
         result = await agent.run("Inspect the workspace.")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert _tool_option_names(model.call_options[1]["tools"]) == [
@@ -913,6 +917,7 @@ def test_skills_shim_disallowed_tools_are_deny_first(
 
     async def scenario() -> None:
         result = await agent.run("Inspect the workspace.")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert _tool_option_names(model.call_options[1]["tools"]) == ["read"]
@@ -960,6 +965,7 @@ def test_skills_shim_activation_is_visible_to_runner_hooks() -> None:
 
     async def scenario() -> None:
         result = await agent.run("Can I still return my order?")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert hooks.events == [
@@ -1001,6 +1007,7 @@ def test_skills_shim_uses_custom_system_prompt() -> None:
 
     async def scenario() -> None:
         result = await agent.run("Hello")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert model.calls[0][0]["role"] == "system"
@@ -1024,6 +1031,7 @@ def test_skills_shim_omits_prompt_and_tool_when_no_skills_are_discovered() -> No
 
     async def scenario() -> None:
         result = await agent.run("Hello")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert model.calls[0] == [
@@ -1298,6 +1306,7 @@ def test_skills_shim_activates_multiple_different_skills_in_one_run() -> None:
 
     async def scenario() -> None:
         result = await agent.run("Help me with my order")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert loader.load_calls == ["refund-policy", "shipping-info"]
@@ -1395,6 +1404,7 @@ def test_skills_shim_returns_already_active_when_other_skills_remain() -> None:
 
     async def scenario() -> None:
         result = await agent.run("Help me with my order")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert loader.load_calls == ["refund-policy"]
@@ -1474,6 +1484,7 @@ def test_skills_shim_reuses_shared_catalog_without_rediscovery() -> None:
             )
         )
         result = await agent.run("Hello")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         # The shim consumes the shared catalog and does not discover again.

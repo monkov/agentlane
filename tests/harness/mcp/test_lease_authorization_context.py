@@ -13,7 +13,7 @@ from mcp.server import Server, ServerRequestContext
 from starlette.requests import Request
 from starlette.types import Message, Receive, Scope, Send
 
-from agentlane.harness import AgentDescriptor
+from agentlane.harness import AgentDescriptor, RunResult
 from agentlane.harness.agents import DefaultAgent
 from agentlane.harness.mcp import (
     MCPAccessToken,
@@ -205,6 +205,7 @@ async def _run_agent(server: MCPServer, manager: MCPClientManager, value: str) -
         )
     )
     result = await agent.run("Read the record")
+    assert isinstance(result, RunResult)
     assert result.final_output == "complete"
 
 

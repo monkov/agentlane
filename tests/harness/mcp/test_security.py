@@ -16,7 +16,7 @@ from mcp.server import Server, ServerRequestContext
 from starlette.requests import Request
 from starlette.types import Message, Receive, Scope, Send
 
-from agentlane.harness import AgentDescriptor, AgentSnapshot
+from agentlane.harness import AgentDescriptor, AgentSnapshot, RunResult
 from agentlane.harness.agents import DefaultAgent
 from agentlane.harness.mcp import (
     MCPAccessToken,
@@ -696,6 +696,7 @@ async def test_real_agent_events_and_snapshot_do_not_persist_credentials(
         try:
             events = [event.to_dict() async for event in stream]
             result = await stream.result()
+            assert isinstance(result, RunResult)
         finally:
             await stream.aclose()
         assert result.run_state is not None
@@ -859,6 +860,7 @@ async def test_concurrent_practitioners_isolate_auth_sessions_catalogs_and_sse_c
                 )
             )
             result = await agent.run("Read my notes")
+            assert isinstance(result, RunResult)
             assert result.final_output == "Complete"
             assert model.call_tools[0] is not None
             assert [tool.name for tool in model.call_tools[0].normalized_tools] == [

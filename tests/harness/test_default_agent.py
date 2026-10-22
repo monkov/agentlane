@@ -13,6 +13,7 @@ from agentlane.harness import (
     RunState,
     RunStream,
     Task,
+    ToolResultInput,
 )
 from agentlane.harness._run import copy_run_state
 from agentlane.harness.agents import AgentBase, DefaultAgent
@@ -167,7 +168,9 @@ class _RecordingRunner(Runner):
         *,
         hooks: RunnerHooks | Sequence[RunnerHooks] | None = None,
         cancellation_token: CancellationToken | None = None,
+        external_input: ToolResultInput | None = None,
     ) -> RunResult:
+        assert external_input is None
         del hooks
         del cancellation_token
 
@@ -224,6 +227,7 @@ def test_default_agent_auto_manages_runtime_and_runner() -> None:
         )
 
         result = await agent.run("My order arrived damaged.")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "Thanks, I can help."
         assert result.turn_count == 1
@@ -256,6 +260,7 @@ def test_default_agent_accepts_hook_sequences() -> None:
         )
 
         result = await agent.run("My order arrived damaged.")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "Thanks, I can help."
         assert events == [
@@ -284,7 +289,9 @@ def test_default_agent_reuses_persisted_run_state_between_calls() -> None:
         )
 
         first = await agent.run("first")
+        assert isinstance(first, RunResult)
         second = await agent.run("second")
+        assert isinstance(second, RunResult)
 
         assert first.turn_count == 1
         assert second.turn_count == 2
@@ -318,6 +325,7 @@ def test_default_agent_supports_explicit_runtime_and_runner_injection() -> None:
         )
 
         result = await agent.run("draft a plan")
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "Planner:draft a plan"
         assert result.run_state is not None
@@ -346,11 +354,13 @@ def test_default_agent_supports_subclass_descriptor_and_explicit_run_state_resum
         agent = SupportAgent(runner=runner)
 
         first = await agent.run("first")
+        assert isinstance(first, RunResult)
         saved_state = first.run_state
         if saved_state is None:
             raise AssertionError("Expected saved run state from first run.")
 
         second = await agent.run(saved_state)
+        assert isinstance(second, RunResult)
 
         assert second.final_output == "Support:first"
         assert second.run_state is not None
@@ -391,6 +401,7 @@ def test_default_agent_run_stream_emits_events_and_commits_state() -> None:
         stream = await agent.run_stream("hello")
         events = await _collect_run_stream(stream)
         result = await stream.result()
+        assert isinstance(result, RunResult)
 
         assert [event.kind for event in events] == [
             ModelStreamEventKind.TEXT_DELTA,
@@ -432,6 +443,7 @@ def test_default_agent_run_stream_reuses_persisted_state() -> None:
         second_stream = await agent.run_stream("two")
         await _collect_run_stream(second_stream)
         second_result = await second_stream.result()
+        assert isinstance(second_result, RunResult)
 
         assert second_result.turn_count == 2
         assert model.calls == [
@@ -458,6 +470,7 @@ def test_default_agent_stream_entry_points_persist_state(tmp_path: Path) -> None
         model_stream = await first.run_stream("first question")
         await _collect_run_stream(model_stream)
         first_result = await model_stream.result()
+        assert isinstance(first_result, RunResult)
 
         event_model = _SequenceModel([make_assistant_response("second reply")])
         second = DefaultAgent(
@@ -468,6 +481,7 @@ def test_default_agent_stream_entry_points_persist_state(tmp_path: Path) -> None
         async for _ in event_stream:
             pass
         second_result = await event_stream.result()
+        assert isinstance(second_result, RunResult)
 
         stored = JsonFileStateStore(state_path).load()
         assert first_result.run_state is not None
@@ -533,6 +547,7 @@ def test_default_agent_fork_branches_without_mutating_persisted_state() -> None:
         )
 
         first = await agent.run("first")
+        assert isinstance(first, RunResult)
         persisted_after_run = copy_run_state(agent.run_state)
         if persisted_after_run is None:
             raise AssertionError("Expected persisted state after first run.")
@@ -564,6 +579,7 @@ def test_default_agent_fork_supports_explicit_run_state_without_persisting_it() 
         )
 
         first = await agent.run("first")
+        assert isinstance(first, RunResult)
         saved_state = first.run_state
         if saved_state is None:
             raise AssertionError("Expected saved run state from first run.")

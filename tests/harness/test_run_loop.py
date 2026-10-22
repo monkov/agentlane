@@ -7,7 +7,7 @@ from unittest.mock import Mock, create_autospec
 
 import pytest
 
-from agentlane.harness import RunnerHooks, RunState, Task
+from agentlane.harness import RunnerHooks, RunResult, RunState, Task
 from agentlane.harness._lifecycle import LifecycleRunner
 from agentlane.harness._run_loop import AgentDelegationState, RunLoop
 from agentlane.messaging import AgentId
@@ -121,6 +121,7 @@ async def test_loop_executes_tool_turn_and_closes_model(fails: bool) -> None:
         assert caught.value is failure
     else:
         result = await loop.run()
+        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert result.turn_count == 2
