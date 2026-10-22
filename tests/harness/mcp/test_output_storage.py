@@ -10,7 +10,7 @@ from mcp import types
 
 from agentlane.harness.filesystem import FileWriter, LocalFileSystem
 from agentlane.harness.mcp import MCPResultPolicy
-from agentlane.harness.mcp._output import store_mcp_result_if_needed
+from agentlane.harness.mcp._output import render_mcp_result_with_storage
 from agentlane.harness.mcp._result import render_mcp_result
 from agentlane.models import ToolFailure
 
@@ -23,7 +23,7 @@ async def _prepare(
     directory: str = "results",
     secrets: tuple[str, ...] = (),
 ) -> str | ToolFailure:
-    return await store_mcp_result_if_needed(
+    return await render_mcp_result_with_storage(
         result,
         policy=MCPResultPolicy(max_text_chars=limit, include_structured_content=False),
         secrets=secrets,

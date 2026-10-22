@@ -30,7 +30,7 @@ from ._errors import (
     MCPFailureKind,
 )
 from ._operation import mcp_operation
-from ._output import store_mcp_result_if_needed
+from ._output import render_mcp_result_with_storage
 from ._sdk import exception_kind
 from ._types import MCPRemoteTool, MCPServer
 
@@ -152,7 +152,7 @@ async def call_tool(
                     CONNECTION_UNAVAILABLE, MCP_TRANSPORT_TOOL_ERROR_KIND
                 )
 
-        preparation = store_mcp_result_if_needed(
+        preparation = render_mcp_result_with_storage(
             result,
             policy=connection.server.result_policy,
             secrets=connection.secrets,

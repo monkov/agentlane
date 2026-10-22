@@ -16,7 +16,7 @@ from ._types import MCPResultPolicy
 _UNAVAILABLE = "\n\n[Full MCP result unavailable.]"
 
 
-async def store_mcp_result_if_needed(
+async def render_mcp_result_with_storage(
     result: object,
     *,
     policy: MCPResultPolicy,
