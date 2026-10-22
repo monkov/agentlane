@@ -16,16 +16,13 @@ from ._types import MCPResultPolicy
 _UNAVAILABLE = "\n\n[Full MCP result unavailable.]"
 
 
-async def prepare_mcp_response(
+async def store_mcp_result_if_needed(
     result: object,
     *,
     policy: MCPResultPolicy,
     secrets: Collection[str],
-    server_name: str,
-    tool_name: str,
     writer: FileWriter | None,
     directory: str | None,
-    preserve_tools: frozenset[tuple[str, str]],
 ) -> str | ToolFailure:
     """Serialize once, then return the text inline or save it for native reads."""
     if writer is None:
@@ -46,10 +43,7 @@ async def prepare_mcp_response(
             "[MCP result unavailable: could not prepare readable text.]", is_error
         )
 
-    if (
-        len(text) <= policy.max_text_chars
-        and (server_name, tool_name) not in preserve_tools
-    ):
+    if len(text) <= policy.max_text_chars:
         return result_response(text, is_error)
 
     # The host selects the directory. The call handler owns cancellation, and

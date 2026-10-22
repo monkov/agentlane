@@ -112,7 +112,6 @@ class MCPClientLease:
         *,
         result_writer: FileWriter | None = None,
         result_directory: str | None = None,
-        preserve_tools: frozenset[tuple[str, str]] = frozenset(),
     ) -> tuple[Tool[Any, Any], ...]:
         if self._released:
             raise MCPError("MCP connection lease has been released.")
@@ -139,7 +138,6 @@ class MCPClientLease:
                     token,
                     result_writer=result_writer,
                     result_directory=result_directory,
-                    preserve_tools=preserve_tools,
                 )
 
             return tuple(
@@ -220,7 +218,6 @@ class MCPClientLease:
         *,
         result_writer: FileWriter | None,
         result_directory: str | None,
-        preserve_tools: frozenset[tuple[str, str]],
     ) -> str | ToolFailure:
         with mcp_operation(authorization_context=self._authorization_context):
             if token.is_cancelled:
@@ -289,7 +286,6 @@ class MCPClientLease:
                     remaining,
                     result_writer=result_writer,
                     result_directory=result_directory,
-                    preserve_tools=preserve_tools,
                 )
             finally:
                 self._entry.calls -= 1

@@ -30,7 +30,7 @@ from ._errors import (
     MCPFailureKind,
 )
 from ._operation import mcp_operation
-from ._output import prepare_mcp_response
+from ._output import store_mcp_result_if_needed
 from ._sdk import exception_kind
 from ._types import MCPRemoteTool, MCPServer
 
@@ -86,7 +86,6 @@ async def call_tool(
     *,
     result_writer: FileWriter | None = None,
     result_directory: str | None = None,
-    preserve_tools: frozenset[tuple[str, str]] = frozenset(),
 ) -> str | ToolFailure:
     if cancellation_token.is_cancelled:
         return tool_failure(TOOL_CANCELLED, ToolErrorKind.CANCELLED.value)
@@ -153,15 +152,12 @@ async def call_tool(
                     CONNECTION_UNAVAILABLE, MCP_TRANSPORT_TOOL_ERROR_KIND
                 )
 
-        preparation = prepare_mcp_response(
+        preparation = store_mcp_result_if_needed(
             result,
             policy=connection.server.result_policy,
             secrets=connection.secrets,
-            server_name=connection.server.name,
-            tool_name=name,
             writer=result_writer,
             directory=result_directory,
-            preserve_tools=preserve_tools,
         )
         if result_writer is None:
             rendered = await preparation

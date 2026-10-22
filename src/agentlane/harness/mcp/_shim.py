@@ -48,7 +48,6 @@ class _BoundMCPToolsShim(BoundShim):
     max_concurrent_discoveries: int = 8
     result_writer: FileWriter | None = None
     result_directory: str | None = None
-    preserve_tools: frozenset[tuple[str, str]] = frozenset()
     inherited_names: frozenset[str] | None = None
     sources: tuple[_SourceState, ...] = ()
     tools: tuple[Tool[BaseModel, object], ...] = ()
@@ -119,7 +118,6 @@ class _BoundMCPToolsShim(BoundShim):
                 source.tools = await source.lease.tools(
                     result_writer=self.result_writer,
                     result_directory=self.result_directory,
-                    preserve_tools=self.preserve_tools,
                 )
             except Exception as exc:
                 source.tools = ()
@@ -169,7 +167,6 @@ class _BoundMCPToolsShim(BoundShim):
             max_concurrent_discoveries=self.max_concurrent_discoveries,
             result_writer=self.result_writer,
             result_directory=self.result_directory,
-            preserve_tools=self.preserve_tools,
         )
         return (ToolSourceBinding(source=self.source, bind=bind),)
 
@@ -220,7 +217,6 @@ class MCPToolsShim(Shim):
     `result_writer` saves supported content under `result_directory`.
     Configure both options to prepare complete readable text before applying
     the response character limit and saving overflow.
-    `preserve_tools` also selects small results by original server/tool pairs.
     Storage options remain local to the bound run and inherited helpers.
     """
 
@@ -233,7 +229,6 @@ class MCPToolsShim(Shim):
         max_concurrent_discoveries: int = 8,
         result_writer: FileWriter | None = None,
         result_directory: str | None = None,
-        preserve_tools: frozenset[tuple[str, str]] = frozenset(),
     ) -> None:
         if not servers:
             raise ValueError("MCPToolsShim requires at least one server.")
@@ -263,7 +258,6 @@ class MCPToolsShim(Shim):
         self._max_concurrent_discoveries = max_concurrent_discoveries
         self._result_writer = result_writer
         self._result_directory = result_directory
-        self._preserve_tools = frozenset(preserve_tools)
 
     @property
     def name(self) -> str:
@@ -284,7 +278,6 @@ class MCPToolsShim(Shim):
             max_concurrent_discoveries=self._max_concurrent_discoveries,
             result_writer=self._result_writer,
             result_directory=self._result_directory,
-            preserve_tools=self._preserve_tools,
         )
 
 
@@ -298,7 +291,6 @@ async def _bind_mcp_tools(
     max_concurrent_discoveries: int,
     result_writer: FileWriter | None = None,
     result_directory: str | None = None,
-    preserve_tools: frozenset[tuple[str, str]] = frozenset(),
     inherited_names: frozenset[str] | None = None,
 ) -> BoundShim:
     """Create a fresh source session with its complete inheritance limits."""
@@ -312,6 +304,5 @@ async def _bind_mcp_tools(
         max_concurrent_discoveries=max_concurrent_discoveries,
         result_writer=result_writer,
         result_directory=result_directory,
-        preserve_tools=preserve_tools,
         inherited_names=inherited_names,
     )

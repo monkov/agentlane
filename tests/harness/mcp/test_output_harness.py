@@ -88,7 +88,7 @@ class _Peer:
 
 @pytest.fixture(name="output_peer")
 def fixture_output_peer(install_connection: ConnectionInstaller) -> _Peer:
-    peer = _Peer(types.CallToolResult(content=[types.TextContent(text="Complete")]))
+    peer = _Peer(types.CallToolResult(content=[types.TextContent(text="x" * 1000)]))
 
     async def prepare(connection: MCPConnection) -> None:
         peer.opened.append(connection)
@@ -192,7 +192,7 @@ async def test_runner_reads_complete_saved_output_through_native_pagination(
 
 
 @pytest.mark.asyncio
-async def test_child_inherits_small_result_selection_with_original_names(
+async def test_child_inherits_overflow_storage(
     output_peer: _Peer, tmp_path: Path
 ) -> None:
     filesystem = LocalFileSystem(tmp_path)
@@ -224,7 +224,6 @@ async def test_child_inherits_small_result_selection_with_original_names(
                         client_manager=manager,
                         result_writer=filesystem,
                         result_directory="./sessions/../tool-results",
-                        preserve_tools=frozenset({(_SERVER_NAME, _TOOL_NAME)}),
                     ),
                 ),
             )
@@ -278,7 +277,6 @@ async def test_concurrent_shims_keep_writers_separate_after_catalog_refresh(
                             client_manager=manager,
                             result_writer=filesystem,
                             result_directory=f"/saved/{label}/tool-results",
-                            preserve_tools=frozenset({(_SERVER_NAME, _TOOL_NAME)}),
                         ),
                     ),
                 )
@@ -340,6 +338,7 @@ async def test_tool_cancellation_waits_for_active_file_write(
     # Use the real owner: ConnectionInstaller does not implement its cleanup.
     server = MCPServer(
         name="math",
+        result_policy=MCPResultPolicy(max_text_chars=128),
         transport=MCPStdioTransport(
             command=sys.executable,
             args=(str(Path(__file__).parent / "fixtures/math_server.py"),),
@@ -367,12 +366,11 @@ async def test_tool_cancellation_waits_for_active_file_write(
     (tool,) = await lease.tools(
         result_writer=filesystem,
         result_directory="/saved/tool-results",
-        preserve_tools=frozenset({("math", "add")}),
     )
     token = CancellationToken()
     call_task = asyncio.create_task(
         tool.run(
-            tool.args_type().model_validate({"left": 2, "right": 3}),
+            tool.args_type().model_validate({"left": 10**200, "right": 3}),
             token,
         )
     )

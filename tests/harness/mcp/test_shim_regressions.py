@@ -58,9 +58,8 @@ class _SourceLease(MCPClientLease):
         *,
         result_writer: FileWriter | None = None,
         result_directory: str | None = None,
-        preserve_tools: frozenset[tuple[str, str]] = frozenset(),
     ) -> tuple[Tool[BaseModel, object], ...]:
-        del result_writer, result_directory, preserve_tools
+        del result_writer, result_directory
 
         async def handler(
             args: BaseModel,

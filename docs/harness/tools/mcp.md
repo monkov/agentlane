@@ -184,7 +184,6 @@ shim = MCPToolsShim(
     servers=(notes,),
     result_writer=filesystem,
     result_directory="/workspace/tool-results",
-    preserve_tools=frozenset({("notes", "get_transcript")}),
 )
 reader = read_tool(reader=filesystem)
 shims = (shim, HarnessToolsShim((reader,)))
@@ -197,8 +196,7 @@ resolve. See [File I/O interfaces](../filesystem.md) for mounts and backends.
 With storage enabled, AgentLane uses its existing serialization and redaction
 for all text blocks, structured content, and embedded resource text. If the
 text fits `max_text_chars`, it returns inline. Otherwise, the same text is
-saved to one UUID-named `.txt` file. `preserve_tools` optionally saves small
-results too; pairs use original server and tool names and default to empty.
+saved to one UUID-named `.txt` file.
 
 A saved result returns a preview and `[Full MCP result: "<path>"]`. The model
 calls `read(path="<path>", offset=1, limit=200)` and follows the reader's next

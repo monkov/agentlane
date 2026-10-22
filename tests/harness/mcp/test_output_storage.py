@@ -10,7 +10,7 @@ from mcp import types
 
 from agentlane.harness.filesystem import FileWriter, LocalFileSystem
 from agentlane.harness.mcp import MCPResultPolicy
-from agentlane.harness.mcp._output import prepare_mcp_response
+from agentlane.harness.mcp._output import store_mcp_result_if_needed
 from agentlane.harness.mcp._result import render_mcp_result
 from agentlane.models import ToolFailure
 
@@ -20,21 +20,15 @@ async def _prepare(
     writer: FileWriter | None,
     *,
     limit: int = 512,
-    selected: bool = False,
     directory: str = "results",
     secrets: tuple[str, ...] = (),
 ) -> str | ToolFailure:
-    return await prepare_mcp_response(
+    return await store_mcp_result_if_needed(
         result,
         policy=MCPResultPolicy(max_text_chars=limit, include_structured_content=False),
         secrets=secrets,
-        server_name="notes",
-        tool_name="get/document",
         writer=writer,
         directory=directory if writer is not None else None,
-        preserve_tools=(
-            frozenset({("notes", "get/document")}) if selected else frozenset()
-        ),
     )
 
 
@@ -69,7 +63,7 @@ async def test_exact_fit_is_inline_and_overflow_saves_the_same_text(
 
 
 @pytest.mark.asyncio
-async def test_selected_small_result_is_saved_and_keeps_text_and_binary_metadata(
+async def test_small_result_keeps_text_and_binary_metadata_without_saving(
     tmp_path: Path,
 ) -> None:
     filesystem = LocalFileSystem(tmp_path)
@@ -91,10 +85,6 @@ async def test_selected_small_result_is_saved_and_keeps_text_and_binary_metadata
         text in inline for text in ("Transcript", "Embedded text", "meeting-123")
     )
     assert "image/png" in inline and "binary-canary" not in inline
-
-    await _prepare(result, filesystem, selected=True, limit=1000)
-    (path,) = tmp_path.rglob("*.txt")
-    assert path.read_text() == inline
 
 
 @pytest.mark.asyncio
@@ -145,10 +135,11 @@ async def test_storage_outcomes_keep_server_error_kind(
         monkeypatch.setattr(
             filesystem, "open_write", Mock(side_effect=TimeoutError("private-detail"))
         )
+    text = "Not found" + ("x" * 1000 if outcome != "inline" else "")
     result = types.CallToolResult(
-        content=[types.TextContent(text="Not found")], is_error=is_error
+        content=[types.TextContent(text=text)], is_error=is_error
     )
-    response = await _prepare(result, filesystem, selected=outcome != "inline")
+    response = await _prepare(result, filesystem)
     assert "Not found" in response and len(response) <= 512
     assert isinstance(response, ToolFailure) is is_error
     if isinstance(response, ToolFailure):
@@ -255,7 +246,7 @@ async def test_preview_processing_limits_do_not_drop_saved_text(
     response = await _prepare(
         {"content": content, "structuredContent": structured},
         LocalFileSystem(tmp_path),
-        selected=True,
+        limit=128,
     )
     (path,) = tmp_path.rglob("*.txt")
     assert final_value in "".join(path.read_text().splitlines())
