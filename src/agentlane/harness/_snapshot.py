@@ -134,39 +134,38 @@ class AgentSnapshot(BaseModel):
 
 
 class RunContinuation(BaseModel):
-    """Uncommitted working state for one external call, stored and claimed by the host.
+    """Saved state for a run waiting on one external tool result.
 
-    The checkpoint reuses the snapshot codec; it must not enter the completed
-    snapshot store. This envelope grants no permission to resume. Treat nested
-    data as read-only; transport and execution boundaries validate and copy it.
+    The application stores this separately from completed snapshots and prevents
+    duplicate resumes. Nested data is copied and validated before use.
     """
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     kind: Literal["external_tool_continuation"] = "external_tool_continuation"
-    """Keep pending execution separate from completed snapshots."""
+    """Record type that distinguishes continuations from completed snapshots."""
     format_version: int = Field(default=1, ge=1, le=1)
-    """Version of this continuation format, not a state revision."""
+    """Continuation schema version."""
     continuation_id: UUID = Field(default_factory=uuid4)
-    """Runtime-generated identity for the host's durable claim."""
+    """Generated ID used by the application to claim one resume."""
     checkpoint: AgentSnapshot
-    """Uncommitted state, owner, and completed baseline revision."""
+    """Pending state with its agent ID and last committed revision."""
     tool_call: ToolCall
     """Original provider call ID, function name, and raw arguments."""
     arguments: dict[str, JsonValue]
-    """Validated arguments for the host's external interaction."""
+    """Validated arguments, including defaults generated at pause."""
     args_schema: dict[str, JsonValue]
-    """Saved function schema used to reject a changed tool contract."""
+    """Tool schema that must match on resume."""
     tool_call_counts: dict[str, NonNegativeInt]
-    """Used calls, including the pending call; stricter caps may be below usage."""
+    """Used calls, including the pending call."""
     tool_round_trips: NonNegativeInt
     """Used tool rounds, including the pending round."""
     max_turns: NonNegativeInt
-    """Saved model-turn limit that resume must not increase."""
+    """Maximum model turns allowed across pause and resume."""
     tool_call_limits: dict[str, NonNegativeInt] | None
-    """Saved per-tool limits, or no configured limits."""
+    """Saved per-tool call limits, or None if unset."""
     max_tool_round_trips: NonNegativeInt
-    """Saved tool-round limit that resume must not increase."""
+    """Maximum tool rounds allowed across pause and resume."""
 
     @field_validator("continuation_id", mode="before")
     @classmethod
@@ -181,7 +180,7 @@ class RunContinuation(BaseModel):
     @field_validator("checkpoint", mode="before")
     @classmethod
     def _check_checkpoint(cls, value: object) -> object:
-        """Validate strict pending state without changing the snapshot v1 contract."""
+        """Require exact checkpoint fields and integer counters."""
         raw = value.model_dump() if isinstance(value, AgentSnapshot) else value
         if not isinstance(raw, dict) or set(cast(dict[object, object], raw)) != set(
             AgentSnapshot.model_fields
@@ -211,12 +210,12 @@ class RunContinuation(BaseModel):
     @field_validator("tool_call", mode="before")
     @classmethod
     def _copy_tool_call(cls, value: object) -> object:
-        """Detach the pending call from the caller's nested model."""
+        """Copy the pending call before validation."""
         return value.model_dump() if isinstance(value, ToolCall) else value
 
     @model_validator(mode="after")
     def _check_pending_run(self) -> Self:
-        """Require consistent pending history, counters, schema, and JSON values."""
+        """Validate the pending call, saved limits, and JSON values."""
         call = self.tool_call
         if not call.id or not call.function.name or call.type != "function":
             raise ValueError("Continuation requires a named function and call ID.")
@@ -228,22 +227,21 @@ class RunContinuation(BaseModel):
             raise ValueError("Continuation must count the pending tool call.")
         _validate_pending_call(self)
 
-        # Check raw JSON payloads before Pydantic can encode nonfinite values as null.
-        # Snapshot timestamps use the existing snapshot codec instead.
+        # Reject nonfinite numbers before JSON encoding turns them into null.
         for value in (self.checkpoint.state, call, self.arguments, self.args_schema):
             serialize_value(value)
 
         return self
 
     def to_json(self) -> dict[str, object]:
-        """Return checked pending state for the host to store and claim."""
+        """Return the validated continuation as a JSON-safe mapping."""
         checked = self.from_json(self.model_dump())
 
         return cast(dict[str, object], checked.model_dump(mode="json"))
 
     @classmethod
     def from_json(cls, data: object) -> Self:
-        """Decode and copy pending state, rejecting inconsistent nested values."""
+        """Validate and copy a saved continuation."""
         raw = data.model_dump() if isinstance(data, cls) else data
         if not isinstance(raw, dict) or set(cast(dict[object, object], raw)) != set(
             cls.model_fields
@@ -253,21 +251,21 @@ class RunContinuation(BaseModel):
         return cls.model_validate(raw)
 
     def to_run_state(self) -> RunState:
-        """Restore a private working copy for the existing run entry points."""
+        """Restore an isolated run state from the checkpoint."""
         return self.from_json(self.model_dump()).checkpoint.to_run_state()
 
 
 @dataclass(frozen=True, slots=True)
 class ToolResultInput:
-    """Host-validated text for a claimed continuation, passed to a new Runner."""
+    """Saved continuation and application-validated tool result."""
 
     continuation: RunContinuation
-    """Exact pending execution; this is not a new user message."""
+    """Pending run that receives the result."""
     result: str
-    """Model-readable result already validated by the host."""
+    """Tool result text passed to the model."""
 
     def __post_init__(self) -> None:
-        """Detach and revalidate caller-owned data before execution."""
+        """Validate the result and copy the continuation."""
         if not isinstance(cast(object, self.result), str):
             raise TypeError("External tool result must be a string.")
         copied = RunContinuation.from_json(self.continuation.model_dump())
@@ -275,21 +273,21 @@ class ToolResultInput:
 
 
 class RunPaused(Exception):
-    """Signal a durable waiting boundary after the run's resources close."""
+    """Raised after cleanup when a run needs an external tool result."""
 
     def __init__(self, continuation: RunContinuation) -> None:
-        """Own a validated copy for the host to persist and claim."""
+        """Validate and copy the pending continuation."""
         self.continuation = RunContinuation.from_json(continuation.model_dump())
         super().__init__(f"Run waits for external call {continuation.tool_call.id}.")
 
 
 def _validate_pending_call(continuation: RunContinuation) -> None:
-    """Require resolved previous rounds and exactly the original final call."""
+    """Require resolved earlier calls and exactly one pending call."""
     pending: dict[str, ToolCall] = {}
     seen: set[str] = set()
     history = continuation.checkpoint.state.history
 
-    # A missing earlier result must not be skipped by a later external answer.
+    # Reject missing results, duplicate calls, and input after a pending call.
     for message in history:
         raw_calls = message.get("tool_calls")
         role = message["role"]
@@ -310,7 +308,7 @@ def _validate_pending_call(continuation: RunContinuation) -> None:
         elif pending:
             raise ValueError("Continuation has input after an unresolved call.")
 
-    # The answer completes this call only, with the same name and raw arguments.
+    # The final history entry must match the call being answered.
     if (
         not history
         or history[-1]["role"] != "assistant"

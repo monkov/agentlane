@@ -187,7 +187,7 @@ class Agent(Task):
         *,
         cancellation_token: CancellationToken | None = None,
     ) -> RunResult | RunPaused:
-        """Queue one input and preserve a pause across runtime delivery."""
+        """Queue one input and return its result or pause."""
         try:
             return await self._lifecycle.enqueue_input(
                 agent=self,
@@ -196,8 +196,7 @@ class Agent(Task):
                 cancellation_token=cancellation_token,
             )
         except RunPaused as pause:
-            # Runtime delivery converts exceptions to text. Return the pause
-            # intact so the facade can raise it with its continuation.
+            # Return the pause so runtime delivery does not convert it to text.
             return pause
 
     async def enqueue_input_stream(

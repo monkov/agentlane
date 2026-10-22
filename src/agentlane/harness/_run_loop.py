@@ -190,7 +190,7 @@ class AgentDelegationState:
 
     @property
     def has_live_children(self) -> bool:
-        """Return whether a delegated child still owns a shared run slot."""
+        """Return whether any child slots are reserved."""
         return self._live_agents > 0
 
     async def reserve_child(
@@ -349,7 +349,7 @@ class RunLoop:
 
                     return result
                 except RunPaused as exc:
-                    # End the trace normally; publish the pause only after cleanup.
+                    # Close the trace and resources before raising the pause.
                     pause = exc
                 finally:
                     await self._cancel_pending_calls()
@@ -383,14 +383,14 @@ class RunLoop:
 
     @property
     def _external_tools_enabled(self) -> bool:
-        """Return whether this loop owns the opted-in root execution."""
+        """Return whether this agent is the configured external-tool root."""
         return (
             self.external_tool_agent_id is not None
             and self.agent.id == self.external_tool_agent_id
         )
 
     def _validate_external_setup(self) -> None:
-        """Check continuation identity and restore budgets before model I/O."""
+        """Validate saved state and restore used tool budgets before model I/O."""
         self._validate_external_catalog(self.runner_task.tools)
         if self._external_tools_enabled and self.model.requires_streaming:
             raise ValueError(
@@ -401,7 +401,7 @@ class RunLoop:
             self._reject_unresolved_external_calls()
             return
 
-        # A caller cannot use a result input to bypass the explicit root opt-in.
+        # Match the saved root and state before restoring tool usage.
         saved = self.external_input.continuation
         if (
             not self._external_tools_enabled
@@ -419,7 +419,7 @@ class RunLoop:
         self.tool_round_trips = saved.tool_round_trips
 
     def _validate_external_catalog(self, tools: Tools | None) -> None:
-        """Reject unsupported external declarations before model execution."""
+        """Reject external tools outside the configured root."""
         if tools is None or not any(
             isinstance(tool, ExternalTool) for tool in tools.normalized_tools
         ):
@@ -428,11 +428,11 @@ class RunLoop:
             raise ValueError("External tools require explicit opt-in for this root.")
 
     def _reject_unresolved_external_calls(self) -> None:
-        """Require typed input when history contains an unfinished external call."""
+        """Reject unfinished calls without a saved continuation and result."""
         if not self._external_tools_enabled:
             return
 
-        # History alone omits the original execution budgets and admission guard.
+        # History alone cannot restore the saved tool budgets.
         pending: set[str] = set()
         for message in render_request_messages(None, self.state.history):
             for raw_call in cast(list[object], message.get("tool_calls") or []):
@@ -444,7 +444,7 @@ class RunLoop:
             raise ValueError("An unfinished external call requires ToolResultInput.")
 
     def _apply_external_result(self, tools: Tools | None) -> None:
-        """Append the admitted result once under the current registered contract."""
+        """Validate the current tool and append its external result once."""
         if self.external_input is None:
             raise RuntimeError("External result admission requires a typed input.")
         saved = self.external_input.continuation
@@ -461,8 +461,8 @@ class RunLoop:
         if definition.schema != saved.args_schema:
             raise ValueError("The pending external tool contract has changed.")
 
-        # Keep the arguments validated at pause; defaults may not be repeatable.
-        # A history-rewrite shim must retain the exact unresolved call boundary.
+        # Shims must preserve the pending call. Keep its validated arguments:
+        # running argument validation again could generate different defaults.
         current = AgentSnapshot.capture(agent_id=self.agent.id, run_state=self.state)
         RunContinuation.from_json(
             saved.model_copy(update={"checkpoint": current}).model_dump()
@@ -500,14 +500,14 @@ class RunLoop:
         if self.inherited_turn is not None:
             turn.tools = self._inherited_tools(self.inherited_turn.tools, turn.tools)
 
-        # Resolve external declarations after shims, before any model request.
+        # Check tools and pending calls after shims can change them.
         self._validate_external_catalog(turn.tools)
         if self.external_input is not None and not self._external_resume_applied:
             self._apply_external_result(turn.tools)
         elif self.external_input is None:
             self._reject_unresolved_external_calls()
 
-        # A restored continuation cannot expand its previous tool budgets.
+        # Resume uses the smaller of the saved and current limits.
         if turn.tools is not None and self.external_input is not None:
             saved = self.external_input.continuation
             limits = dict(turn.tools.tool_call_limits or {})
@@ -640,7 +640,7 @@ class RunLoop:
             tool_calls, completed.required_tool_call_ids, response
         )
 
-        # External runs must retain client control over every next model call.
+        # Provider-driven continuation or steering would bypass the pause checks.
         if self._external_tools_enabled and (
             completed.continuation is not None or completed.input_messages
         ):
@@ -1143,7 +1143,7 @@ class RunLoop:
                     raw_response=response,
                 )
 
-        # The ordinary turn path has recorded history and charged this round.
+        # History and round usage are already recorded; save the pending call.
         for call in tool_calls:
             definition = tool_definitions[call.function.name or ""]
             if isinstance(definition, ExternalTool):

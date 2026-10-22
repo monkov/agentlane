@@ -196,11 +196,7 @@ class AgentDescriptor:
 
 
 class ExternalTool[ArgsT: BaseModel](ToolSpec[ArgsT]):
-    """Declare a tool whose result is supplied later by the host.
-
-    The runner raises ``RunPaused`` instead of calling a local handler. The
-    host must persist and claim the continuation before supplying its result.
-    """
+    """Declarative tool whose result is supplied by the application."""
 
 
 class AgentTool(ToolSpec[Any]):

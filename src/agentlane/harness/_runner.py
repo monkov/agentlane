@@ -51,11 +51,10 @@ class Runner:
                 spawned ``agent`` tool calls.
             is_retryable: Optional predicate for retry eligibility. Defaults
                 to the standard HTTP-status-code check in ``retry_on_errors``.
-            external_tool_agent_id: Root permitted to pause for external tools.
-                This runner accepts one invocation of that root. Create a new
-                runner for each resume; the host owns durable admission.
-            external_input: Claimed continuation and result for the root's next
-                invocation. Pass its restored state through the normal run API.
+            external_tool_agent_id: Root allowed to pause for external tools.
+                Allows one root run per runner. Resume requires a new runner.
+            external_input: Saved continuation and tool result. Pass the restored
+                state to the run method. The application must prevent replay.
         """
         if max_attempts < 1:
             raise ValueError("Runner.max_attempts must be at least 1.")
@@ -72,7 +71,7 @@ class Runner:
         self._max_turns = max_turns
         self._is_retryable = is_retryable
 
-        # Own the resume payload and permit one root execution on this instance.
+        # Copy caller-owned data and track whether the root has run.
         self._external_tool_agent_id = external_tool_agent_id
         self._external_input = (
             ToolResultInput(external_input.continuation, external_input.result)
@@ -81,7 +80,7 @@ class Runner:
         )
         self._external_execution_started = False
 
-        # Handoffs share this runner and must retain the saved model-turn limit.
+        # Handoffs share the runner, so apply the saved turn limit here.
         if self._external_input is not None:
             self._max_turns = min(
                 self._max_turns, self._external_input.continuation.max_turns
@@ -96,13 +95,13 @@ class Runner:
 
     @property
     def external_tool_agent_id(self) -> AgentId | None:
-        """Return the root configured for host-managed external tool results."""
+        """Return the root allowed to use external tools."""
         return self._external_tool_agent_id
 
     def _claim_external_execution(
         self, agent: Task, cancellation_token: CancellationToken | None
     ) -> None:
-        """Reserve the configured root before any task or model I/O starts."""
+        """Prevent a second root run before scheduling any work."""
         if (
             self._external_tool_agent_id is None
             or agent.id != self._external_tool_agent_id
