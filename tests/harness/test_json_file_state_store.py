@@ -14,7 +14,6 @@ from agentlane.harness import (
     RunState,
     StateStore,
     Task,
-    ToolResultInput,
 )
 from agentlane.harness.agents import DefaultAgent
 from agentlane.messaging import AgentId
@@ -60,9 +59,7 @@ class _ReplacingRunner(Runner):
         *,
         hooks: RunnerHooks | Sequence[RunnerHooks] | None = None,
         cancellation_token: CancellationToken | None = None,
-        external_input: ToolResultInput | None = None,
     ) -> RunResult:
-        assert external_input is None
         del agent, hooks, cancellation_token
         replacement = RunState(
             instructions=state.instructions,
@@ -91,9 +88,7 @@ class _BlockingRunner(Runner):
         *,
         hooks: RunnerHooks | Sequence[RunnerHooks] | None = None,
         cancellation_token: CancellationToken | None = None,
-        external_input: ToolResultInput | None = None,
     ) -> RunResult:
-        assert external_input is None
         del agent, hooks, cancellation_token
         self.started.set()
         await self.release.wait()
@@ -234,7 +229,6 @@ def test_default_agent_state_path_restores_continues_and_saves(
             state_path=state_path,
         )
         first_result = await first.run("first question")
-        assert isinstance(first_result, RunResult)
 
         second_model = SequenceModel([make_assistant_response("second reply")])
         second = DefaultAgent(
@@ -242,7 +236,6 @@ def test_default_agent_state_path_restores_continues_and_saves(
             state_path=state_path,
         )
         second_result = await second.run("second question")
-        assert isinstance(second_result, RunResult)
 
         stored = JsonFileStateStore(state_path).load()
         assert stored is not None
@@ -314,9 +307,7 @@ def test_default_agent_replacement_runner_keeps_revision_sequence(
         )
 
         first = await agent.run("first")
-        assert isinstance(first, RunResult)
         second = await agent.run("second")
-        assert isinstance(second, RunResult)
 
         stored = JsonFileStateStore(state_path).load()
         assert first.run_state is not None
@@ -352,7 +343,6 @@ def test_default_agent_explicit_state_uses_persisted_revision(
         )
 
         result = await agent.run(replacement)
-        assert isinstance(result, RunResult)
 
         stored = JsonFileStateStore(state_path).load()
         assert replacement.revision == 0

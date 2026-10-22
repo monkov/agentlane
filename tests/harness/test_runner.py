@@ -435,7 +435,6 @@ def test_runner_returns_run_result_and_updates_run_state() -> None:
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "hello back"
         assert result.turn_count == 1
@@ -544,7 +543,6 @@ def _run_echo_tool_call(model_tracing: ModelTracing) -> _CollectingTracingProces
         )
         with trace("runner_tool_tracing"):
             result = await runner.run(agent, state)
-            assert isinstance(result, RunResult)
         assert result.final_output == "done"
 
     try:
@@ -597,7 +595,6 @@ def test_runner_retries_retryable_model_failures() -> None:
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "retried response"
         assert result.turn_count == 1
@@ -627,7 +624,6 @@ def test_runner_invokes_hooks_in_order() -> None:
         )
 
         result = await runner.run(agent, state, hooks=hooks)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "observed"
         assert hooks.events == [
@@ -660,7 +656,6 @@ def test_runner_accepts_hook_sequences_in_order() -> None:
         )
 
         result = await runner.run(agent, state, hooks=(first, second))
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "observed"
         assert events == [
@@ -742,7 +737,6 @@ def test_runner_run_stream_emits_events_and_returns_final_result() -> None:
         stream = runner.run_stream(agent, state)
         events = await _collect_runner_stream(stream)
         result = await stream.result()
-        assert isinstance(result, RunResult)
 
         assert [event.kind for event in events] == [
             ModelStreamEventKind.TEXT_DELTA,
@@ -806,7 +800,6 @@ def test_runner_run_stream_continues_across_tool_call_turns() -> None:
         stream = runner.run_stream(agent, state)
         events = await _collect_runner_stream(stream)
         result = await stream.result()
-        assert isinstance(result, RunResult)
 
         assert executed == ["docs"]
         assert result.final_output == "docs are ready"
@@ -866,7 +859,6 @@ def test_runner_run_stream_continues_across_first_class_handoff() -> None:
         stream = runner.run_stream(agent, state)
         events = await _collect_runner_stream(stream)
         result = await stream.result()
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "handled by returns"
         assert [event.kind for event in events] == [
@@ -922,7 +914,6 @@ def test_runner_builds_request_from_prompt_instructions_and_history_items() -> N
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert model.calls == [
@@ -1057,7 +1048,6 @@ def test_runner_executes_tool_calls_and_continues_loop() -> None:
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "docs are ready"
         assert executed == ["docs"]
@@ -1170,7 +1160,6 @@ def test_runner_executes_parallel_tool_calls_and_invokes_hooks() -> None:
         release.set()
 
         result = await run_task
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "complete"
         assert set(started_calls) == {"one", "two"}
@@ -1257,7 +1246,6 @@ def test_runner_filters_exhausted_tools_on_later_turns() -> None:
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert model.call_options[0]["tools"] == tools
@@ -1322,7 +1310,6 @@ def test_runner_disables_tools_after_max_round_trips() -> None:
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert model.call_options[0]["tools"] == tools
@@ -1516,7 +1503,6 @@ def test_runner_transfers_handoff_to_specialist_and_returns_child_result() -> No
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "refund approved"
         assert len(result.responses) == 2
@@ -1633,7 +1619,6 @@ def test_runner_executes_agent_as_tool_and_resumes_caller_loop() -> None:
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == (
             "The specialist says the warranty covers screen cracks."
@@ -1744,7 +1729,6 @@ def test_runner_executes_parameterless_agent_tool_with_empty_structured_payload(
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "parent complete"
         child_model = cast(_SequenceModel, child_descriptor.model)
@@ -1832,7 +1816,6 @@ def test_runner_executes_parallel_agent_tool_calls_with_blocking_waits() -> None
         release.set()
 
         result = await run_task
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "parallel complete"
         assert set(started_calls) == {"left", "right"}
@@ -1878,7 +1861,6 @@ def test_runner_executes_default_handoff_with_fresh_child_agent() -> None:
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "default child"
         assert child_model.calls == [
@@ -1966,7 +1948,6 @@ def test_runner_executes_default_agent_tool_with_default_prompt_and_task_input()
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "Here is the researched answer."
         assert child_model.calls == [
@@ -2245,7 +2226,6 @@ def test_handoff_inherits_resolved_parent_model() -> None:
         result = await runner.run(
             agent, RunState(instructions=None, history=["help"], responses=[])
         )
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "finished"
         assert result.turn_count == 2
@@ -2293,7 +2273,6 @@ async def test_handoff_reports_final_output_to_parent_end_hook(streaming: bool) 
     else:
         result = await runner.run(agent, state, hooks=hooks)
 
-    assert isinstance(result, RunResult)
     assert result.final_output == "finished"
     assert [event for event in hooks.events if event[0] == "agent_end"] == [
         ("agent_end", ("Parent", "finished"))

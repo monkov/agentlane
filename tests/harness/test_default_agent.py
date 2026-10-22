@@ -3,29 +3,38 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from agentlane.harness import (
     Agent,
     AgentDescriptor,
+    ExternalTool,
     JsonFileStateStore,
     Runner,
     RunnerHooks,
+    RunPaused,
     RunResult,
     RunState,
     RunStream,
     Task,
     ToolResultInput,
+    restore_run_continuation,
 )
 from agentlane.harness._run import copy_run_state
 from agentlane.harness.agents import AgentBase, DefaultAgent
+from agentlane.messaging import AgentId
 from agentlane.models import (
     MessageDict,
     Model,
     ModelResponse,
     ModelStreamEvent,
     ModelStreamEventKind,
+    Tools,
 )
 from agentlane.runtime import CancellationToken, SingleThreadedRuntimeEngine
 from agentlane.tracing import Span
+
+from .tools_test_utils import EchoArgs, make_tool_call
 
 
 def make_assistant_response(content: str) -> ModelResponse:
@@ -168,9 +177,7 @@ class _RecordingRunner(Runner):
         *,
         hooks: RunnerHooks | Sequence[RunnerHooks] | None = None,
         cancellation_token: CancellationToken | None = None,
-        external_input: ToolResultInput | None = None,
     ) -> RunResult:
-        assert external_input is None
         del hooks
         del cancellation_token
 
@@ -227,7 +234,6 @@ def test_default_agent_auto_manages_runtime_and_runner() -> None:
         )
 
         result = await agent.run("My order arrived damaged.")
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "Thanks, I can help."
         assert result.turn_count == 1
@@ -260,7 +266,6 @@ def test_default_agent_accepts_hook_sequences() -> None:
         )
 
         result = await agent.run("My order arrived damaged.")
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "Thanks, I can help."
         assert events == [
@@ -289,9 +294,7 @@ def test_default_agent_reuses_persisted_run_state_between_calls() -> None:
         )
 
         first = await agent.run("first")
-        assert isinstance(first, RunResult)
         second = await agent.run("second")
-        assert isinstance(second, RunResult)
 
         assert first.turn_count == 1
         assert second.turn_count == 2
@@ -325,7 +328,6 @@ def test_default_agent_supports_explicit_runtime_and_runner_injection() -> None:
         )
 
         result = await agent.run("draft a plan")
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "Planner:draft a plan"
         assert result.run_state is not None
@@ -354,13 +356,11 @@ def test_default_agent_supports_subclass_descriptor_and_explicit_run_state_resum
         agent = SupportAgent(runner=runner)
 
         first = await agent.run("first")
-        assert isinstance(first, RunResult)
         saved_state = first.run_state
         if saved_state is None:
             raise AssertionError("Expected saved run state from first run.")
 
         second = await agent.run(saved_state)
-        assert isinstance(second, RunResult)
 
         assert second.final_output == "Support:first"
         assert second.run_state is not None
@@ -401,7 +401,6 @@ def test_default_agent_run_stream_emits_events_and_commits_state() -> None:
         stream = await agent.run_stream("hello")
         events = await _collect_run_stream(stream)
         result = await stream.result()
-        assert isinstance(result, RunResult)
 
         assert [event.kind for event in events] == [
             ModelStreamEventKind.TEXT_DELTA,
@@ -443,7 +442,6 @@ def test_default_agent_run_stream_reuses_persisted_state() -> None:
         second_stream = await agent.run_stream("two")
         await _collect_run_stream(second_stream)
         second_result = await second_stream.result()
-        assert isinstance(second_result, RunResult)
 
         assert second_result.turn_count == 2
         assert model.calls == [
@@ -470,7 +468,6 @@ def test_default_agent_stream_entry_points_persist_state(tmp_path: Path) -> None
         model_stream = await first.run_stream("first question")
         await _collect_run_stream(model_stream)
         first_result = await model_stream.result()
-        assert isinstance(first_result, RunResult)
 
         event_model = _SequenceModel([make_assistant_response("second reply")])
         second = DefaultAgent(
@@ -481,7 +478,6 @@ def test_default_agent_stream_entry_points_persist_state(tmp_path: Path) -> None
         async for _ in event_stream:
             pass
         second_result = await event_stream.result()
-        assert isinstance(second_result, RunResult)
 
         stored = JsonFileStateStore(state_path).load()
         assert first_result.run_state is not None
@@ -547,7 +543,6 @@ def test_default_agent_fork_branches_without_mutating_persisted_state() -> None:
         )
 
         first = await agent.run("first")
-        assert isinstance(first, RunResult)
         persisted_after_run = copy_run_state(agent.run_state)
         if persisted_after_run is None:
             raise AssertionError("Expected persisted state after first run.")
@@ -579,7 +574,6 @@ def test_default_agent_fork_supports_explicit_run_state_without_persisting_it() 
         )
 
         first = await agent.run("first")
-        assert isinstance(first, RunResult)
         saved_state = first.run_state
         if saved_state is None:
             raise AssertionError("Expected saved run state from first run.")
@@ -596,3 +590,82 @@ def test_default_agent_fork_supports_explicit_run_state_without_persisting_it() 
         assert runner.calls[1].turn_count == 1
 
     asyncio.run(scenario())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["run", "run_stream", "run_events"])
+async def test_default_agent_pause_and_resume_preserve_commit_contract(
+    mode: str,
+) -> None:
+    root = AgentId.from_values("test", "external")
+    pending = make_assistant_response("Choose a city.")
+    pending.choices[0].message.tool_calls = [
+        make_tool_call(
+            tool_id="question", name="external", arguments='{"text":"City?"}'
+        )
+    ]
+
+    tools = Tools(
+        tools=[
+            ExternalTool(
+                name="external", description="Ask the host.", args_model=EchoArgs
+            )
+        ]
+    )
+    baseline = RunState(instructions=None, history=["prior"], responses=[], revision=7)
+    model = _SequenceModel([pending])
+    agent = DefaultAgent(
+        agent_id=root,
+        run_state=baseline,
+        descriptor=AgentDescriptor(name="test", model=model, tools=tools),
+        runner=Runner(external_tool_agent_id=root),
+    )
+
+    # Both stream consumption and result retrieval retain the same typed signal.
+    if mode == "run":
+        with pytest.raises(RunPaused) as paused:
+            await agent.run("start")
+    else:
+        stream = await getattr(agent, mode)("start")
+        try:
+            with pytest.raises(RunPaused) as streamed:
+                async for _ in stream:
+                    pass
+            with pytest.raises(RunPaused) as paused:
+                await stream.result()
+            assert streamed.value is paused.value
+        finally:
+            await stream.aclose()
+    assert agent.run_state == baseline
+    snapshot = agent.snapshot()
+    assert snapshot is not None and snapshot.revision == 7
+    continuation = paused.value.continuation
+    assert continuation.base_revision == 7
+
+    # The resumed execution commits once and adds no new user message.
+    resumed_model = _SequenceModel([make_assistant_response("done")])
+    resumed = DefaultAgent(
+        agent_id=root,
+        run_state=baseline,
+        descriptor=AgentDescriptor(name="test", model=resumed_model, tools=tools),
+        runner=Runner(
+            external_tool_agent_id=root,
+            external_input=ToolResultInput(continuation=continuation, result="Prague"),
+        ),
+    )
+    saved_state = restore_run_continuation(continuation)
+    if mode == "run":
+        result = await resumed.run(saved_state)
+    else:
+        stream = await getattr(resumed, mode)(saved_state)
+        async for _ in stream:
+            pass
+        result = await stream.result()
+    assert result.final_output == "done"
+    assert resumed.run_state is not None and resumed.run_state.revision == 8
+    assert resumed_model.calls[0][-1] == {
+        "role": "tool",
+        "tool_call_id": "question",
+        "name": "external",
+        "content": "Prague",
+    }

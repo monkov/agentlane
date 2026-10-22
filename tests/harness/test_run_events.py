@@ -277,7 +277,6 @@ def test_default_agent_run_events_orders_model_tool_and_state_events() -> None:
         stream = await agent.run_events("search docs")
         events = await _collect_run_events(stream)
         result = await stream.result()
-        assert isinstance(result, RunResult)
 
         assert executed == ["docs"]
         assert result.final_output == "docs are ready"
@@ -543,7 +542,6 @@ def test_default_agent_run_events_tag_agent_tool_calls_as_delegation() -> None:
         stream = await agent.run_events("delegate then finish")
         events = await _collect_run_events(stream)
         result = await stream.result()
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "all done"
         tool_starts = {
@@ -623,7 +621,6 @@ def test_runner_run_events_emits_handoff_events() -> None:
         stream = runner.run_events(agent, state)
         events = await _collect_run_events(stream)
         result = await stream.result()
-        assert isinstance(result, RunResult)
 
         handoff_start = next(
             event for event in events if isinstance(event, RunHandoffStartEvent)
@@ -701,7 +698,6 @@ def test_default_agent_run_events_can_merge_tool_approval_events(
                 )
 
         result = await stream.result()
-        assert isinstance(result, RunResult)
         approval_events = [
             event for event in events if isinstance(event, RunToolApprovalEvent)
         ]

@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from agentlane.harness import AgentDescriptor, RunHistoryItem, RunResult, RunState, Task
+from agentlane.harness import AgentDescriptor, RunHistoryItem, RunState, Task
 from agentlane.harness.agents import DefaultAgent
 from agentlane.harness.compaction import (
     CompactionError,
@@ -567,7 +567,6 @@ async def test_compaction_shim_runs_inside_default_agent_lifecycle() -> None:
     )
 
     result = await agent.run("old prompt [t=8]")
-    assert isinstance(result, RunResult)
 
     assert result.final_output == "done"
     assert compactor.requests[0].history == ("old prompt [t=8]",)
@@ -595,7 +594,6 @@ async def test_compaction_shim_failure_notice_runs_inside_default_agent_lifecycl
     )
 
     result = await agent.run("old prompt [t=8]")
-    assert isinstance(result, RunResult)
 
     assert result.final_output == "done"
     assert compactor.requests[0].history == ("old prompt [t=8]",)

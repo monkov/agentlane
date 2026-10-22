@@ -7,10 +7,18 @@ lifecycle and the runner.
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, TypedDict, cast, overload
+from typing import Any, Literal, Self, TypedDict, cast, overload
 from uuid import UUID
 
-from pydantic import BaseModel, JsonValue
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    JsonValue,
+    NonNegativeInt,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from agentlane.messaging import AgentId
 from agentlane.models import (
@@ -123,130 +131,170 @@ class RunState:
     """Committed state generation, incremented after each successful run."""
 
 
-@dataclass(frozen=True, slots=True)
-class RunContinuation:
-    """Native state at one external call, with no completed tool result.
+class RunStatePayload(BaseModel):
+    """JSON representation of one canonical harness run state."""
 
-    The host must persist this value and claim it before resume. Its identity
-    does not provide authorization or prevent replay in another process.
-    Mutable input values are copied; consumers must treat this value as read-only.
+    model_config = ConfigDict(extra="ignore")
+
+    instructions: str | None
+    history: list[dict[str, JsonValue]]
+    responses: list[ModelResponse]
+    shim_state: dict[str, JsonValue]
+    turn_count: NonNegativeInt
+
+    @field_validator("history")
+    @classmethod
+    def _require_message_roles(
+        cls,
+        history: list[dict[str, JsonValue]],
+    ) -> list[dict[str, JsonValue]]:
+        """Reject malformed canonical messages."""
+        for index, message in enumerate(history):
+            if not isinstance(message.get("role"), str):
+                raise ValueError(f"history[{index}].role must be a string")
+        return history
+
+
+class RunContinuation(BaseModel):
+    """Portable state for one unresolved external call, owned and claimed by the host.
+
+    This value grants no permission to resume. Treat nested data as read-only;
+    execution and codec boundaries validate and copy it before use.
     """
 
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    kind: Literal["external_tool_continuation"]
+    """Keep unfinished execution separate from completed snapshots."""
+    format_version: Literal[1]
+    """Version of this continuation format, not a state revision."""
     agent_id: AgentId
-    """Logical agent address that owns the pending call."""
-
+    """Logical owner whose registration must match on resume."""
     continuation_id: UUID
-    """Fresh immutable identity assigned at this suspension boundary."""
-
-    base_revision: int
-    """Successful snapshot revision from which this execution started."""
-
-    run_state: RunState
-    """Private working state, including the assistant's unresolved call."""
-
+    """Runtime-generated identity for the host's durable claim."""
+    base_revision: NonNegativeInt
+    """Completed baseline revision, unchanged while the run waits."""
+    state: RunStatePayload
+    """Canonical working state with the unresolved assistant call."""
     tool_call: ToolCall
-    """Original provider call whose result the host must supply."""
-
+    """Original provider call ID, function name, and raw arguments."""
     arguments: dict[str, JsonValue]
-    """Arguments validated against the registered external tool."""
-
+    """Validated arguments for the host's external interaction."""
     args_schema: dict[str, JsonValue]
-    """Registered function schema used to detect a changed tool contract."""
+    """Saved function schema used to reject a changed tool contract."""
+    tool_call_counts: dict[str, NonNegativeInt]
+    """Used calls, including the pending call; stricter caps may be below usage."""
+    tool_round_trips: NonNegativeInt
+    """Used tool rounds, including the pending round."""
+    max_turns: NonNegativeInt
+    """Saved model-turn limit that resume must not increase."""
+    tool_call_limits: dict[str, NonNegativeInt] | None
+    """Saved per-tool limits, or no configured limits."""
+    max_tool_round_trips: NonNegativeInt
+    """Saved tool-round limit that resume must not increase."""
 
-    tool_call_counts: Mapping[str, int]
-    """Used calls per tool, including the pending external call."""
+    @field_validator("agent_id", mode="before")
+    @classmethod
+    def _decode_agent_id(cls, value: object) -> AgentId:
+        """Use the existing public address format without extra fields."""
+        if isinstance(value, AgentId):
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("Continuation agent_id requires only type and key.")
+        identity = cast(dict[object, object], value)
+        if set(identity) != {"type", "key"}:
+            raise ValueError("Continuation agent_id requires only type and key.")
 
-    tool_round_trips: int
-    """Used tool rounds, including the pending external round."""
+        return AgentId.from_json(identity)
 
-    max_turns: int
-    """Effective model-turn limit that resume must not increase."""
+    @field_serializer("agent_id")
+    def _encode_agent_id(self, agent_id: AgentId) -> dict[str, object]:
+        """Encode the stable owner with its public wire format."""
+        return agent_id.to_json()
 
-    tool_call_limits: Mapping[str, int] | None
-    """Effective per-tool call limits, or no per-tool limits."""
+    @field_validator("continuation_id", mode="before")
+    @classmethod
+    def _decode_continuation_id(cls, value: object) -> UUID:
+        """Accept UUID objects and their JSON text representation."""
+        if isinstance(value, str):
+            return UUID(value)
+        if isinstance(value, UUID):
+            return value
+        raise ValueError("Continuation identity must be a UUID.")
 
-    max_tool_round_trips: int
-    """Effective tool-round limit that resume must not increase."""
+    @field_validator("state", mode="before")
+    @classmethod
+    def _check_state(cls, value: object) -> object:
+        """Keep snapshot v1 tolerant while continuation counters stay strict."""
+        raw = value.model_dump() if isinstance(value, RunStatePayload) else value
+        if not isinstance(raw, dict):
+            raise ValueError("Continuation state requires the canonical fields.")
+        state = cast(dict[object, object], raw)
+        if set(state) != set(RunStatePayload.model_fields):
+            raise ValueError("Continuation state requires the canonical fields.")
+        if type(state.get("turn_count")) is not int:
+            raise ValueError("Continuation turn_count must be an integer.")
 
-    def __post_init__(self) -> None:
-        """Validate native bounds and detach caller-owned mutable values."""
-        if not isinstance(cast(object, self.agent_id), AgentId):
-            raise TypeError("Continuation agent_id must be an AgentId.")
-        if not isinstance(cast(object, self.continuation_id), UUID):
-            raise TypeError("Continuation continuation_id must be a UUID.")
-        _require_nonnegative_int(self.base_revision, "base_revision")
-        _require_nonnegative_int(self.run_state.turn_count, "turn_count")
-        _require_nonnegative_int(self.tool_round_trips, "tool_round_trips")
-        _require_nonnegative_int(self.max_turns, "max_turns")
-        _require_nonnegative_int(self.max_tool_round_trips, "max_tool_round_trips")
-        if self.run_state.revision != self.base_revision:
-            raise ValueError("Continuation state revision must match base_revision.")
-        if not 1 <= self.run_state.turn_count <= self.max_turns:
-            raise ValueError("Continuation turn_count must be within max_turns.")
-        if not 1 <= self.tool_round_trips <= self.max_tool_round_trips:
-            raise ValueError("Continuation tool rounds must be within the saved limit.")
+        return state
 
-        # Reject missing correlation before storing an external result slot.
-        call = self.tool_call.model_copy(deep=True)
+    @field_validator("format_version", mode="before")
+    @classmethod
+    def _check_version(cls, value: object) -> object:
+        """Do not accept booleans as version one."""
+        if type(value) is not int:
+            raise ValueError("Continuation format_version must be an integer.")
+
+        return value
+
+    @model_validator(mode="after")
+    def _check_limits(self) -> Self:
+        """Require counters to include the waiting call and fit saved limits."""
+        call = self.tool_call
         if not call.id or not call.function.name or call.type != "function":
-            raise ValueError("Continuation requires a named function call and call ID.")
-        counts = _copy_tool_counts(self.tool_call_counts, "tool_call_counts")
-        limits = (
-            _copy_tool_counts(self.tool_call_limits, "tool_call_limits")
-            if self.tool_call_limits is not None
-            else None
-        )
-        if counts.get(call.function.name, 0) < 1:
-            raise ValueError("Continuation must count the pending external tool call.")
-        if limits is not None and any(
-            count > limits[name] for name, count in counts.items() if name in limits
-        ):
-            raise ValueError("Continuation tool counts exceed the saved limits.")
+            raise ValueError("Continuation requires a named function and call ID.")
+        if not 1 <= self.state.turn_count <= self.max_turns:
+            raise ValueError("Continuation turn_count exceeds the saved limit.")
+        if not 1 <= self.tool_round_trips <= self.max_tool_round_trips:
+            raise ValueError("Continuation tool rounds exceed the saved limit.")
+        if self.tool_call_counts.get(call.function.name, 0) < 1:
+            raise ValueError("Continuation must count the pending tool call.")
 
-        # Each stored value belongs to this continuation, not its creator.
-        state = copy_run_state(self.run_state)
-        state.responses = [
-            response.model_copy(deep=True) for response in state.responses
-        ]
-        object.__setattr__(self, "run_state", state)
-        object.__setattr__(self, "tool_call", call)
-        object.__setattr__(self, "arguments", _copy_json_object(self.arguments))
-        object.__setattr__(self, "args_schema", _copy_json_object(self.args_schema))
-        object.__setattr__(self, "tool_call_counts", MappingProxyType(counts))
-        object.__setattr__(
-            self,
-            "tool_call_limits",
-            MappingProxyType(limits) if limits is not None else None,
-        )
+        return self
 
 
 @dataclass(frozen=True, slots=True)
 class ToolResultInput:
-    """Trusted text that completes the exact call in a saved continuation."""
+    """Host-validated text for a claimed continuation, passed to a new Runner."""
 
     continuation: RunContinuation
-    """Host-claimed pending execution; no ordinary user input is appended."""
-
+    """Exact pending execution; this is not a new user message."""
     result: str
-    """Model-readable external result, already validated by the host."""
+    """Model-readable result already validated by the host."""
 
     def __post_init__(self) -> None:
-        """Copy the claimed continuation before asynchronous execution starts."""
+        """Detach and revalidate caller-owned data before execution."""
         if not isinstance(cast(object, self.result), str):
             raise TypeError("External tool result must be a string.")
-        object.__setattr__(
-            self, "continuation", copy_run_continuation(self.continuation)
-        )
+        copied = RunContinuation.model_validate(self.continuation.model_dump())
+        object.__setattr__(self, "continuation", copied)
 
 
-type RunInput = str | list[RunHistoryItem] | RunState | ToolResultInput
+class RunPaused(Exception):
+    """Signal a durable waiting boundary after the run's resources close."""
+
+    def __init__(self, continuation: RunContinuation) -> None:
+        """Own a validated copy for the host to persist and claim."""
+        self.continuation = RunContinuation.model_validate(continuation.model_dump())
+        super().__init__(f"Run waits for external call {continuation.tool_call.id}.")
+
+
+type RunInput = str | list[RunHistoryItem] | RunState
 """Public input accepted by the default harness agent.
 
 A plain `str` starts or continues a conversation with a single user
 message. A `list[RunHistoryItem]` provides a richer multi-item payload (e.g.
 a `PromptSpec` mixed with prior `ModelResponse` objects). A
 `RunState` resumes a previously persisted conversation wholesale.
-`ToolResultInput` completes one pending external call without a new user message.
 """
 
 
@@ -288,68 +336,6 @@ class RunResult:
         rendering errors propagate unchanged, even in fields a host does not show.
         """
         return cast(RunResultRecord, serialize_value(self))
-
-
-@dataclass(frozen=True, slots=True)
-class RunSuspension:
-    """Return control without committing a successful run or a tool result."""
-
-    continuation: RunContinuation
-    """Portable native execution state for the host to persist."""
-
-
-type RunOutcome = RunResult | RunSuspension
-"""A completed run or an external call that still needs a result."""
-
-
-def copy_run_continuation(continuation: RunContinuation) -> RunContinuation:
-    """Validate and copy one continuation at a native ownership boundary."""
-    return RunContinuation(
-        agent_id=continuation.agent_id,
-        continuation_id=continuation.continuation_id,
-        base_revision=continuation.base_revision,
-        run_state=continuation.run_state,
-        tool_call=continuation.tool_call,
-        arguments=continuation.arguments,
-        args_schema=continuation.args_schema,
-        tool_call_counts=continuation.tool_call_counts,
-        tool_round_trips=continuation.tool_round_trips,
-        max_turns=continuation.max_turns,
-        tool_call_limits=continuation.tool_call_limits,
-        max_tool_round_trips=continuation.max_tool_round_trips,
-    )
-
-
-def copy_tool_result_input(run_input: ToolResultInput) -> ToolResultInput:
-    """Detach a supplied result from objects that the caller can still mutate."""
-    return ToolResultInput(continuation=run_input.continuation, result=run_input.result)
-
-
-def _require_nonnegative_int(value: int, name: str) -> None:
-    """Reject coerced and negative execution counters."""
-    if type(value) is not int or value < 0:
-        raise ValueError(f"Continuation {name} must be a nonnegative integer.")
-
-
-def _copy_tool_counts(values: Mapping[str, int], name: str) -> dict[str, int]:
-    """Copy strict counters before storing them in a read-only map."""
-    copied: dict[str, int] = {}
-    for tool_name, value in values.items():
-        if not isinstance(cast(object, tool_name), str) or not tool_name:
-            raise ValueError(f"Continuation {name} requires nonempty tool names.")
-        _require_nonnegative_int(value, name)
-        copied[tool_name] = value
-
-    return copied
-
-
-def _copy_json_object(value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-    """Copy JSON data and reject values that cannot survive persistence."""
-    copied = serialize_value(value)
-    if not isinstance(copied, dict):
-        raise TypeError("Continuation arguments and schema must be JSON objects.")
-
-    return copied
 
 
 @overload

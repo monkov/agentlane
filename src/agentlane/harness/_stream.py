@@ -13,7 +13,7 @@ class RunStream(BaseRunStream[ModelStreamEvent]):
     """Async stream handle for one harness run.
 
     `RunStream` exposes the live per-event model stream while keeping the final
-    harness result or suspension available separately via `result()`.
+    harness `RunResult` available separately via `result()`.
     """
 
     def __init__(

@@ -123,10 +123,7 @@ async def test_native_connections_are_run_local_and_close_on_failure() -> None:
     async def run() -> object:
         agent = DefaultAgent(descriptor=AgentDescriptor(name="live", model=client))
 
-        result = await agent.run("hello")
-        assert isinstance(result, RunResult)
-
-        return result.final_output
+        return (await agent.run("hello")).final_output
 
     # Run both agents against the same client and verify independent cleanup.
     results = await asyncio.gather(run(), run(), return_exceptions=True)
@@ -259,7 +256,6 @@ async def test_steering_receipts_commit_only_on_successor(outcome: str) -> None:
 
             # Check the public result and durable history after the protocol settles.
             result = await stream.result()
-            assert isinstance(result, RunResult)
 
             assert result.final_output == ("parent" if rejected else "child")
             assert str(receipt.status) == ("failed" if rejected else "applied")
@@ -506,9 +502,7 @@ async def test_handoff_routes_controls_or_rejects_pending_steering(
                 )
             )
 
-            result = await stream.result()
-            assert isinstance(result, RunResult)
-            assert result.final_output == "new answer"
+            assert (await stream.result()).final_output == "new answer"
             assert str(receipt.status) == "applied"
             assert child.closed
 
@@ -629,7 +623,6 @@ async def test_queued_steering_uses_one_tool_continuation(asynchronous: bool) ->
 
         # Check single execution, receipt application, and input order in run history.
         result = await stream.result()
-        assert isinstance(result, RunResult)
 
         assert executions == ["ok"]
         assert connection.response.create.await_count == 2
@@ -771,7 +764,6 @@ async def test_async_tools_overlap_stream_and_deliver_each_call_once() -> None:
 
         release["slow"].set()
         result = await stream.result()
-        assert isinstance(result, RunResult)
 
     assert result.final_output == "all received"
     assert connection.response.create.await_count == 3
@@ -982,9 +974,7 @@ async def test_automatic_successor_keeps_handler_and_checks_permissions(
 
             assert executions == []
         else:
-            result = await stream.result()
-            assert isinstance(result, RunResult)
-            assert result.final_output == "done"
+            assert (await stream.result()).final_output == "done"
             assert executions == ["original"]
 
         assert str(receipt.status) == "applied"

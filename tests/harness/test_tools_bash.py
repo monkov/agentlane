@@ -17,7 +17,6 @@ from agentlane.harness import (
     Agent,
     AgentDescriptor,
     Runner,
-    RunResult,
     RunState,
     ToolError,
     ToolFailure,
@@ -623,7 +622,6 @@ def test_bash_tool_executes_through_runner_tool_loop(tmp_path: Path) -> None:
         )
 
         result = await runner.run(agent, state)
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         first_turn_tools = model.call_tools[0]

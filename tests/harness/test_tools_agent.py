@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from agentlane.harness import AgentDescriptor, Runner, RunResult
+from agentlane.harness import AgentDescriptor, Runner
 from agentlane.harness._handoff import (
     default_agent_tool_instructions,
     delegated_result_text,
@@ -119,7 +119,6 @@ def test_agent_tool_executes_through_harness_tools_shim_with_inherited_parent_st
         )
 
         result = await agent.run("Need a researched answer")
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "Here is the researched answer."
         assert child_model.calls == [
@@ -198,7 +197,6 @@ def test_agent_tool_inherits_configured_base_tools_shim_for_child_agents(
         )
 
         result = await agent.run("Need a delegated read")
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "parent complete"
         child_tool_result = model.calls[2][-1]
@@ -247,7 +245,6 @@ def test_agent_tool_can_override_child_tools_to_none() -> None:
         )
 
         result = await agent.run("Delegate without child tools")
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert child_model.call_tools == [None]
@@ -297,7 +294,6 @@ def test_agent_tool_supports_parallel_spawned_agents() -> None:
         release.set()
 
         result = await run_task
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "Both helpers finished."
         assert set(child_model.tasks) == {"Handle alpha.", "Handle beta."}
@@ -336,7 +332,6 @@ def test_agent_tool_allows_child_at_depth_limit() -> None:
         )
 
         result = await agent.run("Research")
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "Solved locally."
         assert len(child_model.calls) == 1
@@ -389,7 +384,6 @@ def test_agent_tool_rejects_beyond_recursive_depth_limit() -> None:
         )
 
         result = await agent.run("Start")
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "Parent done."
         assert len(child_model.calls) == 2
@@ -447,7 +441,6 @@ def test_agent_tool_rejects_at_thread_limit() -> None:
         release.set()
 
         result = await run_task
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "Handled with limit."
         tool_result_contents = [

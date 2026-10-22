@@ -148,7 +148,7 @@ stack:
 
 ### Reading The Result
 
-A completed `run(...)`, `fork(...)`, or `stream.result()` returns a
+`run(...)`, `fork(...)`, and `stream.result()` all return a
 [`RunResult`](../../src/agentlane/harness/_run.py) with four fields:
 
 1. `final_output` is the answer extracted from the terminal run turn
@@ -157,17 +157,9 @@ A completed `run(...)`, `fork(...)`, or `stream.result()` returns a
 4. `run_state` is the final resumable `RunState` when available
 
 ```python
-from agentlane.harness import RunResult
-
 result = await agent.run("I feel dizzy after starting a new medication.")
-assert isinstance(result, RunResult)
 print(result.final_output)
 ```
-
-`run(...)` and `stream.result()` return the `RunOutcome` union. When the runner
-is configured for [external tools](runner.md#external-tool-continuations), the
-outcome can be `RunSuspension`. Check its type before reading `final_output`.
-`fork(...)` supports completed `RunResult` values only.
 
 ## Runtime Behavior
 
@@ -333,19 +325,6 @@ The snapshot stores committed run state and logical identity. Use
 storage system, or persist the value returned by `to_json()` in application-owned
 storage.
 
-### Pending external calls
-
-A `RunSuspension` leaves `run_state` and `snapshot()` at the last completed
-baseline. Its separate `RunContinuation` contains the unfinished working state.
-The host must save both values and restore the same baseline before it submits
-`ToolResultInput`. The first run has no completed snapshot and uses revision 0.
-
-External-tool mode requires host-owned persistence. It cannot use `state_path`,
-a `StateStore`, or `fork()`. A live waiting agent rejects ordinary input until
-the host supplies the pending result. `reset()` discards that live pending
-state; the host must separately cancel its stored request. See the runner's
-[storage and execution requirements](runner.md#host-storage-and-execution-claims).
-
 ## Streaming Semantics
 
 `run_stream(...)` returns a
@@ -354,8 +333,7 @@ state; the host must separately cancel its stored request. See the runner's
 Use it like this:
 
 1. iterate the stream for live [`ModelStreamEvent`](../../src/agentlane/models/_streaming.py) values
-2. await `stream.result()` for `RunResult` or an enabled external-tool
-   `RunSuspension`
+2. await `stream.result()` for the final `RunResult`
 
 Important details:
 

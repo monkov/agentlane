@@ -13,7 +13,6 @@ from agentlane.harness import (
     RunResult,
     RunState,
     Task,
-    ToolResultInput,
 )
 from agentlane.messaging import (
     AgentId,
@@ -92,9 +91,7 @@ class _FakeRunner(Runner):
         *,
         hooks: RunnerHooks | Sequence[RunnerHooks] | None = None,
         cancellation_token: CancellationToken | None = None,
-        external_input: ToolResultInput | None = None,
     ) -> RunResult:
-        assert external_input is None
         _ = agent
         _ = state
         _ = hooks

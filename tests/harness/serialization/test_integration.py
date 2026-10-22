@@ -8,7 +8,7 @@ from typing import Any, cast
 import pytest
 from pydantic import JsonValue
 
-from agentlane.harness import RunEventKind, RunEventRecord, RunResult
+from agentlane.harness import RunEventKind, RunEventRecord
 from agentlane.harness.agents import DefaultAgent
 from agentlane.models import PromptSpec
 
@@ -31,7 +31,6 @@ async def test_serialize_real_agent_preserves_tool_result_and_final_state(
             )
 
         result = await stream.result()
-        assert isinstance(result, RunResult)
     finally:
         await stream.aclose()
         with suppress(Exception, asyncio.CancelledError):
@@ -72,7 +71,6 @@ async def test_serialize_shim_transformed_request_preserves_stored_prompt(
             records.append(record)
 
         result = await stream.result()
-        assert isinstance(result, RunResult)
     finally:
         await stream.aclose()
         with suppress(Exception, asyncio.CancelledError):

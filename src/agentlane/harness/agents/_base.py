@@ -18,7 +18,7 @@ import abc
 
 from agentlane.runtime import CancellationToken
 
-from .._run import RunInput, RunOutcome, RunResult
+from .._run import RunInput, RunResult
 from .._stream import RunStream
 
 
@@ -46,7 +46,7 @@ class AgentBase(abc.ABC):
         input: RunInput,
         *,
         cancellation_token: CancellationToken | None = None,
-    ) -> RunOutcome:
+    ) -> RunResult:
         """Run or continue the primary conversation line.
 
         Args:
@@ -54,7 +54,7 @@ class AgentBase(abc.ABC):
             cancellation_token: Optional shared cancellation token for the run.
 
         Returns:
-            RunOutcome: The completed result or an external tool suspension.
+            RunResult: The final result for the primary conversation line.
         """
         raise NotImplementedError
 
@@ -95,6 +95,6 @@ class AgentBase(abc.ABC):
             cancellation_token: Optional shared cancellation token for the run.
 
         Returns:
-            RunStream: Live model events plus a completed result or suspension.
+            RunStream: Live model event stream plus final ``RunResult`` handle.
         """
         raise NotImplementedError

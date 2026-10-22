@@ -8,7 +8,6 @@ from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from functools import partial
 from typing import Any, Literal, Protocol, cast, runtime_checkable
-from uuid import uuid4
 
 import structlog
 from pydantic import BaseModel, JsonValue, ValidationError
@@ -79,18 +78,20 @@ from ._lifecycle import (
 from ._render import normalize_message_content, render_request_messages
 from ._run import (
     LiveRunStateView,
-    RunContinuation,
     RunHistoryItem,
-    RunOutcome,
+    RunPaused,
     RunResult,
     RunState,
-    RunSuspension,
     ToolResultInput,
     copy_instructions,
     copy_run_state,
     copy_shim_state,
 )
-from ._snapshot import validate_run_continuation
+from ._snapshot import (
+    AgentSnapshot,
+    capture_run_continuation,
+    validate_run_continuation,
+)
 from ._stream_base import BaseRunStream
 from ._task import Task
 from ._tooling import InheritTools, RestrictTools, ToolConfig
@@ -316,11 +317,12 @@ class RunLoop:
             is_retryable=self.is_retryable,
         )(self._run_once)
 
-    async def run(self) -> RunOutcome:
+    async def run(self) -> RunResult:
         """Execute turns and close model and tool resources on every exit path."""
         self._validate_external_setup()
+        pause: RunPaused | None = None
         run_error: BaseException | None = None
-        result: RunOutcome | None = None
+        result: RunResult | None = None
 
         # Open the model session before binding controls or starting the run.
         model_scope = AsyncExitStack()
@@ -347,8 +349,14 @@ class RunLoop:
                     result = await self._run_turns(model, span)
 
                     return result
+                except RunPaused as exc:
+                    # End the trace normally; publish the pause only after cleanup.
+                    pause = exc
                 finally:
                     await self._cancel_pending_calls()
+            raise pause
+        except RunPaused:
+            raise
         except BaseException as exc:
             run_error = exc
 
@@ -363,15 +371,11 @@ class RunLoop:
 
             raise
         finally:
-            await self._finish_run(
-                model_scope,
-                result if isinstance(result, RunResult) else None,
-                run_error,
-            )
+            await self._finish_run(model_scope, result, run_error)
 
     async def _run_turns(
         self, model: Model[ModelResponse], span: Span[Any]
-    ) -> RunOutcome:
+    ) -> RunResult:
         while True:
             turn = await self._prepare_turn()
             response, completed = await self._call_model(model, turn, span)
@@ -404,7 +408,8 @@ class RunLoop:
         if not self._external_tools_enabled or saved.agent_id != self.agent.id:
             raise ValueError("External tool continuation belongs to a different root.")
         validate_run_continuation(saved)
-        if self.state.revision != saved.base_revision or self.state != saved.run_state:
+        current = AgentSnapshot.capture(agent_id=self.agent.id, run_state=self.state)
+        if current.revision != saved.base_revision or current.state != saved.state:
             raise ValueError("External tool continuation does not match the run state.")
 
         self.max_turns = min(self.max_turns, saved.max_turns)
@@ -464,7 +469,8 @@ class RunLoop:
             raise ValueError("The pending external tool arguments have changed.")
 
         # A history-rewrite shim must retain the exact unresolved call boundary.
-        validate_run_continuation(replace(saved, run_state=self.state))
+        current = AgentSnapshot.capture(agent_id=self.agent.id, run_state=self.state)
+        validate_run_continuation(saved.model_copy(update={"state": current.state}))
         self.state.history.append(
             _tool_result_message(
                 tool_call=saved.tool_call,
@@ -479,7 +485,7 @@ class RunLoop:
         turn: PreparedTurn,
         response: ModelResponse,
         tool_calls: list[ToolCall],
-    ) -> RunSuspension | None:
+    ) -> None:
         """Capture a sole external call before any sibling handler can execute."""
         tools = turn.tools
         if tools is None:
@@ -519,10 +525,8 @@ class RunLoop:
         self.tool_call_counts[definition.name] = (
             self.tool_call_counts.get(definition.name, 0) + 1
         )
-        continuation = RunContinuation(
+        continuation = capture_run_continuation(
             agent_id=self.agent.id,
-            continuation_id=uuid4(),
-            base_revision=self.state.revision,
             run_state=self.state,
             tool_call=selected,
             arguments=arguments,
@@ -533,9 +537,7 @@ class RunLoop:
             tool_call_limits=tools.tool_call_limits,
             max_tool_round_trips=tools.max_tool_round_trips,
         )
-        validate_run_continuation(continuation)
-
-        return RunSuspension(continuation=continuation)
+        raise RunPaused(continuation)
 
     async def _prepare_turn(self) -> PreparedTurn:
         self.state.turn_count += 1
@@ -675,7 +677,7 @@ class RunLoop:
         response: ModelResponse,
         completed: ModelStreamEvent,
         span: Span[Any],
-    ) -> RunOutcome | None:
+    ) -> RunResult | None:
         # Retain the response and the tool catalog used by an automatic successor.
         self.state.responses.append(response)
         self.inherited_turn = (
@@ -710,9 +712,7 @@ class RunLoop:
                 raw_response=response,
             )
 
-        suspension = self._suspend_external_call(turn, response, tool_calls)
-        if suspension is not None:
-            return suspension
+        self._suspend_external_call(turn, response, tool_calls)
 
         # Resolve a handoff once, before committing an ordinary tool round.
         handoff: _HandoffTarget | None = None
@@ -1523,9 +1523,6 @@ class RunLoop:
             parent_tools=self.runner_task.base_tools,
         )
 
-        if isinstance(outcome.response_payload, RunSuspension):
-            raise RuntimeError("Delegated external tool suspension is not supported.")
-
         return delegated_result_text(outcome)
 
     async def _run_default_agent_tool(
@@ -1577,11 +1574,6 @@ class RunLoop:
                 run_input=[parsed_input.task],
                 parent_tools=self.runner_task.base_tools,
             )
-
-            if isinstance(outcome.response_payload, RunSuspension):
-                raise RuntimeError(
-                    "Delegated external tool suspension is not supported."
-                )
 
             return delegated_result_text(outcome)
         finally:

@@ -10,7 +10,7 @@ from agentlane_claude_agent_sdk import ClaudeAgent
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage
 from pydantic import BaseModel
 
-from agentlane.harness import AgentDescriptor, Runner, RunResult, Task
+from agentlane.harness import AgentDescriptor, Runner, Task
 from agentlane.harness.agents import DefaultAgent
 from agentlane.messaging import AgentId, DeliveryStatus
 from agentlane.models import (
@@ -237,7 +237,6 @@ def test_native_agent_delegates_to_addressed_claude_and_finishes(
         )
 
         result = await native.run("Complete the research task.")
-        assert isinstance(result, RunResult)
 
         assert result.final_output == final_answer
         assert observed_senders == [NATIVE_ID]

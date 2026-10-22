@@ -15,7 +15,6 @@ from agentlane.harness import (
     RunInput,
     Runner,
     RunnerHooks,
-    RunOutcome,
     RunResult,
     RunState,
     Task,
@@ -215,9 +214,7 @@ async def _run(
     agent: DefaultAgent, mode: _RunMode, token: CancellationToken | None = None
 ) -> RunResult:
     if mode == "run":
-        result = await agent.run("test", cancellation_token=token)
-        assert isinstance(result, RunResult)
-        return result
+        return await agent.run("test", cancellation_token=token)
 
     stream = (
         await agent.run_stream("test", cancellation_token=token)
@@ -227,16 +224,14 @@ async def _run(
     try:
         async for _event in stream:
             pass
-        result = await stream.result()
-        assert isinstance(result, RunResult)
-        return result
+        return await stream.result()
     finally:
         await stream.aclose()
         with suppress(BaseException):
             await stream.result()
 
 
-async def _assert_cancelled(task: asyncio.Task[RunOutcome], mode: _RunMode) -> None:
+async def _assert_cancelled(task: asyncio.Task[RunResult], mode: _RunMode) -> None:
     if mode == "run":
         with pytest.raises(RuntimeError, match="delivery status `canceled`"):
             await asyncio.wait_for(task, 1)
@@ -294,7 +289,6 @@ async def test_shared_runtime_reuses_worker_after_shim_token_cancellation(
 
         shim.release.set()
         result = await asyncio.wait_for(agent.run("retry"), 1)
-        assert isinstance(result, RunResult)
         assert result.final_output == "recovered"
         assert calls.count("context:end") == 3
         assert shim.values[-1] == "unset"
@@ -547,7 +541,6 @@ async def test_cancelled_drain_resolves_active_and_queued_streams_and_can_restar
         recovered = await enqueue("retry")
         try:
             result = await asyncio.wait_for(recovered.result(), 1)
-            assert isinstance(result, RunResult)
             assert result.final_output == "recovered"
         finally:
             await recovered.aclose()

@@ -4,14 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from agentlane.harness import (
-    Agent,
-    AgentDescriptor,
-    Runner,
-    RunResult,
-    RunState,
-    ShimState,
-)
+from agentlane.harness import Agent, AgentDescriptor, Runner, RunState, ShimState
 from agentlane.harness._tooling import merge_tools
 from agentlane.harness.agents import DefaultAgent
 from agentlane.harness.shims import (
@@ -269,7 +262,6 @@ def test_default_agent_applies_shims_in_descriptor_order() -> None:
         )
 
         result = await agent.run("hello")
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "done"
         assert model.calls[0][0] == {
@@ -350,7 +342,6 @@ def test_default_agent_shim_can_add_tools() -> None:
         )
 
         result = await agent.run("run the shim tool")
-        assert isinstance(result, RunResult)
 
         assert result.final_output == "tool complete"
         first_tools = model.call_options[0]["tools"]

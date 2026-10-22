@@ -1,539 +1,439 @@
-"""External tool boundaries through the existing runner entry points."""
+"""Host-owned continuation round trips and execution boundaries."""
 
+import asyncio
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import replace
-from typing import Any, Literal, Self
-from unittest.mock import patch
+from typing import Self
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from agentlane.harness import (
     Agent,
     AgentDescriptor,
     ExternalTool,
     Runner,
-    RunnerHooks,
+    RunPaused,
     RunResult,
     RunState,
-    RunSuspension,
-    Task,
     ToolResultInput,
+    continuation_from_json,
+    continuation_to_json,
+    restore_run_continuation,
 )
-from agentlane.harness._run import copy_run_state
-from agentlane.harness._snapshot import continuation_from_json, continuation_to_json
-from agentlane.harness.shims import BoundShim, PreparedTurn
-from agentlane.harness.shims._manager import BoundShimManager
+from agentlane.harness._run_loop import AgentDelegationState
 from agentlane.messaging import AgentId
 from agentlane.models import (
-    MessageDict,
     Model,
     ModelBehaviorError,
-    ModelContinuation,
     ModelResponse,
     ModelStreamEvent,
     ModelStreamEventKind,
-    ToolCall,
     Tools,
 )
-from agentlane.runtime import SingleThreadedRuntimeEngine
+from agentlane.runtime import CancellationToken, SingleThreadedRuntimeEngine
+
+from .tools_test_utils import (
+    EchoArgs,
+    SequenceModel,
+    make_assistant_response,
+    make_tool_call,
+)
+
+ROOT = AgentId.from_values("test", "root")
 
 
-class _ExternalArgs(BaseModel):
-    text: str = Field(description="Information requested from the host.")
+class ChangedArgs(BaseModel):
+    city: str
 
 
-class _ChangedArgs(BaseModel):
-    topic: str = Field(description="A changed tool contract.")
-
-
-def _external_tool() -> ExternalTool[_ExternalArgs]:
+def external() -> ExternalTool[EchoArgs]:
     return ExternalTool(
-        name="external", description="Get an external result.", args_model=_ExternalArgs
+        name="external", description="Get host input.", args_model=EchoArgs
     )
 
 
-def _call(name: str, call_id: str, arguments: str = '{"text":"needed"}') -> ToolCall:
-    return ToolCall.model_validate(
-        {
-            "id": call_id,
-            "type": "function",
-            "function": {"name": name, "arguments": arguments},
-        }
-    )
+def response(*names: str, call_suffix: str = "") -> ModelResponse:
+    calls = [
+        make_tool_call(
+            tool_id=name + call_suffix, name=name, arguments='{"text":"needed"}'
+        )
+        for name in names
+    ]
+    return make_assistant_response(None if calls else "done", tool_calls=calls or None)
 
 
-def _response(*calls: ToolCall) -> ModelResponse:
-    return ModelResponse.model_validate(
-        {
-            "id": "response",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "test",
-            "choices": [
-                {
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": None if calls else "done",
-                        "tool_calls": list(calls) or None,
-                    },
-                }
-            ],
-        }
-    )
-
-
-class _ScriptedModel(Model[ModelResponse]):
-    def __init__(
-        self,
-        responses: list[ModelResponse],
-        *,
-        requires_streaming: bool = False,
-        extra_events: tuple[ModelStreamEvent, ...] = (),
-        continuation: Literal["automatic", "explicit"] | None = None,
-    ) -> None:
-        self.responses = list(responses)
-        self.requests: list[list[MessageDict]] = []
-        self.catalogs: list[Tools | None] = []
-        self.opened = 0
-        self.closed = 0
-        self._requires_streaming = requires_streaming
-        self.extra_events = extra_events
-        self.continuation: Literal["automatic", "explicit"] | None = continuation
-
-    @property
-    def requires_streaming(self) -> bool:
-        return self._requires_streaming
+class ScriptedModel(SequenceModel):
+    def __init__(self, *responses: ModelResponse, cleanup_error: bool = False) -> None:
+        super().__init__(list(responses))
+        self.closed = False
+        self.cleanup_error = cleanup_error
 
     @asynccontextmanager
     async def open_run(self) -> AsyncIterator[Self]:
-        self.opened += 1
         try:
             yield self
         finally:
-            self.closed += 1
-
-    async def get_response(
-        self,
-        messages: list[MessageDict],
-        extra_call_args: object = None,
-        schema: object = None,
-        tools: Tools | None = None,
-        cancellation_token: object = None,
-        parent_span: object = None,
-        **kwargs: Any,
-    ) -> ModelResponse:
-        self.requests.append([dict(message) for message in messages])
-        self.catalogs.append(tools)
-        if not self.responses:
-            raise AssertionError("Unexpected next model call.")
-
-        return self.responses.pop(0)
-
-    async def stream_response(
-        self,
-        messages: list[MessageDict],
-        extra_call_args: object = None,
-        schema: object = None,
-        tools: Tools | None = None,
-        cancellation_token: object = None,
-        parent_span: object = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamEvent]:
-        response = await self.get_response(messages, tools=tools)
-        for event in self.extra_events:
-            yield event
-        yield ModelStreamEvent(
-            kind=ModelStreamEventKind.COMPLETED,
-            response=response,
-            continuation=self.continuation,
-        )
+            self.closed = True
+            if self.cleanup_error:
+                raise RuntimeError("cleanup failed")
 
 
-class _EndHooks(RunnerHooks):
-    def __init__(self) -> None:
-        self.results: list[RunResult | None] = []
-
-    async def on_agent_end(self, task: Task, result: RunResult | None) -> None:
-        self.results.append(result)
-
-
-class _RewritePendingShim(BoundShim):
-    async def prepare_turn(self, turn: PreparedTurn) -> None:
-        turn.replace_history([{"role": "user", "content": "rewritten"}])
-
-
-class _ExternalCatalogShim(BoundShim):
-    async def prepare_turn(self, turn: PreparedTurn) -> None:
-        turn.add_tools((_external_tool(),))
-
-
-def _agent(model: _ScriptedModel, runner: Runner, tools: Tools) -> Agent:
+def agent(
+    model: Model[ModelResponse], runner: Runner, tools: Tools | None = None
+) -> Agent:
     return Agent(
         SingleThreadedRuntimeEngine(),
         runner,
-        bind_id=AgentId.from_values("test", "root"),
-        descriptor=AgentDescriptor(name="test", model=model, tools=tools),
+        bind_id=ROOT,
+        descriptor=AgentDescriptor(
+            name="test", model=model, tools=tools or Tools(tools=[external()])
+        ),
     )
 
 
-def _runner(**kwargs: Any) -> Runner:
-    return Runner(external_tool_agent_id=AgentId.from_values("test", "root"), **kwargs)
-
-
-def _state() -> RunState:
+def state() -> RunState:
     return RunState(instructions=None, history=["start"], responses=[])
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["run", "stream", "events"])
-async def test_external_call_returns_suspension_and_cleans_up(mode: str) -> None:
-    runner = _runner()
-    model = _ScriptedModel([_response(_call("external", "pending"))])
-    agent = _agent(model, runner, Tools(tools=[_external_tool()]))
-    hooks = _EndHooks()
-    state = _state()
-
+async def execute(
+    runner: Runner,
+    model: ScriptedModel,
+    run_state: RunState,
+    tools: Tools | None = None,
+    mode: str = "run",
+) -> RunResult:
+    task = agent(model, runner, tools)
     if mode == "run":
-        outcome = await runner.run(agent, state, hooks=hooks)
-    else:
-        stream = (
-            runner.run_events(agent, state, hooks=hooks)
-            if mode == "events"
-            else runner.run_stream(agent, state, hooks=hooks)
-        )
-        try:
-            outcome = await stream.result()
-        finally:
-            await stream.aclose()
-
-    assert isinstance(outcome, RunSuspension)
-    assert outcome.continuation.tool_call.id == "pending"
-    assert outcome.continuation.tool_call_counts == {"external": 1}
-    assert outcome.continuation.tool_round_trips == 1
-    assert outcome.continuation.run_state.turn_count == 1
-    assert outcome.continuation.base_revision == 0
-    assert hooks.results == [None]
-    assert model.opened == model.closed == 1
-    assert len(model.requests) == 1
+        return await runner.run(task, run_state)
+    stream = (
+        runner.run_events(task, run_state)
+        if mode == "events"
+        else runner.run_stream(task, run_state)
+    )
+    try:
+        return await stream.result()
+    finally:
+        await stream.aclose()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["run", "stream", "events"])
-async def test_restart_resume_keeps_prior_effects_and_original_tool_message(
-    mode: str,
+@pytest.mark.parametrize("lower_cap", [False, True])
+async def test_restart_retains_prior_effects_and_original_call(
+    mode: str, lower_cap: bool
 ) -> None:
     effects: list[str] = []
 
     async def write(text: str) -> str:
-        """Record one side effect."""
+        """Record a side effect."""
         effects.append(text)
         return "written"
 
     tools = Tools(
-        tools=[write, _external_tool()],
+        tools=[write, external()],
         tool_call_limits={"write": 1, "external": 2},
         max_tool_round_trips=3,
     )
-    first = _runner(max_turns=3)
-    model = _ScriptedModel(
-        [
-            _response(_call("write", "effect")),
-            _response(_call("external", "pending")),
-        ]
+    first = Runner(external_tool_agent_id=ROOT, max_turns=4 if lower_cap else 3)
+    model = ScriptedModel(response("write"), response("external"))
+    with pytest.raises(RunPaused) as paused:
+        await execute(first, model, state(), tools, mode)
+    saved = continuation_from_json(
+        json.loads(json.dumps(continuation_to_json(paused.value.continuation)))
     )
-    paused = await first.run(_agent(model, first, tools), _state())
-    assert isinstance(paused, RunSuspension)
-    restored = continuation_from_json(continuation_to_json(paused.continuation))
+    assert model.closed and len(model.calls) == 2
+    assert saved.state.turn_count == 2 and saved.base_revision == 0
+    assert saved.tool_call_counts == {"write": 1, "external": 1}
 
-    # Rebuild the runner and model, as a different host process would do.
-    second = _runner(max_turns=999)
-    resumed_model = _ScriptedModel([_response()])
-    resumed_input = ToolResultInput(continuation=restored, result="host answer")
-    resumed_agent = _agent(resumed_model, second, tools)
-    resumed_state = copy_run_state(restored.run_state)
-    if mode == "run":
-        outcome = await second.run(
-            resumed_agent, resumed_state, external_input=resumed_input
+    # A new process has only JSON and application configuration.
+    resumed = Runner(
+        external_tool_agent_id=ROOT,
+        max_turns=999,
+        external_input=ToolResultInput(continuation=saved, result="Prague"),
+    )
+    next_model = ScriptedModel(
+        response("external", call_suffix="_again") if lower_cap else response()
+    )
+    expanded_tools = Tools(
+        tools=[write, external()],
+        tool_call_limits={"write": 0 if lower_cap else 999, "external": 999},
+        max_tool_round_trips=999,
+    )
+    if lower_cap:
+        # Lower limits constrain future calls, including after another pause.
+        with pytest.raises(RunPaused) as paused_again:
+            await execute(
+                resumed,
+                next_model,
+                restore_run_continuation(saved),
+                expanded_tools,
+                mode,
+            )
+        again = continuation_from_json(
+            continuation_to_json(paused_again.value.continuation)
         )
+        assert again.tool_call_counts == {"write": 1, "external": 2}
+        assert again.tool_call_limits == {"write": 0, "external": 2}
+        last = Runner(
+            external_tool_agent_id=ROOT,
+            external_input=ToolResultInput(continuation=again, result="answer"),
+        )
+        final_model = ScriptedModel(response())
+        result = await execute(
+            last, final_model, restore_run_continuation(again), tools, mode
+        )
+        catalog = final_model.call_tools[0]
+        assert catalog is not None and not catalog.normalized_tools
     else:
-        stream = (
-            second.run_events(
-                resumed_agent, resumed_state, external_input=resumed_input
-            )
-            if mode == "events"
-            else second.run_stream(
-                resumed_agent, resumed_state, external_input=resumed_input
-            )
+        result = await execute(
+            resumed, next_model, restore_run_continuation(saved), expanded_tools, mode
         )
-        try:
-            outcome = await stream.result()
-        finally:
-            await stream.aclose()
-
-    assert isinstance(outcome, RunResult)
-    assert outcome.turn_count == 3
+    assert result.final_output == "done" and result.turn_count == (
+        4 if lower_cap else 3
+    )
     assert effects == ["needed"]
-    tool_messages = [
-        message for message in resumed_model.requests[0] if message["role"] == "tool"
+    assert [m for m in next_model.calls[0] if m["role"] == "user"] == [
+        {"role": "user", "content": "start"}
     ]
-    assert tool_messages == [
-        {
-            "role": "tool",
-            "tool_call_id": "effect",
-            "name": "write",
-            "content": "written",
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "pending",
-            "name": "external",
-            "content": "host answer",
-        },
-    ]
-    catalog = resumed_model.catalogs[0]
+    assert [
+        (m["tool_call_id"], m["content"])
+        for m in next_model.calls[0]
+        if m["role"] == "tool"
+    ] == [("write", "written"), ("external", "Prague")]
+    assert saved.state.turn_count == 2
+    catalog = next_model.call_tools[0]
     assert catalog is not None
     assert [tool.name for tool in catalog.normalized_tools] == ["external"]
-    assert catalog.tool_call_limits == {"write": 1, "external": 2}
-    assert restored.run_state.turn_count == 2
+    assert catalog.max_tool_round_trips == 3
+    assert catalog.tool_call_limits == {"write": 0 if lower_cap else 1, "external": 2}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("parallel", [False, True])
-async def test_mixed_external_batch_rejects_before_sibling_effects(
-    parallel: bool,
-) -> None:
-    effects: list[str] = []
-
-    async def write(text: str) -> str:
-        """Record one side effect."""
-        effects.append(text)
-        return text
-
-    runner = _runner()
-    model = _ScriptedModel(
-        [_response(_call("write", "effect"), _call("external", "pending"))]
-    )
-    tools = Tools(tools=[write, _external_tool()], parallel_tool_calls=parallel)
-    with pytest.raises(ModelBehaviorError, match="only tool call"):
-        await runner.run(_agent(model, runner, tools), _state())
-
-    assert effects == []
-    assert model.closed == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("enabled", [False, True])
-async def test_unsupported_external_root_rejects_before_model_open(
-    enabled: bool,
-) -> None:
+async def test_repeated_pause_cannot_expand_saved_budgets() -> None:
+    saved = None
+    for turn in (1, 2):
+        runner = Runner(
+            external_tool_agent_id=ROOT,
+            max_turns=2 if saved is None else 999,
+            external_input=(
+                ToolResultInput(continuation=saved, result="answer") if saved else None
+            ),
+        )
+        with pytest.raises(RunPaused) as paused:
+            await execute(
+                runner,
+                ScriptedModel(response("external", call_suffix=str(turn))),
+                restore_run_continuation(saved) if saved else state(),
+            )
+        saved = paused.value.continuation
+        assert saved.tool_round_trips == turn and saved.max_turns == 2
+        assert saved.tool_call_counts == {"external": turn}
+    assert saved is not None
+    model = ScriptedModel()
     runner = Runner(
-        external_tool_agent_id=AgentId.from_values("test", "other") if enabled else None
+        external_tool_agent_id=ROOT,
+        external_input=ToolResultInput(continuation=saved, result="answer"),
     )
-    model = _ScriptedModel([])
-    with pytest.raises(ValueError, match="explicit opt-in"):
-        await runner.run(
-            _agent(model, runner, Tools(tools=[_external_tool()])), _state()
-        )
-
-    assert model.opened == 0
+    with pytest.raises(RuntimeError, match="turn limit"):
+        await execute(runner, model, restore_run_continuation(saved))
+    assert model.calls == []
 
 
 @pytest.mark.asyncio
-async def test_session_model_rejects_before_model_open() -> None:
-    runner = _runner()
-    model = _ScriptedModel([], requires_streaming=True)
-    with pytest.raises(ValueError, match="live provider session"):
-        await runner.run(
-            _agent(model, runner, Tools(tools=[_external_tool()])), _state()
+@pytest.mark.parametrize("invalid", ["state", "schema", "identity", "pending"])
+async def test_invalid_resume_rejects_before_model_io(invalid: str) -> None:
+    runner = Runner(external_tool_agent_id=ROOT)
+    with pytest.raises(RunPaused) as paused:
+        await execute(runner, ScriptedModel(response("external")), state())
+    saved = paused.value.continuation.model_copy(deep=True)
+    resumed_state = restore_run_continuation(saved)
+    tools = Tools(tools=[external()])
+    if invalid == "state":
+        resumed_state.history.append("unexpected user turn")
+    elif invalid == "schema":
+        tools = Tools(
+            tools=[
+                ExternalTool(
+                    name="external", description="changed", args_model=ChangedArgs
+                )
+            ]
         )
-
-    assert model.opened == 0
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("registered", [False, True])
-async def test_raw_pending_state_requires_typed_result_input(registered: bool) -> None:
-    runner = _runner()
-    tools = Tools(tools=[_external_tool()])
-    first_model = _ScriptedModel([_response(_call("external", "pending"))])
-    outcome = await runner.run(_agent(first_model, runner, tools), _state())
-    assert isinstance(outcome, RunSuspension)
-    resumed_model = _ScriptedModel([])
-
-    with pytest.raises(ValueError, match="requires ToolResultInput"):
-        await runner.run(
-            _agent(resumed_model, runner, tools if registered else Tools(tools=[])),
-            copy_run_state(outcome.continuation.run_state),
-        )
-
-    assert resumed_model.opened == 0
-
-
-@pytest.mark.asyncio
-async def test_resume_rejects_changed_contract_before_next_model_request() -> None:
-    runner = _runner()
-    model = _ScriptedModel([_response(_call("external", "pending"))])
-    outcome = await runner.run(
-        _agent(model, runner, Tools(tools=[_external_tool()])), _state()
-    )
-    assert isinstance(outcome, RunSuspension)
-    replacement = ExternalTool(
-        name="external", description="Get an external result.", args_model=_ChangedArgs
-    )
-    resumed_model = _ScriptedModel([])
-    with pytest.raises(ValueError, match="contract has changed"):
-        await runner.run(
-            _agent(resumed_model, runner, Tools(tools=[replacement])),
-            copy_run_state(outcome.continuation.run_state),
-            external_input=ToolResultInput(
-                continuation=outcome.continuation, result="text"
-            ),
-        )
-
-    assert resumed_model.requests == []
-    assert resumed_model.opened == resumed_model.closed
-
-
-@pytest.mark.asyncio
-async def test_repeated_pause_preserves_turn_and_tool_budgets() -> None:
-    runner = _runner(max_turns=2)
-    tools = Tools(tools=[_external_tool()], max_tool_round_trips=2)
-    first_model = _ScriptedModel([_response(_call("external", "one"))])
-    first = await runner.run(_agent(first_model, runner, tools), _state())
-    assert isinstance(first, RunSuspension)
-    second_runner = _runner(max_turns=999)
-    second_model = _ScriptedModel([_response(_call("external", "two"))])
-    second = await second_runner.run(
-        _agent(second_model, second_runner, tools),
-        copy_run_state(first.continuation.run_state),
-        external_input=ToolResultInput(continuation=first.continuation, result="one"),
-    )
-    assert isinstance(second, RunSuspension)
-    assert second.continuation.continuation_id != first.continuation.continuation_id
-    assert second.continuation.tool_call_counts == {"external": 2}
-    assert second.continuation.tool_round_trips == 2
-    assert second.continuation.max_turns == 2
-    final_model = _ScriptedModel([])
-
-    with pytest.raises(RuntimeError, match="turn limit of 2"):
-        await second_runner.run(
-            _agent(final_model, second_runner, tools),
-            copy_run_state(second.continuation.run_state),
-            external_input=ToolResultInput(
-                continuation=second.continuation, result="two"
-            ),
-        )
-
-    assert final_model.requests == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["async", "automatic", "steering"])
-async def test_provider_control_modes_reject_without_local_effects(kind: str) -> None:
-    effects: list[str] = []
-
-    async def write(text: str) -> str:
-        """Record one side effect."""
-        effects.append(text)
-        return text
-
-    events: tuple[ModelStreamEvent, ...] = ()
-    continuation: Literal["automatic", "explicit"] | None = None
-    if kind == "async":
-        events = (
-            ModelStreamEvent(
-                kind=ModelStreamEventKind.PROVIDER,
-                async_tool_call=_call("write", "effect"),
-            ),
-        )
-    elif kind == "steering":
-        events = (
-            ModelStreamEvent(
-                kind=ModelStreamEventKind.PROVIDER,
-                input_messages=[{"role": "user", "content": "live input"}],
-            ),
+    elif invalid == "identity":
+        saved = saved.model_copy(
+            update={"agent_id": AgentId.from_values("test", "other")}
         )
     else:
-        continuation = ModelContinuation.AUTOMATIC.value
-    model = _ScriptedModel(
-        [_response(_call("external", "pending"))],
-        extra_events=events,
-        continuation=continuation,
-    )
-    runner = _runner()
-    stream = runner.run_stream(
-        _agent(model, runner, Tools(tools=[write, _external_tool()])), _state()
-    )
-    try:
-        with pytest.raises(ModelBehaviorError):
-            await stream.result()
-    finally:
-        await stream.aclose()
-
-    assert effects == []
-    assert model.closed == 1
+        saved.state.history.append({"role": "user", "content": "wrong boundary"})
+    model = ScriptedModel()
+    with pytest.raises(ValueError):
+        resumed = Runner(
+            external_tool_agent_id=ROOT,
+            external_input=ToolResultInput(continuation=saved, result="answer"),
+        )
+        await execute(resumed, model, resumed_state, tools)
+    assert model.calls == []
 
 
 @pytest.mark.asyncio
-async def test_malformed_pending_transcript_rejects_before_model_open() -> None:
-    runner = _runner()
-    tools = Tools(tools=[_external_tool()])
-    model = _ScriptedModel([_response(_call("external", "pending"))])
-    outcome = await runner.run(_agent(model, runner, tools), _state())
-    assert isinstance(outcome, RunSuspension)
-    changed_state = copy_run_state(outcome.continuation.run_state)
-    changed_state.history.append({"role": "user", "content": "wrong boundary"})
-    changed = replace(outcome.continuation, run_state=changed_state)
-    resumed_model = _ScriptedModel([])
+@pytest.mark.parametrize("failure", ["mixed", "opt_in", "cleanup"])
+async def test_unsafe_boundary_never_publishes_pause(failure: str) -> None:
+    effects: list[str] = []
 
+    async def write(text: str) -> str:
+        """Record a side effect."""
+        effects.append(text)
+        return text
+
+    runner = Runner(external_tool_agent_id=None if failure == "opt_in" else ROOT)
+    calls = ("external", "write") if failure == "mixed" else ("external",)
+    model = ScriptedModel(response(*calls), cleanup_error=failure == "cleanup")
+    expected = {
+        "mixed": ModelBehaviorError,
+        "opt_in": ValueError,
+        "cleanup": ExceptionGroup,
+    }
+    with pytest.raises(expected[failure]):
+        await execute(runner, model, state(), Tools(tools=[write, external()]))
+    assert effects == []
+    if failure == "opt_in":
+        assert model.calls == []
+    else:
+        assert model.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["run", "stream", "events"])
+async def test_cancelled_input_does_not_consume_root_but_execution_does(
+    mode: str,
+) -> None:
+    runner = Runner(external_tool_agent_id=ROOT)
+    model = ScriptedModel(response("external"))
+    token = CancellationToken()
+    token.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run(agent(model, runner), state(), cancellation_token=token)
+    with pytest.raises(RunPaused):
+        await execute(runner, model, state(), mode=mode)
+    with pytest.raises(RuntimeError):
+        await execute(runner, model, state())
+    assert len(model.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("max_turns", False),
+        ("tool_round_trips", -1),
+        ("format_version", True),
+        ("unexpected", 1),
+    ],
+)
+async def test_codec_rejects_invalid_counters_and_owns_copies(
+    field: str, value: object
+) -> None:
+    with pytest.raises(RunPaused) as paused:
+        await execute(
+            Runner(external_tool_agent_id=ROOT),
+            ScriptedModel(response("external")),
+            state(),
+        )
+    saved = paused.value.continuation
+    data = continuation_to_json(saved)
+    result_input = ToolResultInput(continuation=saved, result="answer")
+    runner = Runner(external_tool_agent_id=ROOT, external_input=result_input)
+
+    # Neither caller can change the payload already owned by the runner.
+    saved.arguments["text"] = "first mutation"
+    result_input.continuation.arguments["text"] = "second mutation"
+    restored = continuation_from_json(data)
+    result = await execute(
+        runner, ScriptedModel(response()), restore_run_continuation(restored)
+    )
+    assert result.final_output == "done"
+    data[field] = value
     with pytest.raises(ValueError):
-        await runner.run(
-            _agent(resumed_model, runner, tools),
-            copy_run_state(changed.run_state),
-            external_input=ToolResultInput(continuation=changed, result="text"),
+        continuation_from_json(data)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", ["automatic", "explicit", "steering", "async", "session", "child"]
+)
+async def test_unsupported_provider_controls_reject_before_effects(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    effects: list[str] = []
+
+    async def write(text: str) -> str:
+        """Record a side effect."""
+        effects.append(text)
+        return text
+
+    model = ScriptedModel()
+    call = make_tool_call(tool_id="effect", name="write", arguments='{"text":"needed"}')
+    event = ModelStreamEvent(
+        kind=ModelStreamEventKind.COMPLETED,
+        response=response("external" if mode == "child" else "write"),
+    )
+    if mode in ("automatic", "explicit"):
+        event.continuation = "automatic" if mode == "automatic" else "explicit"
+    elif mode == "steering":
+        event.input_messages = [{"role": "user", "content": "live input"}]
+    elif mode == "async":
+        event.async_tool_call = call
+    elif mode == "session":
+        monkeypatch.setattr(
+            ScriptedModel, "requires_streaming", property(lambda self: True)
+        )
+    else:
+        monkeypatch.setattr(
+            AgentDelegationState, "has_live_children", property(lambda self: True)
         )
 
-    assert resumed_model.opened == 0
+    async def stream_response(
+        *args: object, **kwargs: object
+    ) -> AsyncIterator[ModelStreamEvent]:
+        yield event
+
+    monkeypatch.setattr(model, "stream_response", stream_response)
+    expected = ValueError if mode == "session" else ModelBehaviorError
+    with pytest.raises(expected):
+        await execute(
+            Runner(external_tool_agent_id=ROOT),
+            model,
+            state(),
+            Tools(tools=[write, external()]),
+            "stream",
+        )
+    assert effects == []
+    assert model.closed == (mode != "session")
 
 
 @pytest.mark.asyncio
-async def test_history_rewrite_cannot_remove_pending_call_before_resume() -> None:
-    runner = _runner()
-    tools = Tools(tools=[_external_tool()])
-    model = _ScriptedModel([_response(_call("external", "pending"))])
-    outcome = await runner.run(_agent(model, runner, tools), _state())
-    assert isinstance(outcome, RunSuspension)
-    resumed_model = _ScriptedModel([])
-    manager = BoundShimManager((_RewritePendingShim(),))
+async def test_stream_reserves_root_before_concurrent_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    model = ScriptedModel()
 
-    # Shim preparation runs after the initial continuation validation.
-    with patch("agentlane.harness._run_loop._shim_manager", return_value=manager):
-        with pytest.raises(ValueError):
-            await runner.run(
-                _agent(resumed_model, runner, tools),
-                copy_run_state(outcome.continuation.run_state),
-                external_input=ToolResultInput(
-                    continuation=outcome.continuation, result="text"
-                ),
-            )
+    async def blocked_response(*args: object, **kwargs: object) -> ModelResponse:
+        entered.set()
+        await release.wait()
+        return response("external")
 
-    assert resumed_model.requests == []
-    assert resumed_model.opened == resumed_model.closed
-
-
-@pytest.mark.asyncio
-async def test_dynamic_external_declaration_rejects_unsupported_root() -> None:
-    runner = Runner()
-    model = _ScriptedModel([])
-    manager = BoundShimManager((_ExternalCatalogShim(),))
-
-    with patch("agentlane.harness._run_loop._shim_manager", return_value=manager):
-        with pytest.raises(ValueError, match="explicit opt-in"):
-            await runner.run(_agent(model, runner, Tools(tools=[])), _state())
-
-    assert model.requests == []
-    assert model.opened == model.closed
+    monkeypatch.setattr(model, "get_response", blocked_response)
+    runner = Runner(external_tool_agent_id=ROOT)
+    stream = runner.run_events(agent(model, runner), state())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        with pytest.raises(RuntimeError, match="fresh Runner"):
+            await runner.run(agent(model, runner), state())
+        release.set()
+        with pytest.raises(RunPaused):
+            await stream.result()
+    finally:
+        release.set()
+        await stream.aclose()

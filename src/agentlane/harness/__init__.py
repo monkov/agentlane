@@ -33,16 +33,20 @@ from ._run import (
     RunHistoryItem,
     RunInput,
     RunInstructions,
-    RunOutcome,
+    RunPaused,
     RunResult,
     RunResultRecord,
     RunState,
-    RunSuspension,
     ShimState,
     ToolResultInput,
 )
 from ._runner import Runner
-from ._snapshot import AgentSnapshot, continuation_from_json, continuation_to_json
+from ._snapshot import (
+    AgentSnapshot,
+    continuation_from_json,
+    continuation_to_json,
+    restore_run_continuation,
+)
 from ._state_store import StateStore
 from ._stream import RunStream
 from ._task import Task
@@ -65,19 +69,13 @@ from ._tooling import (
 )
 
 __all__ = [
-    "continuation_to_json",
-    "continuation_from_json",
-    "ToolResultInput",
-    "RunSuspension",
-    "RunOutcome",
-    "RunContinuation",
-    "ExternalTool",
     "ACTIVE_SKILL_NAMES_STATE_KEY_SUFFIX",
     "Agent",
     "AgentDescriptor",
     "AgentSnapshot",
     "DefaultAgentTool",
     "DefaultHandoff",
+    "ExternalTool",
     "HarnessEventType",
     "INHERIT_TOOLS",
     "InheritTools",
@@ -89,6 +87,7 @@ __all__ = [
     "RESTRICT_TOOLS",
     "RunAgentEndEvent",
     "RunAgentStartEvent",
+    "RunContinuation",
     "RunEvent",
     "RunEventKind",
     "RunEventRecord",
@@ -101,6 +100,7 @@ __all__ = [
     "RunLLMEndEvent",
     "RunLLMStartEvent",
     "RunModelStreamEvent",
+    "RunPaused",
     "RunPlanItem",
     "RunPlanUpdatedEvent",
     "RunResult",
@@ -124,5 +124,9 @@ __all__ = [
     "ToolError",
     "ToolFailure",
     "ToolOutcome",
+    "ToolResultInput",
+    "continuation_from_json",
+    "continuation_to_json",
+    "restore_run_continuation",
     "tool_outcome",
 ]

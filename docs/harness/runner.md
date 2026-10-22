@@ -147,9 +147,8 @@ That split is deliberate:
 
 One streamed harness run may cross multiple model calls because of tools or
 first-class handoff, so one `run_stream(...)` may emit more than one
-`ModelStreamEventKind.COMPLETED`. The whole-run outcome is `RunResult` on
-completion or `RunSuspension` when an enabled external tool needs a host
-result. Both belong to `RunOutcome`.
+`ModelStreamEventKind.COMPLETED`. The final whole-run result is still
+`RunResult`.
 
 Streaming remains local to the harness in this step. The runner and lifecycle
 handle it without changing runtime `send_message(...)` delivery semantics.
@@ -392,121 +391,75 @@ total number of turns that ran (`RunResult.turn_count` is this final value).
 Gate first-turn logic on `turn_count == 1` rather than reading it as a
 completed-turns count.
 
-## External tool continuations
+## External Tool Results
 
-`ExternalTool` declares a tool whose result comes from the host application.
-It has a name, description, and Pydantic argument model. It has no handler.
-The application chooses the tool schema, validates the external answer, and
-controls access to it. For example, a question tool can accept choices and free
-text without adding question semantics to the runner.
+Declare an `ExternalTool(name=..., description=..., args_model=...)` in the
+agent's tools and set `Runner(external_tool_agent_id=root_id)`. The application
+owns the question schema, choices, free-text input, answer validation, and UI.
+AgentLane generates the continuation ID and preserves the original tool-call ID.
 
-Enable this behavior for one stable root agent address:
+An external call raises `RunPaused` after model and shim cleanup. Its
+`continuation` holds working state, the pending call, and used execution limits.
+The pause does not commit completed state or advance its revision. A cleanup
+failure takes precedence over the pause. Completed calls still return
+`RunResult`; `RunInput` and all three run method signatures stay unchanged.
+
+Create a fresh `Runner` and `DefaultAgent` for each execution segment. An opted-in
+runner accepts one root invocation, including a failed invocation. Ordinary
+runners remain reusable. Use the same root ID, completed baseline, and registered
+tool contract when resuming. Pass the claimed answer in the runner constructor;
+pass restored state through the existing run method.
+
+The example uses application-owned `descriptor`, `root_id`, `baseline`, `store`,
+and `publish_question`. The descriptor includes the external tool. Store methods
+below represent durable application operations, not AgentLane APIs.
 
 ```python
-from pydantic import BaseModel, Field
-
-from agentlane.harness import AgentDescriptor, ExternalTool, Runner
+from agentlane.harness import (
+    Runner, RunPaused, ToolResultInput, continuation_from_json,
+    continuation_to_json, restore_run_continuation,
+)
 from agentlane.harness.agents import DefaultAgent
-from agentlane.messaging import AgentId
-from agentlane.models import Tools
 
+async def execute(input, external_input=None):
+    runner = Runner(
+        external_tool_agent_id=root_id, external_input=external_input,
+    )
+    agent = DefaultAgent(
+        descriptor=descriptor, agent_id=root_id, run_state=baseline, runner=runner,
+    )
+    try:
+        return await agent.run(input)
+    except RunPaused as paused:
+        # Commit the waiting record before showing the question.
+        await store.save_waiting(continuation_to_json(paused.continuation))
+        await publish_question(paused.continuation)
 
-class RequestInputArgs(BaseModel):
-    question: str
-    # Suggestions are optional. The host also accepts and validates free text.
-    choices: list[str] = Field(default_factory=list)
+await execute("Help me choose a destination.")
 
-
-agent_id = AgentId.from_values("assistant", "main")
-agent = DefaultAgent(
-    agent_id=agent_id,
-    runner=Runner(external_tool_agent_id=agent_id),
-    descriptor=AgentDescriptor(
-        name="Assistant",
-        model=model,
-        tools=Tools(tools=[ExternalTool(
-            name="request_input",
-            description="Ask the user for information needed to continue.",
-            args_model=RequestInputArgs,
-        )]),
-    ),
+# Later, possibly in another process: authorize and atomically claim one answer.
+record, answer = await store.claim_answer(continuation_id)
+saved = continuation_from_json(record)
+result = await execute(
+    restore_run_continuation(saved), ToolResultInput(saved, answer),
 )
 ```
 
-### Suspend and resume
+For `run_stream()` and `run_events()`, catch `RunPaused` around both stream
+iteration and `stream.result()`, then close and drain the stream as described
+above. Both surfaces preserve the typed pause. Resume appends one tool result to
+the original call without adding a user message or replaying completed tools.
+Saved execution limits remain in force; the host can apply stricter limits.
 
-A supported external call ends the active execution with
-`RunSuspension(continuation=...)`. Streams close normally, and
-`stream.result()` returns that suspension. End hooks receive `None` because
-there is no completed `RunResult`. A suspension does not commit the working
-state or advance the completed revision.
+The host must persist before publishing, authorize and atomically claim answers,
+and block ordinary input while a question is pending. The runner's local guard
+does not prevent replay across processes or guarantee exactly-once side effects.
+The host must reconcile a failed or uncertain resume before another attempt.
 
-The `RunContinuation` carries a runtime-generated `continuation_id`, the stable
-agent address, the completed baseline revision, the original tool call, its
-validated arguments and schema, working state, and consumed execution limits.
-The model does not generate the continuation ID.
-
-Use `continuation_to_json()` and `continuation_from_json()` to store and restore
-this separate versioned value. Keep the previous completed `AgentSnapshot`
-with it when one exists. On a new process, reconstruct the same agent address,
-completed baseline, descriptor, tools, model, and shims. Then pass the restored
-continuation and validated result text through the existing run surface:
-
-```python
-from agentlane.harness import RunResult, ToolResultInput, continuation_from_json
-
-# The host must claim this pending request before it starts execution.
-continuation = continuation_from_json(saved_payload)
-outcome = await restored_agent.run(
-    ToolResultInput(continuation=continuation, result=validated_answer_text)
-)
-if isinstance(outcome, RunResult):
-    print(outcome.final_output)
-else:
-    # Save the next continuation before presenting the next external request.
-    next_continuation = outcome.continuation
-```
-
-`run_stream(...)` and `run_events(...)` accept the same `ToolResultInput`.
-The result becomes a tool-result message for the original call ID. The next
-model turn continues the saved run. Previous tool execution and consumed
-budgets are retained. Passing a normal user message or raw `RunState` does not
-resolve the pending call.
-
-### Host storage and execution claims
-
-The host must save the continuation before it publishes the external request.
-It must validate and save the answer, then atomically claim the pending
-continuation before it calls the runner. Save the completed snapshot or next
-continuation before marking that attempt complete.
-
-The runtime checks the agent address, baseline revision, pending call, current
-tool schema, and limits. A live agent rejects reused continuations and ordinary
-input while it waits. These checks do not coordinate separate processes.
-If a claimed attempt fails after execution starts, the host must treat its
-outcome as uncertain. Automatic replay can repeat external effects. AgentLane
-does not supply a durable store, distributed claim, or exactly-once guarantee.
-
-The [offline continuation example](../../examples/harness/external_tool_continuation/)
-uses SQLite for a pending request, saved answer, and atomic execution claim.
-It runs the pause and resume in separate processes.
-
-### Supported boundary
-
-The first version supports one root external call at a quiet tool boundary:
-
-- The model response contains exactly one tool call, and it is external.
-- There are no active asynchronous tools or delegated child runs.
-- The configured model uses ordinary request and response turns. Provider
-  modes that require live streaming, steering, or automatic successors are
-  excluded.
-- The root runner has explicit `external_tool_agent_id` configuration.
-- The host owns persistence. `DefaultAgent` rejects `state_path`, `StateStore`,
-  and `fork()` with this mode. The process bridge does not transport a
-  continuation. Child tools and handoffs cannot suspend into the parent.
-
-Unsupported combinations raise errors. Ordinary tools and completed
-`AgentSnapshot` version 1 values keep their existing behavior.
+Only a single external call at an idle root boundary is supported. Mixed tool
+batches, live provider sessions, asynchronous dispatch, steering, child
+suspension, and process-bridge resume are outside this contract. Opted-in agents
+cannot use `state_path`, `state_store`, or `fork()`; the host owns persistence.
 
 ## Request Ownership
 

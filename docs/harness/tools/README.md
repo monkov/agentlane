@@ -20,8 +20,6 @@ Core docs:
 4. [Sandboxes](../sandboxes/README.md): run environment tools in a sandbox
    managed by your app.
 5. [MCP](./mcp.md): use tools from Model Context Protocol servers.
-6. [External tool continuations](../runner.md#external-tool-continuations):
-   declare a tool whose result comes from the host application.
 
 Tool reference:
 

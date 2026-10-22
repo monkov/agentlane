@@ -13,7 +13,6 @@ from agentlane.harness import (
     AgentDescriptor,
     InheritTools,
     RestrictTools,
-    RunResult,
 )
 from agentlane.harness.agents import DefaultAgent
 from agentlane.harness.agents.definitions import (
@@ -589,7 +588,6 @@ def test_default_agent_from_markdown_runs_with_sequence_model(tmp_path: Path) ->
     agent = DefaultAgent.from_markdown(path, model=client)
 
     result = asyncio.run(agent.run("hi"))
-    assert isinstance(result, RunResult)
 
     assert result.final_output == "done"
     first_call = client.calls[0]
@@ -633,7 +631,6 @@ def test_default_agent_from_markdown_subagent_runs_as_subroutine(
     )
 
     result = asyncio.run(agent.run("go"))
-    assert isinstance(result, RunResult)
 
     assert result.final_output == "final answer"
     assert len(child_model.calls) == 1

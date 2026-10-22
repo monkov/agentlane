@@ -17,7 +17,7 @@ from typing import Literal, Protocol, cast, runtime_checkable
 
 import structlog
 
-from agentlane.harness import RunEvent, RunOutcome, RunResult, RunState
+from agentlane.harness import RunEvent, RunResult, RunState
 from agentlane.harness.tools import (
     ToolApprovalBroker,
     ToolApprovalEvent,
@@ -87,7 +87,7 @@ class RunEventStreamLike(Protocol):
         """Yield run events in the order produced by the AgentLane runtime."""
         ...
 
-    async def result(self) -> RunOutcome:
+    async def result(self) -> RunResult:
         """Return the completed run result or raise the terminal run error."""
         ...
 
@@ -335,10 +335,6 @@ class BridgeBackend:
             # it here so failures are reported at the run boundary, not leaked
             # as unobserved task exceptions.
             result = await stream.result()
-            if not isinstance(result, RunResult):
-                raise RuntimeError(
-                    "The process bridge does not support external tool suspension."
-                )
 
             record = result.to_dict()
             state = record["run_state"]
