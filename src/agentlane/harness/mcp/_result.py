@@ -172,7 +172,6 @@ class _Renderer:
     def __init__(
         self, output_limit: int, secrets: Collection[str], *, complete: bool = False
     ) -> None:
-        # sys.maxsize removes preview budgets for complete, in-memory strings.
         self.complete = complete
         self.characters = sys.maxsize if complete else max(64 * 1024, output_limit)
         self.nodes = sys.maxsize if complete else _MAX_NODES

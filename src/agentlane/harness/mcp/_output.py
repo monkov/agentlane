@@ -1,4 +1,4 @@
-"""Prepare MCP text once, then return it inline or save it for later reads."""
+"""File-backed MCP responses for results that exceed the preview budget."""
 
 import json
 from collections.abc import Collection
@@ -24,12 +24,10 @@ async def render_mcp_result_with_storage(
     writer: FileWriter | None,
     directory: str | None,
 ) -> str | ToolFailure:
-    """Serialize once, then return the text inline or save it for native reads."""
+    """Return a bounded response with a file path when the full text is saved."""
     if writer is None:
         return render_mcp_result(result, policy, secrets=secrets)
 
-    # Prepare all supported content once. Inline output, saving, and failure
-    # previews use this same text without visiting the provider result again.
     is_error = read_result(result).is_error
     try:
         serialized = render_mcp_result(result, policy, secrets=secrets, complete=True)
@@ -46,8 +44,6 @@ async def render_mcp_result_with_storage(
     if len(text) <= policy.max_text_chars:
         return result_response(text, is_error)
 
-    # The host selects the directory. The call handler owns cancellation, and
-    # the shared writer waits for an active write to finish before propagating it.
     try:
         if not directory:
             raise ValueError("MCP result storage requires a directory.")
@@ -62,8 +58,7 @@ async def render_mcp_result_with_storage(
     except Exception:
         notice = _UNAVAILABLE
 
-    # Keep the complete reference inside the response budget. Only the already
-    # sanitized text can be shortened; the saved file retains the full text.
+    # Truncate the preview, never the file path the model needs to read it.
     if len(notice) > policy.max_text_chars:
         notice = _UNAVAILABLE
     available = policy.max_text_chars - len(notice)

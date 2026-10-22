@@ -158,7 +158,6 @@ async def test_runner_reads_complete_saved_output_through_native_pagination(
     assert reference is not None
     read_path = json.loads(reference.group(1))
 
-    # Follow the actual published path and native read continuation offsets.
     pages: list[str] = []
     offset = 1
     while True:
@@ -384,7 +383,7 @@ async def test_tool_cancellation_waits_for_active_file_write(
         else:
             call_task.cancel()
 
-        # Each cancellation path must reach the same active result preparation.
+        # Wait for cancellation to reach the writer before releasing the write.
         async with asyncio.timeout(5):
             while not any(task.cancelling() for task in connection.active_calls):
                 await asyncio.sleep(0.01)
