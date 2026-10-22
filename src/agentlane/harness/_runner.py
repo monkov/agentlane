@@ -81,6 +81,12 @@ class Runner:
         )
         self._external_execution_started = False
 
+        # Handoffs share this runner and must retain the saved model-turn limit.
+        if self._external_input is not None:
+            self._max_turns = min(
+                self._max_turns, self._external_input.continuation.max_turns
+            )
+
         # Share execution services and delegation limits across this runner's loops.
         self._tool_executor = ToolExecutor()
         self._agent_delegation = AgentDelegationState(

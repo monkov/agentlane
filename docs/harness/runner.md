@@ -438,7 +438,9 @@ result = await execute(saved.to_run_state(), ToolResultInput(saved, answer))
 For `run_stream()` and `run_events()`, catch `RunPaused` around both stream
 iteration and `stream.result()`, then close and drain the stream as described
 above. Resume adds one result to the original tool call, with no extra user
-message or replay of completed tools. Saved limits apply and can be reduced.
+message or replay of completed tools. Resume reuses the arguments validated at
+pause, including generated defaults. Saved limits can be reduced; the smaller
+configured or saved model-turn cap applies to all agents, including handoffs.
 
 The host must block ordinary input while waiting, prevent replay across processes,
 and reconcile failed or uncertain attempts before retrying. The local runner guard

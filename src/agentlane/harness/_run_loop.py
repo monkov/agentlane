@@ -415,7 +415,6 @@ class RunLoop:
         ):
             raise ValueError("External tool continuation does not match the run state.")
 
-        self.max_turns = min(self.max_turns, saved.max_turns)
         self.tool_call_counts = dict(saved.tool_call_counts)
         self.tool_round_trips = saved.tool_round_trips
 
@@ -461,10 +460,8 @@ class RunLoop:
             raise ValueError("The pending external tool is no longer registered.")
         if definition.schema != saved.args_schema:
             raise ValueError("The pending external tool contract has changed.")
-        arguments = _parse_external_tool_args(saved.tool_call, definition)
-        if arguments != saved.arguments:
-            raise ValueError("The pending external tool arguments have changed.")
 
+        # Keep the arguments validated at pause; defaults may not be repeatable.
         # A history-rewrite shim must retain the exact unresolved call boundary.
         current = AgentSnapshot.capture(agent_id=self.agent.id, run_state=self.state)
         RunContinuation.from_json(

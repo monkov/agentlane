@@ -5,13 +5,16 @@ import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Self, cast
+from unittest.mock import Mock
+from uuid import UUID, uuid4
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agentlane.harness import (
     Agent,
     AgentDescriptor,
+    DefaultHandoff,
     ExternalTool,
     RunContinuation,
     Runner,
@@ -52,11 +55,11 @@ def external() -> ExternalTool[EchoArgs]:
     )
 
 
-def response(*names: str, call_suffix: str = "") -> ModelResponse:
+def response(
+    *names: str, call_suffix: str = "", arguments: str = '{"text":"needed"}'
+) -> ModelResponse:
     calls = [
-        make_tool_call(
-            tool_id=name + call_suffix, name=name, arguments='{"text":"needed"}'
-        )
+        make_tool_call(tool_id=name + call_suffix, name=name, arguments=arguments)
         for name in names
     ]
     return make_assistant_response(None if calls else "done", tool_calls=calls or None)
@@ -79,14 +82,20 @@ class ScriptedModel(SequenceModel):
 
 
 def agent(
-    model: Model[ModelResponse], runner: Runner, tools: Tools | None = None
+    model: Model[ModelResponse],
+    runner: Runner,
+    tools: Tools | None = None,
+    default_handoff: DefaultHandoff | None = None,
 ) -> Agent:
     return Agent(
         SingleThreadedRuntimeEngine(),
         runner,
         bind_id=ROOT,
         descriptor=AgentDescriptor(
-            name="test", model=model, tools=tools or Tools(tools=[external()])
+            name="test",
+            model=model,
+            tools=tools or Tools(tools=[external()]),
+            default_handoff=default_handoff,
         ),
     )
 
@@ -101,8 +110,10 @@ async def execute(
     run_state: RunState,
     tools: Tools | None = None,
     mode: str = "run",
+    *,
+    default_handoff: DefaultHandoff | None = None,
 ) -> RunResult:
-    task = agent(model, runner, tools)
+    task = agent(model, runner, tools, default_handoff)
     if mode == "run":
         return await runner.run(task, run_state)
     stream = (
@@ -187,6 +198,95 @@ async def test_restart_retains_effects_calls_and_saved_budgets(mode: str) -> Non
     with pytest.raises(RuntimeError, match="turn limit"):
         await execute(last, final_model, again.to_run_state(), expanded_tools, mode)
     assert final_model.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["run", "stream", "events"])
+@pytest.mark.parametrize("max_turns,current_limit", [(2, 999), (3, 999), (3, 2)])
+async def test_resume_handoff_retains_saved_turn_limit(
+    mode: str, max_turns: int, current_limit: int
+) -> None:
+    with pytest.raises(RunPaused) as paused:
+        await execute(
+            Runner(external_tool_agent_id=ROOT, max_turns=max_turns),
+            ScriptedModel(response("external")),
+            state(),
+            mode=mode,
+        )
+    saved = RunContinuation.from_json(paused.value.continuation.to_json())
+    child = ScriptedModel(response())
+    resumed = Runner(
+        external_tool_agent_id=ROOT,
+        max_turns=current_limit,
+        external_input=ToolResultInput(continuation=saved, result="answer"),
+    )
+    execution = execute(
+        resumed,
+        ScriptedModel(response("handoff", arguments="{}")),
+        saved.to_run_state(),
+        mode=mode,
+        default_handoff=DefaultHandoff(model=child, tools=None),
+    )
+
+    # The same handoff succeeds only when the saved budget permits its third turn.
+    if min(max_turns, current_limit) == 2:
+        with pytest.raises(RuntimeError, match="turn limit"):
+            await execution
+        assert child.calls == []
+    else:
+        assert (await execution).final_output == "done"
+        assert len(child.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["run", "stream", "events"])
+async def test_resume_preserves_external_argument_defaults(mode: str) -> None:
+    factory = Mock(side_effect=uuid4)
+
+    class DefaultArgs(BaseModel):
+        request_id: UUID = Field(default_factory=factory, alias="requestId")
+
+    tools = Tools(
+        tools=[
+            ExternalTool(
+                name="external",
+                description="Get host input.",
+                args_model=DefaultArgs,
+                strict=False,
+            )
+        ]
+    )
+    with pytest.raises(RunPaused) as paused:
+        await execute(
+            Runner(external_tool_agent_id=ROOT),
+            ScriptedModel(response("external", arguments="{}")),
+            state(),
+            tools,
+            mode,
+        )
+    saved = RunContinuation.from_json(
+        json.loads(json.dumps(paused.value.continuation.to_json()))
+    )
+    original = saved.to_json()
+    model = ScriptedModel(response())
+    resumed = Runner(
+        external_tool_agent_id=ROOT,
+        external_input=ToolResultInput(continuation=saved, result="answer"),
+    )
+    result = await execute(resumed, model, saved.to_run_state(), tools, mode)
+    assert result.final_output == "done"
+    assert factory.call_count == 1 and saved.to_json() == original
+    assert saved.tool_call.function.arguments == "{}"
+    assert UUID(str(saved.arguments["request_id"]))
+    assert [message for message in model.calls[0] if message["role"] == "user"] == [
+        {"role": "user", "content": "start"}
+    ]
+    assert model.calls[0][-1] == {
+        "role": "tool",
+        "tool_call_id": saved.tool_call.id,
+        "name": "external",
+        "content": "answer",
+    }
 
 
 @pytest.mark.asyncio
