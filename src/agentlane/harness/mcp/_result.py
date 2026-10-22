@@ -1,10 +1,8 @@
 """Convert MCP tool results to bounded, safe model-facing text."""
 
-import json
 from collections.abc import Collection, Iterator, Mapping, Sequence
-from dataclasses import dataclass
 from math import isfinite
-from typing import Protocol, cast
+from typing import cast
 
 from pydantic import BaseModel
 
@@ -12,26 +10,20 @@ from agentlane.models import ToolError, ToolFailure
 
 from ._errors import MCP_SERVER_TOOL_ERROR_KIND
 from ._redaction import is_secret_key, redact_known_secrets, redact_secret_pairs
+from ._result_values import (
+    NOT_JSON,
+    block_type,
+    get_field,
+    json_text,
+    parse_json,
+    read_result,
+    value_fields,
+)
 from ._types import MCPResultPolicy
 
 _OMISSION = "[omitted: exceeds processing limit]"
 _MAX_NODES = 4096
 _MAX_DEPTH = 32
-_NOT_JSON = object()
-"""Returned by `_parse_json` when text is not valid JSON."""
-
-
-class _SDKResult(Protocol):
-    content: Sequence[object]
-    structured_content: object
-    is_error: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _Result:
-    content: Sequence[object]
-    structured_content: object
-    is_error: bool
 
 
 def render_mcp_result(
@@ -39,9 +31,12 @@ def render_mcp_result(
     policy: MCPResultPolicy,
     *,
     secrets: Collection[str] = (),
+    source_path: str | None = None,
+    read_path: str | None = None,
+    storage_unavailable: bool = False,
 ) -> str | ToolFailure:
     """Render a bounded preview without processing omitted server content."""
-    source = _read_result(result)
+    source = read_result(result)
     renderer = _Renderer(policy.max_text_chars, secrets)
 
     # An empty structured result carries no data, so it does not replace text.
@@ -59,7 +54,39 @@ def render_mcp_result(
     if structured is not None:
         reserved["structuredContent"] = {"omitted": True}
 
-    available = policy.max_text_chars - len(_json(reserved))
+    # File references share the preview budget and must remain complete.
+    output_metadata: dict[str, str] | None = None
+    if source_path is not None and read_path is not None:
+        if max(len(source_path), len(read_path)) <= policy.max_text_chars:
+            output_metadata = {
+                "source_path": source_path,
+                "read_path": read_path,
+            }
+        else:
+            storage_unavailable = True
+
+    if storage_unavailable:
+        output_metadata = {"status": "unavailable"}
+    if output_metadata is not None:
+        reserved["output"] = output_metadata
+        if len(json_text(reserved)) > policy.max_text_chars:
+            output_metadata = {"status": "unavailable"}
+            reserved["output"] = output_metadata
+
+        if len(json_text(reserved)) > policy.max_text_chars:
+            return _response(
+                json_text(
+                    {
+                        "content": [],
+                        "isError": source.is_error,
+                        "truncated": True,
+                        "output": output_metadata,
+                    }
+                ),
+                source.is_error,
+            )
+
+    available = policy.max_text_chars - len(json_text(reserved))
     content_budget = 2 + (int(available * 0.6) if structured is not None else available)
 
     # Servers repeat structured content in text blocks for clients that cannot
@@ -71,9 +98,11 @@ def render_mcp_result(
         policy.max_content_blocks,
         skip_text=structured is not None and not source.is_error,
     )
-    fields = [f'"content":{content}', f'"isError":{_json(source.is_error)}']
+    fields = [f'"content":{content}', f'"isError":{json_text(source.is_error)}']
+    if output_metadata is not None:
+        fields.append(f'"output":{json_text(output_metadata)}')
     if structured is not None:
-        structured_budget = len(_json(reserved["structuredContent"])) + (
+        structured_budget = len(json_text(reserved["structuredContent"])) + (
             available - (len(content) - 2)
         )
         preview = renderer.value(structured, structured_budget) or '{"omitted":true}'
@@ -84,7 +113,11 @@ def render_mcp_result(
         fields.extend(['"truncated":true', f'"omittedBlocks":{omitted_blocks}'])
 
     text = "{" + ",".join(fields) + "}"
-    if source.is_error:
+    return _response(text, source.is_error)
+
+
+def _response(text: str, is_error: bool) -> str | ToolFailure:
+    if is_error:
         return ToolFailure(
             text=text,
             error=ToolError(
@@ -94,68 +127,6 @@ def render_mcp_result(
         )
 
     return text
-
-
-def _read_result(value: object) -> _Result:
-    if isinstance(value, Mapping):
-        raw = cast(Mapping[str, object], value)
-        content = raw.get("content", [])
-        return _Result(
-            content=_sequence(content),
-            structured_content=raw.get(
-                "structuredContent", raw.get("structured_content")
-            ),
-            is_error=raw.get("isError", raw.get("is_error", False)) is True,
-        )
-
-    source = cast(_SDKResult, value)
-    return _Result(source.content, source.structured_content, source.is_error)
-
-
-def _parse_json(text: str) -> object:
-    try:
-        return json.loads(text)
-    except (ValueError, RecursionError):
-        return _NOT_JSON
-
-
-def _sequence(value: object) -> Sequence[object]:
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return cast(Sequence[object], value)
-
-    return ()
-
-
-def _json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def _fields(value: Mapping[str, object] | BaseModel) -> Iterator[tuple[str, str]]:
-    if isinstance(value, BaseModel):
-        for name, field in type(value).model_fields.items():
-            yield name, field.serialization_alias or field.alias or name
-
-        for name in value.model_extra or {}:
-            yield name, name
-
-        return
-
-    for name in value:
-        yield name, name
-
-
-def _field(value: Mapping[str, object] | BaseModel, name: str) -> object:
-    if isinstance(value, BaseModel):
-        return getattr(value, name)
-
-    return value[name]
-
-
-def _block_type(block: object) -> object | None:
-    if isinstance(block, (Mapping, BaseModel)):
-        return _field(cast(Mapping[str, object] | BaseModel, block), "type")
-
-    return None
 
 
 class _Renderer:
@@ -187,7 +158,7 @@ class _Renderer:
         # Only serialize a prefix of already sanitized text. Raw strings must
         # pass the complete-string processing budget before this method runs.
         prefix = value[:available]
-        encoded = _json(prefix)
+        encoded = json_text(prefix)
         if len(prefix) == len(value) and len(encoded) <= available:
             return encoded
 
@@ -198,12 +169,12 @@ class _Renderer:
         low, high = 0, len(prefix)
         while low < high:
             midpoint = (low + high + 1) // 2
-            if len(_json(prefix[:midpoint] + "…")) <= available:
+            if len(json_text(prefix[:midpoint] + "…")) <= available:
                 low = midpoint
             else:
                 high = midpoint - 1
 
-        return _json(prefix[:low] + "…")
+        return json_text(prefix[:low] + "…")
 
     def value(
         self,
@@ -245,8 +216,8 @@ class _Renderer:
 
             # Render JSON text as structure, so credential keys are redacted.
             # Text that does not parse is text, so redact it as text.
-            parsed = _parse_json(value) if is_json else _NOT_JSON
-            if parsed is not _NOT_JSON:
+            parsed = parse_json(value) if is_json else NOT_JSON
+            if parsed is not NOT_JSON:
                 safe = (
                     self.value(parsed, max(2, available - 2), depth + 1, charged=True)
                     or "null"
@@ -269,7 +240,7 @@ class _Renderer:
             if isinstance(value, float) and not isfinite(value):
                 return self._omission(available)
 
-            encoded = _json(value)
+            encoded = json_text(value)
             if len(encoded) <= available:
                 return encoded
 
@@ -285,8 +256,8 @@ class _Renderer:
         block: bool,
         charged: bool,
     ) -> str | None:
-        kind = _field(value, "type") if block else None
-        fields = _fields(value)
+        kind = get_field(value, "type") if block else None
+        fields = value_fields(value)
         if block:
             fields = self._content_fields(fields, text=kind == "text")
 
@@ -320,7 +291,7 @@ class _Renderer:
                 self.truncated = True
                 continue
 
-            encoded_key = _json(safe_key)
+            encoded_key = json_text(safe_key)
             remaining = available - used - len(encoded_key) - 1 - bool(parts)
             if remaining < 2:
                 self.truncated = True
@@ -329,7 +300,7 @@ class _Renderer:
             if is_secret_key(alias):
                 encoded = self._text("[redacted]", remaining)
             else:
-                item = _field(value, name)
+                item = get_field(value, name)
                 if omitted_body:
                     item = len(item) if isinstance(item, str) else 0
 
@@ -402,7 +373,7 @@ class _Renderer:
             block = value[index]
 
             # A skipped text block is a repeated copy, not an omitted block.
-            if skip_text and _block_type(block) == "text":
+            if skip_text and block_type(block) == "text":
                 kept += 1
                 continue
 

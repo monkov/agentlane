@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from agentlane.harness import AgentDescriptor, RunState, Task
 from agentlane.harness.agents import DefaultAgent
+from agentlane.harness.filesystem import FileWriter
 from agentlane.harness.mcp import (
     MCPAuthorizationContext,
     MCPAuthorizationError,
@@ -51,7 +52,15 @@ class _SourceLease(MCPClientLease):
     def server(self) -> MCPServer:
         return self.config
 
-    async def tools(self) -> tuple[Tool[BaseModel, object], ...]:
+    async def tools(
+        self,
+        *,
+        result_writer: FileWriter | None = None,
+        result_directory: str | None = None,
+        preserve_tools: frozenset[tuple[str, str]] = frozenset(),
+    ) -> tuple[Tool[BaseModel, object], ...]:
+        del result_writer, result_directory, preserve_tools
+
         async def handler(
             args: BaseModel,
             cancellation_token: CancellationToken,
