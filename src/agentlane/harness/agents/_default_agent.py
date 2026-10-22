@@ -26,13 +26,14 @@ from .._cancellation import cancel_task_callback, cancellation_relay_task
 from .._events import RunEventStream
 from .._hooks import RunnerHooks
 from .._json_file_state_store import JsonFileStateStore
-from .._lifecycle import AgentDescriptor
-from .._run import RunInput, RunResult, RunState, copy_run_state
+from .._lifecycle import AgentDescriptor, ExternalTool
+from .._run import RunResult, RunState, copy_run_state
 from .._runner import Runner
-from .._snapshot import AgentSnapshot, RunPaused
+from .._snapshot import AgentSnapshot, RunInput, RunPaused, ToolResultInput
 from .._state_store import StateStore
 from .._stream import RunStream
 from .._stream_base import close_stream_callback
+from .._tooling import resolve_tools
 from ._base import AgentBase
 from .definitions import (
     AgentFileError,
@@ -117,14 +118,6 @@ class DefaultAgent(AgentBase):
             raise ValueError(
                 "Pass state_path or state_store without run_state or snapshot."
             )
-        if (
-            runner is not None
-            and runner.external_tool_agent_id is not None
-            and (state_path is not None or state_store is not None)
-        ):
-            raise ValueError(
-                "External tools require host-managed continuation storage."
-            )
 
         self._state_store = (
             JsonFileStateStore(state_path) if state_path is not None else state_store
@@ -149,6 +142,16 @@ class DefaultAgent(AgentBase):
             _coerce_subagents(subagents),
             link=subagent_link,
         )
+        tools = resolve_tools(self._descriptor.tools)
+        if (
+            tools is not None
+            and any(isinstance(tool, ExternalTool) for tool in tools.normalized_tools)
+            and self._state_store is not None
+        ):
+            raise ValueError(
+                "External tools require host-managed continuation storage."
+            )
+
         self._runtime = runtime
         self._runner = runner
         self._hooks = hooks
@@ -290,9 +293,9 @@ class DefaultAgent(AgentBase):
         """Execute one primary-line run and persist the resulting state.
 
         Args:
-            input: Raw run input or an explicit ``RunState`` resume payload.
-                When a ``RunState`` is provided directly, it takes precedence
-                over the agent's stored baseline for that call.
+            input: Raw run input, explicit ``RunState``, or ``ToolResultInput``.
+                An explicit state replaces the stored baseline for this call.
+                A tool result resumes its continuation at the stored revision.
             cancellation_token: Optional shared cancellation token.
 
         Returns:
@@ -357,7 +360,13 @@ class DefaultAgent(AgentBase):
                 None if isinstance(input, RunState) else copy_run_state(self._run_state)
             )
 
-            if effective_runner.external_tool_agent_id is not None:
+            tools = resolve_tools(self._descriptor.tools)
+            if isinstance(input, ToolResultInput) or (
+                tools is not None
+                and any(
+                    isinstance(tool, ExternalTool) for tool in tools.normalized_tools
+                )
+            ):
                 raise ValueError("External tools do not support forked runs.")
 
         fork_agent_id = _fork_agent_id(self._agent_id)
@@ -491,6 +500,14 @@ class DefaultAgent(AgentBase):
             recipient=agent_id,
             cancellation_token=cancellation_token,
         )
+        if isinstance(outcome.response_payload, RunPaused):
+            if self._state_store is not None:
+                raise ValueError(
+                    "External tools require host-managed continuation storage."
+                )
+            if agent_id != self._agent_id:
+                raise ValueError("External tools do not support forked runs.")
+
         result = _require_run_result(outcome)
         if result.run_state is not None:
             return result
@@ -631,6 +648,12 @@ class DefaultAgent(AgentBase):
                 stream.emit(event)
 
             result = await low_level_stream.result()
+        except RunPaused as exc:
+            if self._state_store is not None:
+                raise ValueError(
+                    "External tools require host-managed continuation storage."
+                ) from exc
+            raise
         finally:
             await low_level_stream.aclose()
 
@@ -670,6 +693,22 @@ class DefaultAgent(AgentBase):
         run_input: RunInput,
     ) -> tuple[RunInput, RunState | None]:
         """Prepare one primary input against the durable revision baseline."""
+        if isinstance(run_input, ToolResultInput):
+            if self._state_store is not None:
+                raise ValueError(
+                    "External tools require host-managed continuation storage."
+                )
+            if (
+                self._run_state is not None
+                and self._run_state.revision
+                != run_input.continuation.checkpoint.revision
+            ):
+                raise ValueError(
+                    "Continuation revision does not match the stored state."
+                )
+
+            return run_input, None
+
         if not isinstance(run_input, RunState):
             return run_input, self._run_state
         if self._state_store is None or self._run_state is None:
@@ -717,6 +756,12 @@ class DefaultAgent(AgentBase):
                 stream.emit(event)
 
             result = await low_level_stream.result()
+        except RunPaused as exc:
+            if self._state_store is not None:
+                raise ValueError(
+                    "External tools require host-managed continuation storage."
+                ) from exc
+            raise
         finally:
             await low_level_stream.aclose()
 

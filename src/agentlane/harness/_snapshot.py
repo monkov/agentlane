@@ -284,6 +284,10 @@ class ToolResultInput:
         object.__setattr__(self, "continuation", copied)
 
 
+type RunInput = str | list[RunHistoryItem] | RunState | ToolResultInput
+"""Input for a new conversation, restored state, or pending tool result."""
+
+
 class RunPaused(Exception):
     """Raised after cleanup when a run needs an external tool result."""
 

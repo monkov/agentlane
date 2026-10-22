@@ -1358,12 +1358,7 @@ async def test_responses_resume_keeps_original_call_and_one_result(
         create = AsyncMock(return_value=transport if streaming else native)
         client = ResponsesClient(Config(api_key="test-key", model="test"))
         cast(Any, client)._openai_client.responses.create = create
-        runner = Runner(
-            external_tool_agent_id=root,
-            external_input=(
-                ToolResultInput(continuation=saved, result="Prague") if saved else None
-            ),
-        )
+        runner = Runner()
         agent = Agent(
             SingleThreadedRuntimeEngine(),
             runner,
@@ -1372,7 +1367,7 @@ async def test_responses_resume_keeps_original_call_and_one_result(
         )
 
         state = (
-            saved.to_run_state()
+            ToolResultInput(continuation=saved, result="Prague")
             if saved
             else RunState(instructions=None, history=["Start."], responses=[])
         )

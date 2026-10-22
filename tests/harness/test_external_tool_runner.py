@@ -1,10 +1,11 @@
 """Host-owned continuation round trips and execution boundaries."""
 
 import asyncio
+import gc
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Self, cast
+from typing import Any, Self, cast
 from unittest.mock import Mock
 from uuid import UUID, uuid4
 
@@ -24,7 +25,7 @@ from agentlane.harness import (
     ToolResultInput,
 )
 from agentlane.harness._run_loop import AgentDelegationState
-from agentlane.messaging import AgentId
+from agentlane.messaging import AgentId, DeliveryStatus
 from agentlane.models import (
     Model,
     ModelBehaviorError,
@@ -108,21 +109,22 @@ def state() -> RunState:
 async def execute(
     runner: Runner,
     model: ScriptedModel,
-    run_state: RunState,
+    run_state: RunState | ToolResultInput,
     tools: Tools | None = None,
     mode: str = "run",
     *,
     default_handoff: DefaultHandoff | None = None,
+    cancellation_token: CancellationToken | None = None,
 ) -> RunResult:
     task = agent(model, runner, tools, default_handoff)
 
     if mode == "run":
-        return await runner.run(task, run_state)
+        return await runner.run(task, run_state, cancellation_token=cancellation_token)
 
     stream = (
-        runner.run_events(task, run_state)
+        runner.run_events(task, run_state, cancellation_token=cancellation_token)
         if mode == "events"
-        else runner.run_stream(task, run_state)
+        else runner.run_stream(task, run_state, cancellation_token=cancellation_token)
     )
 
     try:
@@ -147,7 +149,7 @@ async def test_restart_retains_effects_calls_and_saved_budgets(mode: str) -> Non
         tool_call_limits={"write": 1, "external": 2},
         max_tool_round_trips=3,
     )
-    first = Runner(external_tool_agent_id=ROOT, max_turns=3)
+    first = Runner(max_turns=3)
     model = ScriptedModel(response("write"), response("external"))
     with pytest.raises(RunPaused) as paused:
         await execute(first, model, state(), tools, mode)
@@ -160,11 +162,7 @@ async def test_restart_retains_effects_calls_and_saved_budgets(mode: str) -> Non
     original = saved.to_json()
 
     # A new execution can lower limits, but cannot expand the saved budget.
-    resumed = Runner(
-        external_tool_agent_id=ROOT,
-        max_turns=999,
-        external_input=ToolResultInput(continuation=saved, result="Prague"),
-    )
+    resumed = Runner(max_turns=999)
     next_model = ScriptedModel(response("external", call_suffix="_again"))
     expanded_tools = Tools(
         tools=[write, external()],
@@ -172,7 +170,13 @@ async def test_restart_retains_effects_calls_and_saved_budgets(mode: str) -> Non
         max_tool_round_trips=999,
     )
     with pytest.raises(RunPaused) as paused_again:
-        await execute(resumed, next_model, saved.to_run_state(), expanded_tools, mode)
+        await execute(
+            resumed,
+            next_model,
+            ToolResultInput(continuation=saved, result="Prague"),
+            expanded_tools,
+            mode,
+        )
     again = RunContinuation.from_json(paused_again.value.continuation.to_json())
     assert again.tool_call_counts == {"write": 1, "external": 2}
     assert again.tool_call_limits == {"write": 0, "external": 2}
@@ -194,14 +198,16 @@ async def test_restart_retains_effects_calls_and_saved_budgets(mode: str) -> Non
     assert catalog.tool_call_limits == {"write": 0, "external": 2}
 
     # A second answer cannot grant another model turn after the saved limit.
-    last = Runner(
-        external_tool_agent_id=ROOT,
-        max_turns=999,
-        external_input=ToolResultInput(continuation=again, result="answer"),
-    )
+    last = Runner(max_turns=999)
     final_model = ScriptedModel()
     with pytest.raises(RuntimeError, match="turn limit"):
-        await execute(last, final_model, again.to_run_state(), expanded_tools, mode)
+        await execute(
+            last,
+            final_model,
+            ToolResultInput(continuation=again, result="answer"),
+            expanded_tools,
+            mode,
+        )
     assert final_model.calls == []
 
 
@@ -213,22 +219,18 @@ async def test_resume_handoff_retains_saved_turn_limit(
 ) -> None:
     with pytest.raises(RunPaused) as paused:
         await execute(
-            Runner(external_tool_agent_id=ROOT, max_turns=max_turns),
+            Runner(max_turns=max_turns),
             ScriptedModel(response("external")),
             state(),
             mode=mode,
         )
     saved = RunContinuation.from_json(paused.value.continuation.to_json())
     child = ScriptedModel(response())
-    resumed = Runner(
-        external_tool_agent_id=ROOT,
-        max_turns=current_limit,
-        external_input=ToolResultInput(continuation=saved, result="answer"),
-    )
+    resumed = Runner(max_turns=current_limit)
     execution = execute(
         resumed,
         ScriptedModel(response("handoff", arguments="{}")),
-        saved.to_run_state(),
+        ToolResultInput(continuation=saved, result="answer"),
         mode=mode,
         default_handoff=DefaultHandoff(model=child, tools=None),
     )
@@ -263,7 +265,7 @@ async def test_resume_preserves_external_argument_defaults(mode: str) -> None:
     )
     with pytest.raises(RunPaused) as paused:
         await execute(
-            Runner(external_tool_agent_id=ROOT),
+            Runner(),
             ScriptedModel(response("external", arguments="{}")),
             state(),
             tools,
@@ -274,11 +276,13 @@ async def test_resume_preserves_external_argument_defaults(mode: str) -> None:
     )
     original = saved.to_json()
     model = ScriptedModel(response())
-    resumed = Runner(
-        external_tool_agent_id=ROOT,
-        external_input=ToolResultInput(continuation=saved, result="answer"),
+    result = await execute(
+        Runner(),
+        model,
+        ToolResultInput(continuation=saved, result="answer"),
+        tools,
+        mode,
     )
-    result = await execute(resumed, model, saved.to_run_state(), tools, mode)
     assert result.final_output == "done"
     assert factory.call_count == 1 and saved.to_json() == original
     assert saved.tool_call.function.arguments == "{}"
@@ -295,17 +299,14 @@ async def test_resume_preserves_external_argument_defaults(mode: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid", ["state", "schema", "identity", "pending"])
+@pytest.mark.parametrize("invalid", ["schema", "identity", "pending"])
 async def test_invalid_resume_rejects_before_model_io(invalid: str) -> None:
-    runner = Runner(external_tool_agent_id=ROOT)
+    runner = Runner()
     with pytest.raises(RunPaused) as paused:
         await execute(runner, ScriptedModel(response("external")), state())
     saved = paused.value.continuation.model_copy(deep=True)
-    resumed_state = saved.to_run_state()
     tools = Tools(tools=[external()])
-    if invalid == "state":
-        resumed_state.history.append("unexpected user turn")
-    elif invalid == "schema":
+    if invalid == "schema":
         tools = Tools(
             tools=[
                 ExternalTool(
@@ -321,16 +322,14 @@ async def test_invalid_resume_rejects_before_model_io(invalid: str) -> None:
         )
     model = ScriptedModel()
     with pytest.raises(ValueError):
-        resumed = Runner(
-            external_tool_agent_id=ROOT,
-            external_input=ToolResultInput(continuation=saved, result="answer"),
+        await execute(
+            Runner(), model, ToolResultInput(continuation=saved, result="answer"), tools
         )
-        await execute(resumed, model, resumed_state, tools)
     assert model.calls == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["mixed", "opt_in", "cleanup"])
+@pytest.mark.parametrize("failure", ["mixed", "cleanup"])
 async def test_unsafe_boundary_never_publishes_pause(failure: str) -> None:
     effects: list[str] = []
 
@@ -340,38 +339,38 @@ async def test_unsafe_boundary_never_publishes_pause(failure: str) -> None:
 
         return text
 
-    runner = Runner(external_tool_agent_id=None if failure == "opt_in" else ROOT)
+    runner = Runner()
     calls = ("external", "write") if failure == "mixed" else ("external",)
     model = ScriptedModel(response(*calls), cleanup_error=failure == "cleanup")
     expected = {
         "mixed": ModelBehaviorError,
-        "opt_in": ValueError,
         "cleanup": ExceptionGroup,
     }
     with pytest.raises(expected[failure]):
         await execute(runner, model, state(), Tools(tools=[write, external()]))
     assert effects == []
-    if failure == "opt_in":
-        assert model.calls == []
-    else:
-        assert model.closed
+    assert model.closed
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["run", "stream", "events"])
-async def test_cancelled_input_does_not_consume_root_but_execution_does(
+async def test_cancelled_input_does_not_consume_continuation_but_execution_does(
     mode: str,
 ) -> None:
-    runner = Runner(external_tool_agent_id=ROOT)
-    model = ScriptedModel(response("external"))
+    runner = Runner()
+    with pytest.raises(RunPaused) as paused:
+        await execute(runner, ScriptedModel(response("external")), state())
+    result_input = ToolResultInput(paused.value.continuation, "answer")
+    model = ScriptedModel(response())
     token = CancellationToken()
     token.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await runner.run(agent(model, runner), state(), cancellation_token=token)
-    with pytest.raises(RunPaused):
-        await execute(runner, model, state(), mode=mode)
+        await execute(runner, model, result_input, mode=mode, cancellation_token=token)
+    assert (
+        await execute(runner, model, result_input, mode=mode)
+    ).final_output == "done"
     with pytest.raises(RuntimeError):
-        await execute(runner, model, state())
+        await execute(runner, model, result_input)
     assert len(model.calls) == 1
 
 
@@ -395,21 +394,23 @@ async def test_codec_rejects_invalid_counters_and_owns_copies(
 ) -> None:
     with pytest.raises(RunPaused) as paused:
         await execute(
-            Runner(external_tool_agent_id=ROOT),
+            Runner(),
             ScriptedModel(response("external")),
             state(),
         )
     saved = paused.value.continuation
     data = saved.to_json()
     result_input = ToolResultInput(continuation=saved, result="answer")
-    runner = Runner(external_tool_agent_id=ROOT, external_input=result_input)
-
-    # Neither caller can change the payload already owned by the runner.
-    saved.arguments["text"] = "first mutation"
-    result_input.continuation.arguments["text"] = "second mutation"
-    restored = RunContinuation.from_json(data)
-    result = await execute(runner, ScriptedModel(response()), restored.to_run_state())
-    assert result.final_output == "done"
+    runner = Runner()
+    stream = runner.run_events(agent(ScriptedModel(response()), runner), result_input)
+    try:
+        # Neither caller can change the payload already owned by the runner.
+        saved.arguments["text"] = "first mutation"
+        result_input.continuation.arguments["text"] = "second mutation"
+        result_input.continuation.checkpoint.state.history.clear()
+        assert (await stream.result()).final_output == "done"
+    finally:
+        await stream.aclose()
     target = data
     *parents, name = field.split(".")
     for parent in parents:
@@ -467,7 +468,7 @@ async def test_unsupported_provider_controls_reject_before_effects(
     expected = ValueError if mode == "session" else ModelBehaviorError
     with pytest.raises(expected):
         await execute(
-            Runner(external_tool_agent_id=ROOT),
+            Runner(),
             model,
             state(),
             Tools(tools=[write, external()]),
@@ -478,27 +479,142 @@ async def test_unsupported_provider_controls_reject_before_effects(
 
 
 @pytest.mark.asyncio
-async def test_stream_reserves_root_before_concurrent_run(
+async def test_stream_reserves_continuation_before_concurrent_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    runner = Runner()
+    with pytest.raises(RunPaused) as paused:
+        await execute(runner, ScriptedModel(response("external")), state())
+    result_input = ToolResultInput(paused.value.continuation, "answer")
     entered, release = asyncio.Event(), asyncio.Event()
     model = ScriptedModel()
 
     async def blocked_response(*args: object, **kwargs: object) -> ModelResponse:
         entered.set()
         await release.wait()
-        return response("external")
+
+        return response()
 
     monkeypatch.setattr(model, "get_response", blocked_response)
-    runner = Runner(external_tool_agent_id=ROOT)
-    stream = runner.run_events(agent(model, runner), state())
+    stream = runner.run_events(agent(model, runner), result_input)
     try:
+        # Reserve the continuation before the stream task starts.
+        with pytest.raises(RuntimeError):
+            await runner.run(agent(model, runner), result_input)
         await asyncio.wait_for(entered.wait(), timeout=1)
-        with pytest.raises(RuntimeError, match="fresh Runner"):
-            await runner.run(agent(model, runner), state())
         release.set()
-        with pytest.raises(RunPaused):
-            await stream.result()
+        assert (await stream.result()).final_output == "done"
     finally:
         release.set()
         await stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["run", "stream", "events"])
+async def test_resume_turn_limit_does_not_change_runner_limit(mode: str) -> None:
+    with pytest.raises(RunPaused) as paused:
+        await execute(
+            Runner(max_turns=1), ScriptedModel(response("external")), state(), mode=mode
+        )
+    runner = Runner(max_turns=3)
+    with pytest.raises(RuntimeError, match="turn limit"):
+        await execute(
+            runner,
+            ScriptedModel(),
+            ToolResultInput(paused.value.continuation, "answer"),
+            mode=mode,
+        )
+
+    async def write(text: str) -> str:
+        """Return the supplied text."""
+        return text
+
+    model = ScriptedModel(response("write"), response("write"), response())
+    result = await execute(runner, model, state(), Tools(tools=[write]), mode)
+    assert result.final_output == "done"
+    assert len(model.calls) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["run", "stream", "events"])
+async def test_handoff_cannot_pause_for_external_tool(mode: str) -> None:
+    child = ScriptedModel(response("external"))
+    expected = RuntimeError if mode == "run" else ValueError
+    with pytest.raises(expected, match="child suspension"):
+        await execute(
+            Runner(),
+            ScriptedModel(response("handoff", arguments="{}")),
+            state(),
+            mode=mode,
+            default_handoff=DefaultHandoff(
+                model=child, tools=Tools(tools=[external()])
+            ),
+        )
+    assert child.calls == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_resume_commits_current_revision_once() -> None:
+    runtime = SingleThreadedRuntimeEngine()
+    baseline = RunState(instructions=None, history=["prior"], responses=[], revision=7)
+    model = ScriptedModel(response("external"), response())
+    task = Agent.bind(
+        runtime,
+        ROOT,
+        runner=Runner(),
+        descriptor=AgentDescriptor(
+            name="test", model=model, tools=Tools(tools=[external()])
+        ),
+        run_state=baseline,
+    )
+    gc.collect()
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    unhandled: list[dict[str, Any]] = []
+
+    def record_exception(
+        loop: asyncio.AbstractEventLoop, context: dict[str, Any]
+    ) -> None:
+        del loop
+        unhandled.append(context)
+
+    loop.set_exception_handler(record_exception)
+    try:
+        paused = await runtime.send_message("start", recipient=ROOT)
+        assert paused.status == DeliveryStatus.DELIVERED
+        assert isinstance(paused.response_payload, RunPaused)
+        saved = paused.response_payload.continuation
+        assert saved.checkpoint.revision == 7
+        assert task.run_state == baseline
+
+        result_input = ToolResultInput(saved, "Prague")
+        resumed = await runtime.send_message(result_input, recipient=ROOT)
+        assert resumed.status == DeliveryStatus.DELIVERED
+        assert isinstance(resumed.response_payload, RunResult)
+        assert resumed.response_payload.final_output == "done"
+        assert task.run_state is not None and task.run_state.revision == 8
+        assert model.calls[-1][-1] == {
+            "role": "tool",
+            "tool_call_id": saved.tool_call.id,
+            "name": "external",
+            "content": "Prague",
+        }
+        assert [
+            message for message in model.calls[-1] if message["role"] == "user"
+        ] == [
+            {"role": "user", "content": "prior"},
+            {"role": "user", "content": "start"},
+        ]
+
+        stale = await runtime.send_message(result_input, recipient=ROOT)
+        assert stale.status == DeliveryStatus.HANDLER_ERROR
+        assert stale.error is not None
+        assert "Continuation revision" in stale.error.message
+        assert task.run_state.revision == 8
+        assert len(model.calls) == 2
+    finally:
+        await runtime.stop_when_idle()
+        await asyncio.sleep(0)
+        gc.collect()
+        loop.set_exception_handler(previous_handler)
+    assert unhandled == []

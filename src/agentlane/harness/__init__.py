@@ -30,7 +30,6 @@ from ._run import (
     ACTIVE_SKILL_NAMES_STATE_KEY_SUFFIX,
     LiveRunStateView,
     RunHistoryItem,
-    RunInput,
     RunInstructions,
     RunResult,
     RunResultRecord,
@@ -41,6 +40,7 @@ from ._runner import Runner
 from ._snapshot import (
     AgentSnapshot,
     RunContinuation,
+    RunInput,
     RunPaused,
     ToolResultInput,
 )

@@ -26,9 +26,9 @@ from ._lifecycle import (
     DefaultHandoffTool,
     HandoffTool,
 )
-from ._run import RunHistoryItem, RunInput, RunResult, RunState
+from ._run import RunHistoryItem, RunResult, RunState
 from ._runner import Runner
-from ._snapshot import RunPaused
+from ._snapshot import RunInput, RunPaused, ToolResultInput
 from ._stream import RunStream
 from ._task import Task
 from ._tooling import merge_tools, resolve_tools
@@ -276,6 +276,17 @@ class Agent(Task):
         context: MessageContext,
     ) -> object:
         """Handle one inbound resumable run state."""
+        return await self._enqueue_input(
+            payload, cancellation_token=context.cancellation_token
+        )
+
+    @on_message
+    async def handle_tool_result(
+        self,
+        payload: ToolResultInput,
+        context: MessageContext,
+    ) -> object:
+        """Resume one pending tool call."""
         return await self._enqueue_input(
             payload, cancellation_token=context.cancellation_token
         )

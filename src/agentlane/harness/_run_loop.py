@@ -184,6 +184,9 @@ class AgentDelegationState:
 
     max_depth: int
     max_threads: int
+    child_turn_limits: dict[AgentId, int] = field(default_factory=dict[AgentId, int])
+    """Active child runs and their inherited turn limits."""
+
     _live_agents: int = 0
     _depth_by_agent: dict[AgentId, int] = field(default_factory=dict[AgentId, int])
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -268,7 +271,7 @@ class RunLoop:
         agent: Task,
         runner_task: RunnerTask,
         model: Model[ModelResponse],
-        state: RunState,
+        state: RunState | ToolResultInput,
         delegate_runner: LifecycleRunner,
         agent_delegation: AgentDelegationState,
         tool_executor: ToolExecutor,
@@ -280,26 +283,41 @@ class RunLoop:
         emit: Callable[[ModelStreamEvent], None] | None = None,
         run_events: RunEventEmitter | None = None,
         control_stream: BaseRunStream[Any] | None = None,
-        external_tool_agent_id: AgentId | None = None,
-        external_input: ToolResultInput | None = None,
     ) -> None:
         self.agent = agent
         self.runner_task = runner_task
         self.model = model
-        self.state = state
-        self.agent_delivery = AgentDelivery(agent, delegate_runner, cancellation_token)
+        self.external_input = state if isinstance(state, ToolResultInput) else None
+        self.state = (
+            state.continuation.to_run_state()
+            if isinstance(state, ToolResultInput)
+            else state
+        )
         self.agent_delegation = agent_delegation
+        self._is_child = agent.id in agent_delegation.child_turn_limits
         self.tool_executor = tool_executor
         self.hooks = hooks
         self.max_attempts = max_attempts
-        self.max_turns = max_turns
+        self.max_turns = min(
+            max_turns, agent_delegation.child_turn_limits.get(agent.id, max_turns)
+        )
+        if self.external_input is not None:
+            self.max_turns = min(
+                self.max_turns, self.external_input.continuation.max_turns
+            )
+        self.agent_delivery = AgentDelivery(
+            agent,
+            delegate_runner,
+            cancellation_token,
+            child_turn_limits=agent_delegation.child_turn_limits,
+            max_turns=self.max_turns,
+        )
         self.is_retryable = is_retryable
         self.cancellation_token = cancellation_token
         self.emit = emit
         self.run_events = run_events
         self.control_stream = control_stream
-        self.external_tool_agent_id = external_tool_agent_id
-        self.external_input = external_input if self._external_tools_enabled else None
+        self._external_tools_enabled = self.external_input is not None
         self._external_resume_applied = False
 
         # Keep tool budgets and pending results local to this run.
@@ -381,51 +399,36 @@ class RunLoop:
             if result is not None:
                 return result
 
-    @property
-    def _external_tools_enabled(self) -> bool:
-        """Return whether this agent is the configured external-tool root."""
-        return (
-            self.external_tool_agent_id is not None
-            and self.agent.id == self.external_tool_agent_id
-        )
-
     def _validate_external_setup(self) -> None:
         """Validate saved state and restore used tool budgets before model I/O."""
         self._validate_external_catalog(self.runner_task.tools)
-        if self._external_tools_enabled and self.model.requires_streaming:
-            raise ValueError(
-                "External tools require a model without a live provider session."
-            )
-
         if self.external_input is None:
             self._reject_unresolved_external_calls()
             return
 
-        # Match the saved root and state before restoring tool usage.
+        # Match the saved root before restoring tool usage.
         saved = self.external_input.continuation
-        if (
-            not self._external_tools_enabled
-            or saved.checkpoint.agent_id != self.agent.id
-        ):
+        if self._is_child or saved.checkpoint.agent_id != self.agent.id:
             raise ValueError("External tool continuation belongs to a different root.")
-        current = AgentSnapshot.capture(agent_id=self.agent.id, run_state=self.state)
-        if (
-            current.revision != saved.checkpoint.revision
-            or current.state != saved.checkpoint.state
-        ):
-            raise ValueError("External tool continuation does not match the run state.")
-
         self.tool_call_counts = dict(saved.tool_call_counts)
         self.tool_round_trips = saved.tool_round_trips
 
     def _validate_external_catalog(self, tools: Tools | None) -> None:
-        """Reject external tools outside the configured root."""
-        if tools is None or not any(
+        """Enable external tools only at a root without a live provider session."""
+        if tools is not None and any(
             isinstance(tool, ExternalTool) for tool in tools.normalized_tools
         ):
-            return
-        if not self._external_tools_enabled:
-            raise ValueError("External tools require explicit opt-in for this root.")
+            if self._is_child:
+                raise ValueError("External tools do not support child suspension.")
+            self._external_tools_enabled = True
+
+        if self._external_tools_enabled:
+            if self.model.requires_streaming:
+                raise ValueError(
+                    "External tools require a model without a live provider session."
+                )
+            if self.control_stream is not None:
+                self.control_stream.bind_steering(None)
 
     def _reject_unresolved_external_calls(self) -> None:
         """Reject unfinished calls without a saved continuation and result."""
