@@ -1,6 +1,7 @@
 """Create child agents and deliver delegated input through the harness runtime."""
 
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any, Protocol, runtime_checkable
 
 from agentlane.messaging import AgentId, DeliveryOutcome
@@ -98,7 +99,7 @@ class AgentDelivery:
         if control_stream is not None:
             control_stream.bind_steering(child_stream.steer)
 
-        # Forward output and always close the child stream before returning.
+        # Forward output and always close and drain the child stream.
         try:
             async for event in child_stream:
                 emit(event)
@@ -106,6 +107,8 @@ class AgentDelivery:
             return await child_stream.result()
         finally:
             await child_stream.aclose()
+            with suppress(BaseException):
+                await child_stream.result()
 
     def _runtime(self) -> RuntimeEngine:
         """Return the runtime engine required for delegated agent routing."""
