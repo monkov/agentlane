@@ -24,7 +24,7 @@ from agentlane.harness import (
     RunState,
     ToolResultInput,
 )
-from agentlane.harness._run_loop import AgentDelegationState
+from agentlane.harness._lifecycle import DefaultAgentTool
 from agentlane.messaging import AgentId, DeliveryStatus
 from agentlane.models import (
     Model,
@@ -425,7 +425,7 @@ async def test_codec_rejects_invalid_counters_and_owns_copies(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mode", ["automatic", "explicit", "steering", "async", "session", "child"]
+    "mode", ["automatic", "explicit", "steering", "async", "session"]
 )
 async def test_unsupported_provider_controls_reject_before_effects(
     mode: str, monkeypatch: pytest.MonkeyPatch
@@ -442,7 +442,7 @@ async def test_unsupported_provider_controls_reject_before_effects(
     call = make_tool_call(tool_id="effect", name="write", arguments='{"text":"needed"}')
     event = ModelStreamEvent(
         kind=ModelStreamEventKind.COMPLETED,
-        response=response("external" if mode == "child" else "write"),
+        response=response("write"),
     )
     if mode in ("automatic", "explicit"):
         event.continuation = "automatic" if mode == "automatic" else "explicit"
@@ -453,10 +453,6 @@ async def test_unsupported_provider_controls_reject_before_effects(
     elif mode == "session":
         monkeypatch.setattr(
             ScriptedModel, "requires_streaming", property(lambda self: True)
-        )
-    else:
-        monkeypatch.setattr(
-            AgentDelegationState, "has_live_children", property(lambda self: True)
         )
 
     async def stream_response(
@@ -618,3 +614,62 @@ async def test_runtime_resume_commits_current_revision_once() -> None:
         gc.collect()
         loop.set_exception_handler(previous_handler)
     assert unhandled == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["run", "stream", "events"])
+async def test_independent_root_can_pause_and_resume_while_another_root_has_a_child(
+    mode: str,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def wait(text: str) -> str:
+        """Keep the child active until the independent root completes."""
+        entered.set()
+        await release.wait()
+        return text
+
+    runner = Runner()
+    runtime = SingleThreadedRuntimeEngine()
+    parent = Agent(
+        runtime,
+        runner,
+        bind_id=AgentId.from_values("test", "other"),
+        descriptor=AgentDescriptor(
+            name="parent",
+            model=ScriptedModel(
+                response("agent", arguments='{"name":"Child","task":"Wait."}'),
+                response(),
+            ),
+            tools=Tools(
+                tools=[
+                    DefaultAgentTool(
+                        model=ScriptedModel(response("wait"), response()),
+                        tools=Tools(tools=[wait]),
+                    )
+                ]
+            ),
+        ),
+    )
+    running = asyncio.create_task(runner.run(parent, state()))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        with pytest.raises(RunPaused) as paused:
+            await execute(
+                runner, ScriptedModel(response("external")), state(), mode=mode
+            )
+        result = await execute(
+            runner,
+            ScriptedModel(response()),
+            ToolResultInput(paused.value.continuation, "answer"),
+            mode=mode,
+        )
+        assert result.final_output == "done"
+        assert not running.done()
+    finally:
+        release.set()
+        try:
+            assert (await running).final_output == "done"
+        finally:
+            await runtime.stop_when_idle()

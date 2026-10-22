@@ -191,11 +191,6 @@ class AgentDelegationState:
     _depth_by_agent: dict[AgentId, int] = field(default_factory=dict[AgentId, int])
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    @property
-    def has_live_children(self) -> bool:
-        """Return whether any child slots are reserved."""
-        return self._live_agents > 0
-
     async def reserve_child(
         self,
         *,
@@ -1152,7 +1147,6 @@ class RunLoop:
                     not self._external_tools_enabled
                     or len(tool_calls) != 1
                     or self._has_pending_results()
-                    or self.agent_delegation.has_live_children
                 ):
                     raise _model_behavior_error(
                         "An external tool requires a sole call at an idle root boundary.",
