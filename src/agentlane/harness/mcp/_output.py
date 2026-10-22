@@ -5,15 +5,19 @@ from collections.abc import Collection
 from pathlib import PurePosixPath
 from uuid import uuid4
 
-from agentlane.harness.filesystem import FileWriter
 from agentlane.models import ToolFailure
 
 from .._storage_write import write_content
+from ..filesystem import FileWriter
 from ._redaction import redact_known_secrets, redact_secret_pairs
 from ._result import read_result, render_mcp_result, result_response
 from ._types import MCPResultPolicy
 
 _UNAVAILABLE = "\n\n[Full MCP result unavailable.]"
+"""Returned when the full result cannot be saved or its path cannot fit."""
+
+_FILE_LINE_CHARS = 4096
+"""Keep saved lines within the native read tool byte limit, including UTF-8."""
 
 
 async def render_mcp_result_with_storage(
@@ -47,8 +51,12 @@ async def render_mcp_result_with_storage(
             or redact_secret_pairs(read_path) != read_path
         ):
             raise ValueError("MCP output path contains credentials.")
+
         # read cannot return a single line larger than its byte limit.
-        file_text = "\n".join(text[i : i + 4096] for i in range(0, len(text), 4096))
+        file_text = "\n".join(
+            text[i : i + _FILE_LINE_CHARS]
+            for i in range(0, len(text), _FILE_LINE_CHARS)
+        )
         await write_content(writer, read_path, file_text.encode("utf-8"))
         notice = f"\n\n[Full MCP result: {json.dumps(read_path, ensure_ascii=False)}]"
     except Exception:

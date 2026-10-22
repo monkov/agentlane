@@ -144,6 +144,7 @@ async def call_tool(
         finally:
             connection.active_calls.discard(call)
             connection.secrets.update(operation.secrets)
+
         if result_writer is not None:
             if cancellation_token.is_cancelled:
                 return tool_failure(TOOL_CANCELLED, ToolErrorKind.CANCELLED.value)
