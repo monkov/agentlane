@@ -144,26 +144,37 @@ class RunContinuation(BaseModel):
 
     kind: Literal["external_tool_continuation"] = "external_tool_continuation"
     """Record type that distinguishes continuations from completed snapshots."""
+
     format_version: int = Field(default=1, ge=1, le=1)
     """Continuation schema version."""
+
     continuation_id: UUID = Field(default_factory=uuid4)
     """Generated ID used by the application to claim one resume."""
+
     checkpoint: AgentSnapshot
     """Pending state with its agent ID and last committed revision."""
+
     tool_call: ToolCall
     """Original provider call ID, function name, and raw arguments."""
+
     arguments: dict[str, JsonValue]
     """Validated arguments, including defaults generated at pause."""
+
     args_schema: dict[str, JsonValue]
     """Tool schema that must match on resume."""
+
     tool_call_counts: dict[str, NonNegativeInt]
     """Used calls, including the pending call."""
+
     tool_round_trips: NonNegativeInt
     """Used tool rounds, including the pending round."""
+
     max_turns: NonNegativeInt
     """Maximum model turns allowed across pause and resume."""
+
     tool_call_limits: dict[str, NonNegativeInt] | None
     """Saved per-tool call limits, or None if unset."""
+
     max_tool_round_trips: NonNegativeInt
     """Maximum tool rounds allowed across pause and resume."""
 
@@ -235,7 +246,7 @@ class RunContinuation(BaseModel):
 
     def to_json(self) -> dict[str, object]:
         """Return the validated continuation as a JSON-safe mapping."""
-        checked = self.from_json(self.model_dump())
+        checked = self.from_json(self)
 
         return cast(dict[str, object], checked.model_dump(mode="json"))
 
@@ -252,7 +263,7 @@ class RunContinuation(BaseModel):
 
     def to_run_state(self) -> RunState:
         """Restore an isolated run state from the checkpoint."""
-        return self.from_json(self.model_dump()).checkpoint.to_run_state()
+        return self.from_json(self).checkpoint.to_run_state()
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +272,7 @@ class ToolResultInput:
 
     continuation: RunContinuation
     """Pending run that receives the result."""
+
     result: str
     """Tool result text passed to the model."""
 
@@ -268,7 +280,7 @@ class ToolResultInput:
         """Validate the result and copy the continuation."""
         if not isinstance(cast(object, self.result), str):
             raise TypeError("External tool result must be a string.")
-        copied = RunContinuation.from_json(self.continuation.model_dump())
+        copied = RunContinuation.from_json(self.continuation)
         object.__setattr__(self, "continuation", copied)
 
 
@@ -277,7 +289,7 @@ class RunPaused(Exception):
 
     def __init__(self, continuation: RunContinuation) -> None:
         """Validate and copy the pending continuation."""
-        self.continuation = RunContinuation.from_json(continuation.model_dump())
+        self.continuation = RunContinuation.from_json(continuation)
         super().__init__(f"Run waits for external call {continuation.tool_call.id}.")
 
 

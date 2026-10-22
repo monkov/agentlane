@@ -62,6 +62,7 @@ def response(
         make_tool_call(tool_id=name + call_suffix, name=name, arguments=arguments)
         for name in names
     ]
+
     return make_assistant_response(None if calls else "done", tool_calls=calls or None)
 
 
@@ -114,13 +115,16 @@ async def execute(
     default_handoff: DefaultHandoff | None = None,
 ) -> RunResult:
     task = agent(model, runner, tools, default_handoff)
+
     if mode == "run":
         return await runner.run(task, run_state)
+
     stream = (
         runner.run_events(task, run_state)
         if mode == "events"
         else runner.run_stream(task, run_state)
     )
+
     try:
         return await stream.result()
     finally:
@@ -135,6 +139,7 @@ async def test_restart_retains_effects_calls_and_saved_budgets(mode: str) -> Non
     async def write(text: str) -> str:
         """Record a side effect."""
         effects.append(text)
+
         return "written"
 
     tools = Tools(
@@ -332,6 +337,7 @@ async def test_unsafe_boundary_never_publishes_pause(failure: str) -> None:
     async def write(text: str) -> str:
         """Record a side effect."""
         effects.append(text)
+
         return text
 
     runner = Runner(external_tool_agent_id=None if failure == "opt_in" else ROOT)
@@ -428,6 +434,7 @@ async def test_unsupported_provider_controls_reject_before_effects(
     async def write(text: str) -> str:
         """Record a side effect."""
         effects.append(text)
+
         return text
 
     model = ScriptedModel()

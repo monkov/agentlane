@@ -464,9 +464,7 @@ class RunLoop:
         # Shims must preserve the pending call. Keep its validated arguments:
         # running argument validation again could generate different defaults.
         current = AgentSnapshot.capture(agent_id=self.agent.id, run_state=self.state)
-        RunContinuation.from_json(
-            saved.model_copy(update={"checkpoint": current}).model_dump()
-        )
+        RunContinuation.from_json(saved.model_copy(update={"checkpoint": current}))
         self.state.history.append(
             _tool_result_message(
                 tool_call=saved.tool_call,
