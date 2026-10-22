@@ -22,7 +22,6 @@ from agentlane.runtime import (
 )
 
 from .._agent import Agent as RuntimeAgent
-from .._agent import PausedRunDelivery
 from .._cancellation import cancel_task_callback, cancellation_relay_task
 from .._events import RunEventStream
 from .._hooks import RunnerHooks
@@ -30,7 +29,7 @@ from .._json_file_state_store import JsonFileStateStore
 from .._lifecycle import AgentDescriptor
 from .._run import RunInput, RunResult, RunState, copy_run_state
 from .._runner import Runner
-from .._snapshot import AgentSnapshot
+from .._snapshot import AgentSnapshot, RunPaused
 from .._state_store import StateStore
 from .._stream import RunStream
 from .._stream_base import close_stream_callback
@@ -799,8 +798,8 @@ def _require_run_result(outcome: DeliveryOutcome) -> RunResult:
             f"`{outcome.status.value}`: {detail}"
         )
 
-    if isinstance(outcome.response_payload, PausedRunDelivery):
-        raise outcome.response_payload.pause
+    if isinstance(outcome.response_payload, RunPaused):
+        raise outcome.response_payload
 
     if not isinstance(outcome.response_payload, RunResult):
         raise TypeError(

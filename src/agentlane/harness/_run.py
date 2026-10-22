@@ -7,27 +7,12 @@ lifecycle and the runner.
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Literal, Self, TypedDict, cast, overload
-from uuid import UUID
+from typing import Any, TypedDict, cast, overload
 
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    JsonValue,
-    NonNegativeInt,
-    field_serializer,
-    field_validator,
-    model_validator,
-)
+from pydantic import BaseModel, JsonValue
 
 from agentlane.messaging import AgentId
-from agentlane.models import (
-    MessageDict,
-    ModelResponse,
-    PromptSpec,
-    RunStateView,
-    ToolCall,
-)
+from agentlane.models import MessageDict, ModelResponse, PromptSpec, RunStateView
 from agentlane.models.run import DefaultRunContext
 
 from ._serialization import serialize_value
@@ -129,163 +114,6 @@ class RunState:
 
     revision: int = 0
     """Committed state generation, incremented after each successful run."""
-
-
-class RunStatePayload(BaseModel):
-    """JSON representation of one canonical harness run state."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    instructions: str | None
-    history: list[dict[str, JsonValue]]
-    responses: list[ModelResponse]
-    shim_state: dict[str, JsonValue]
-    turn_count: NonNegativeInt
-
-    @field_validator("history")
-    @classmethod
-    def _require_message_roles(
-        cls,
-        history: list[dict[str, JsonValue]],
-    ) -> list[dict[str, JsonValue]]:
-        """Reject malformed canonical messages."""
-        for index, message in enumerate(history):
-            if not isinstance(message.get("role"), str):
-                raise ValueError(f"history[{index}].role must be a string")
-        return history
-
-
-class RunContinuation(BaseModel):
-    """Portable state for one unresolved external call, owned and claimed by the host.
-
-    This value grants no permission to resume. Treat nested data as read-only;
-    execution and codec boundaries validate and copy it before use.
-    """
-
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-
-    kind: Literal["external_tool_continuation"]
-    """Keep unfinished execution separate from completed snapshots."""
-    format_version: Literal[1]
-    """Version of this continuation format, not a state revision."""
-    agent_id: AgentId
-    """Logical owner whose registration must match on resume."""
-    continuation_id: UUID
-    """Runtime-generated identity for the host's durable claim."""
-    base_revision: NonNegativeInt
-    """Completed baseline revision, unchanged while the run waits."""
-    state: RunStatePayload
-    """Canonical working state with the unresolved assistant call."""
-    tool_call: ToolCall
-    """Original provider call ID, function name, and raw arguments."""
-    arguments: dict[str, JsonValue]
-    """Validated arguments for the host's external interaction."""
-    args_schema: dict[str, JsonValue]
-    """Saved function schema used to reject a changed tool contract."""
-    tool_call_counts: dict[str, NonNegativeInt]
-    """Used calls, including the pending call; stricter caps may be below usage."""
-    tool_round_trips: NonNegativeInt
-    """Used tool rounds, including the pending round."""
-    max_turns: NonNegativeInt
-    """Saved model-turn limit that resume must not increase."""
-    tool_call_limits: dict[str, NonNegativeInt] | None
-    """Saved per-tool limits, or no configured limits."""
-    max_tool_round_trips: NonNegativeInt
-    """Saved tool-round limit that resume must not increase."""
-
-    @field_validator("agent_id", mode="before")
-    @classmethod
-    def _decode_agent_id(cls, value: object) -> AgentId:
-        """Use the existing public address format without extra fields."""
-        if isinstance(value, AgentId):
-            return value
-        if not isinstance(value, dict):
-            raise ValueError("Continuation agent_id requires only type and key.")
-        identity = cast(dict[object, object], value)
-        if set(identity) != {"type", "key"}:
-            raise ValueError("Continuation agent_id requires only type and key.")
-
-        return AgentId.from_json(identity)
-
-    @field_serializer("agent_id")
-    def _encode_agent_id(self, agent_id: AgentId) -> dict[str, object]:
-        """Encode the stable owner with its public wire format."""
-        return agent_id.to_json()
-
-    @field_validator("continuation_id", mode="before")
-    @classmethod
-    def _decode_continuation_id(cls, value: object) -> UUID:
-        """Accept UUID objects and their JSON text representation."""
-        if isinstance(value, str):
-            return UUID(value)
-        if isinstance(value, UUID):
-            return value
-        raise ValueError("Continuation identity must be a UUID.")
-
-    @field_validator("state", mode="before")
-    @classmethod
-    def _check_state(cls, value: object) -> object:
-        """Keep snapshot v1 tolerant while continuation counters stay strict."""
-        raw = value.model_dump() if isinstance(value, RunStatePayload) else value
-        if not isinstance(raw, dict):
-            raise ValueError("Continuation state requires the canonical fields.")
-        state = cast(dict[object, object], raw)
-        if set(state) != set(RunStatePayload.model_fields):
-            raise ValueError("Continuation state requires the canonical fields.")
-        if type(state.get("turn_count")) is not int:
-            raise ValueError("Continuation turn_count must be an integer.")
-
-        return state
-
-    @field_validator("format_version", mode="before")
-    @classmethod
-    def _check_version(cls, value: object) -> object:
-        """Do not accept booleans as version one."""
-        if type(value) is not int:
-            raise ValueError("Continuation format_version must be an integer.")
-
-        return value
-
-    @model_validator(mode="after")
-    def _check_limits(self) -> Self:
-        """Require counters to include the waiting call and fit saved limits."""
-        call = self.tool_call
-        if not call.id or not call.function.name or call.type != "function":
-            raise ValueError("Continuation requires a named function and call ID.")
-        if not 1 <= self.state.turn_count <= self.max_turns:
-            raise ValueError("Continuation turn_count exceeds the saved limit.")
-        if not 1 <= self.tool_round_trips <= self.max_tool_round_trips:
-            raise ValueError("Continuation tool rounds exceed the saved limit.")
-        if self.tool_call_counts.get(call.function.name, 0) < 1:
-            raise ValueError("Continuation must count the pending tool call.")
-
-        return self
-
-
-@dataclass(frozen=True, slots=True)
-class ToolResultInput:
-    """Host-validated text for a claimed continuation, passed to a new Runner."""
-
-    continuation: RunContinuation
-    """Exact pending execution; this is not a new user message."""
-    result: str
-    """Model-readable result already validated by the host."""
-
-    def __post_init__(self) -> None:
-        """Detach and revalidate caller-owned data before execution."""
-        if not isinstance(cast(object, self.result), str):
-            raise TypeError("External tool result must be a string.")
-        copied = RunContinuation.model_validate(self.continuation.model_dump())
-        object.__setattr__(self, "continuation", copied)
-
-
-class RunPaused(Exception):
-    """Signal a durable waiting boundary after the run's resources close."""
-
-    def __init__(self, continuation: RunContinuation) -> None:
-        """Own a validated copy for the host to persist and claim."""
-        self.continuation = RunContinuation.model_validate(continuation.model_dump())
-        super().__init__(f"Run waits for external call {continuation.tool_call.id}.")
 
 
 type RunInput = str | list[RunHistoryItem] | RunState

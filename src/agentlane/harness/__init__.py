@@ -29,23 +29,20 @@ from ._lifecycle import AgentDescriptor, DefaultAgentTool, DefaultHandoff, Exter
 from ._run import (
     ACTIVE_SKILL_NAMES_STATE_KEY_SUFFIX,
     LiveRunStateView,
-    RunContinuation,
     RunHistoryItem,
     RunInput,
     RunInstructions,
-    RunPaused,
     RunResult,
     RunResultRecord,
     RunState,
     ShimState,
-    ToolResultInput,
 )
 from ._runner import Runner
 from ._snapshot import (
     AgentSnapshot,
-    continuation_from_json,
-    continuation_to_json,
-    restore_run_continuation,
+    RunContinuation,
+    RunPaused,
+    ToolResultInput,
 )
 from ._state_store import StateStore
 from ._stream import RunStream
@@ -125,8 +122,5 @@ __all__ = [
     "ToolFailure",
     "ToolOutcome",
     "ToolResultInput",
-    "continuation_from_json",
-    "continuation_to_json",
-    "restore_run_continuation",
     "tool_outcome",
 ]

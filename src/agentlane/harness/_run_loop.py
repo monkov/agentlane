@@ -79,18 +79,17 @@ from ._render import normalize_message_content, render_request_messages
 from ._run import (
     LiveRunStateView,
     RunHistoryItem,
-    RunPaused,
     RunResult,
     RunState,
-    ToolResultInput,
     copy_instructions,
     copy_run_state,
     copy_shim_state,
 )
 from ._snapshot import (
     AgentSnapshot,
-    capture_run_continuation,
-    validate_run_continuation,
+    RunContinuation,
+    RunPaused,
+    ToolResultInput,
 )
 from ._stream_base import BaseRunStream
 from ._task import Task
@@ -400,16 +399,22 @@ class RunLoop:
             )
 
         if self.external_input is None:
-            self._reject_unresolved_external_calls(self.runner_task.tools)
+            self._reject_unresolved_external_calls()
             return
 
         # A caller cannot use a result input to bypass the explicit root opt-in.
         saved = self.external_input.continuation
-        if not self._external_tools_enabled or saved.agent_id != self.agent.id:
+        if (
+            not self._external_tools_enabled
+            or saved.checkpoint.agent_id != self.agent.id
+        ):
             raise ValueError("External tool continuation belongs to a different root.")
-        validate_run_continuation(saved)
+        RunContinuation.from_json(saved.model_dump())
         current = AgentSnapshot.capture(agent_id=self.agent.id, run_state=self.state)
-        if current.revision != saved.base_revision or current.state != saved.state:
+        if (
+            current.revision != saved.checkpoint.revision
+            or current.state != saved.checkpoint.state
+        ):
             raise ValueError("External tool continuation does not match the run state.")
 
         self.max_turns = min(self.max_turns, saved.max_turns)
@@ -425,14 +430,9 @@ class RunLoop:
         if not self._external_tools_enabled:
             raise ValueError("External tools require explicit opt-in for this root.")
 
-    def _reject_unresolved_external_calls(self, tools: Tools | None) -> None:
+    def _reject_unresolved_external_calls(self) -> None:
         """Require typed input when history contains an unfinished external call."""
-        external_names = {
-            tool.name
-            for tool in (tools.normalized_tools if tools is not None else ())
-            if isinstance(tool, ExternalTool)
-        }
-        if not external_names and not self._external_tools_enabled:
+        if not self._external_tools_enabled:
             return
 
         # History alone omits the original execution budgets and admission guard.
@@ -440,8 +440,7 @@ class RunLoop:
         for message in render_request_messages(None, self.state.history):
             for raw_call in cast(list[object], message.get("tool_calls") or []):
                 call = ToolCall.model_validate(raw_call)
-                if self._external_tools_enabled or call.function.name in external_names:
-                    pending.add(call.id)
+                pending.add(call.id)
             if message.get("role") == MessageRole.TOOL.value:
                 pending.discard(str(message.get("tool_call_id")))
         if pending:
@@ -470,7 +469,9 @@ class RunLoop:
 
         # A history-rewrite shim must retain the exact unresolved call boundary.
         current = AgentSnapshot.capture(agent_id=self.agent.id, run_state=self.state)
-        validate_run_continuation(saved.model_copy(update={"state": current.state}))
+        RunContinuation.from_json(
+            saved.model_copy(update={"checkpoint": current}).model_dump()
+        )
         self.state.history.append(
             _tool_result_message(
                 tool_call=saved.tool_call,
@@ -479,65 +480,6 @@ class RunLoop:
             )
         )
         self._external_resume_applied = True
-
-    def _suspend_external_call(
-        self,
-        turn: PreparedTurn,
-        response: ModelResponse,
-        tool_calls: list[ToolCall],
-    ) -> None:
-        """Capture a sole external call before any sibling handler can execute."""
-        tools = turn.tools
-        if tools is None:
-            return None
-        external = {
-            tool.name: tool
-            for tool in tools.normalized_tools
-            if isinstance(tool, ExternalTool)
-        }
-        selected = next(
-            (call for call in tool_calls if call.function.name in external), None
-        )
-        if selected is None:
-            return None
-
-        # Only a quiescent single-call boundary can be restored without tasks.
-        if len(tool_calls) != 1:
-            raise _model_behavior_error(
-                "An external tool must be the only tool call in the response.",
-                raw_response=response,
-            )
-        if (
-            self._has_pending_results()
-            or self.agent_delegation.has_live_children
-            or tools.tool_choice == ToolChoice.NONE.value
-        ):
-            raise _model_behavior_error(
-                "An external tool requires a quiescent, permitted tool boundary.",
-                raw_response=response,
-            )
-        definition = external[selected.function.name or ""]
-        arguments = _parse_external_tool_args(selected, definition)
-
-        # Record the original assistant call and charge its budget exactly once.
-        self.state.history.append(response)
-        self.tool_round_trips += 1
-        self.tool_call_counts[definition.name] = (
-            self.tool_call_counts.get(definition.name, 0) + 1
-        )
-        continuation = capture_run_continuation(
-            agent_id=self.agent.id,
-            run_state=self.state,
-            tool_call=selected,
-            arguments=arguments,
-            args_schema=cast(dict[str, JsonValue], definition.schema),
-            tool_call_counts=self.tool_call_counts,
-            tool_round_trips=self.tool_round_trips,
-            max_turns=self.max_turns,
-            tool_call_limits=tools.tool_call_limits,
-            max_tool_round_trips=tools.max_tool_round_trips,
-        )
-        raise RunPaused(continuation)
 
     async def _prepare_turn(self) -> PreparedTurn:
         self.state.turn_count += 1
@@ -568,7 +510,7 @@ class RunLoop:
         if self.external_input is not None and not self._external_resume_applied:
             self._apply_external_result(turn.tools)
         elif self.external_input is None:
-            self._reject_unresolved_external_calls(turn.tools)
+            self._reject_unresolved_external_calls()
 
         # A restored continuation cannot expand its previous tool budgets.
         if turn.tools is not None and self.external_input is not None:
@@ -711,8 +653,6 @@ class RunLoop:
                 "External tools do not support automatic continuation or steering.",
                 raw_response=response,
             )
-
-        self._suspend_external_call(turn, response, tool_calls)
 
         # Resolve a handoff once, before committing an ordinary tool round.
         handoff: _HandoffTarget | None = None
@@ -1206,6 +1146,49 @@ class RunLoop:
                 raise _model_behavior_error(
                     "Runner received a tool call for an unknown tool.",
                     raw_response=response,
+                )
+
+        # The ordinary turn path has recorded history and charged this round.
+        for call in tool_calls:
+            definition = tool_definitions[call.function.name or ""]
+            if isinstance(definition, ExternalTool):
+                if (
+                    not self._external_tools_enabled
+                    or len(tool_calls) != 1
+                    or self._has_pending_results()
+                    or self.agent_delegation.has_live_children
+                ):
+                    raise _model_behavior_error(
+                        "An external tool requires a sole call at an idle root boundary.",
+                        raw_response=response,
+                    )
+                if (
+                    type(self.state.turn_count) is not int
+                    or type(self.state.revision) is not int
+                ):
+                    raise ValueError("Continuation counters must be integers.")
+                arguments = _parse_external_tool_args(call, definition)
+                self.tool_call_counts[definition.name] = (
+                    self.tool_call_counts.get(definition.name, 0) + 1
+                )
+                raise RunPaused(
+                    RunContinuation(
+                        checkpoint=AgentSnapshot.capture(
+                            agent_id=self.agent.id, run_state=self.state
+                        ),
+                        tool_call=call,
+                        arguments=arguments,
+                        args_schema=cast(dict[str, JsonValue], definition.schema),
+                        tool_call_counts=self.tool_call_counts,
+                        tool_round_trips=self.tool_round_trips,
+                        max_turns=self.max_turns,
+                        tool_call_limits=(
+                            dict(tools.tool_call_limits)
+                            if tools.tool_call_limits is not None
+                            else None
+                        ),
+                        max_tool_round_trips=tools.max_tool_round_trips,
+                    )
                 )
 
         # Execute a tool call batch in parallel and return aggregated result

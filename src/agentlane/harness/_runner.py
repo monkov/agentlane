@@ -11,8 +11,9 @@ from agentlane.runtime import CancellationToken
 from ._cancellation import cancel_task_callback
 from ._events import RunEventEmitter, RunEventStream, forward_tool_approval_events
 from ._hooks import RunnerHooks, coerce_runner_hooks
-from ._run import RunResult, RunState, ToolResultInput
+from ._run import RunResult, RunState
 from ._run_loop import AgentDelegationState, RunLoop, RunnerTask
+from ._snapshot import ToolResultInput
 from ._stream import RunStream
 from ._task import Task
 

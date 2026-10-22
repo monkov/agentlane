@@ -18,7 +18,6 @@ from agentlane.harness import (
     RunStream,
     Task,
     ToolResultInput,
-    restore_run_continuation,
 )
 from agentlane.harness._run import copy_run_state
 from agentlane.harness.agents import AgentBase, DefaultAgent
@@ -640,7 +639,7 @@ async def test_default_agent_pause_and_resume_preserve_commit_contract(
     snapshot = agent.snapshot()
     assert snapshot is not None and snapshot.revision == 7
     continuation = paused.value.continuation
-    assert continuation.base_revision == 7
+    assert continuation.checkpoint.revision == 7
 
     # The resumed execution commits once and adds no new user message.
     resumed_model = _SequenceModel([make_assistant_response("done")])
@@ -653,7 +652,7 @@ async def test_default_agent_pause_and_resume_preserve_commit_contract(
             external_input=ToolResultInput(continuation=continuation, result="Prague"),
         ),
     )
-    saved_state = restore_run_continuation(continuation)
+    saved_state = continuation.to_run_state()
     if mode == "run":
         result = await resumed.run(saved_state)
     else:

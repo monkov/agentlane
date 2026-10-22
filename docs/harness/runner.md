@@ -394,67 +394,55 @@ completed-turns count.
 ## External Tool Results
 
 Declare an `ExternalTool(name=..., description=..., args_model=...)` in the
-agent's tools and set `Runner(external_tool_agent_id=root_id)`. The application
-owns the question schema, choices, free-text input, answer validation, and UI.
-AgentLane generates the continuation ID and preserves the original tool-call ID.
+agent's tools and set `Runner(external_tool_agent_id=root_id)`. The host owns the
+question schema, choices, free text, validation, and UI. AgentLane generates the
+continuation ID and preserves the original tool-call ID.
 
-An external call raises `RunPaused` after model and shim cleanup. Its
-`continuation` holds working state, the pending call, and used execution limits.
-The pause does not commit completed state or advance its revision. A cleanup
-failure takes precedence over the pause. Completed calls still return
-`RunResult`; `RunInput` and all three run method signatures stay unchanged.
+An external call raises `RunPaused` after model and shim cleanup; a cleanup
+failure takes precedence. Its `continuation` holds the pending call, used limits,
+and an uncommitted `checkpoint: AgentSnapshot`. Save the whole continuation;
+never store its checkpoint as completed state. Pause does not advance revision.
+Completed calls return `RunResult`; `RunInput`, all three run method signatures,
+and completed snapshot v1 stay unchanged.
 
-Create a fresh `Runner` and `DefaultAgent` for each execution segment. An opted-in
-runner accepts one root invocation, including a failed invocation. Ordinary
-runners remain reusable. Use the same root ID, completed baseline, and registered
-tool contract when resuming. Pass the claimed answer in the runner constructor;
-pass restored state through the existing run method.
+Create a fresh `Runner` and `DefaultAgent` per execution segment, with the same
+root ID, completed baseline, and tool contract. An opted-in runner accepts one
+root invocation, including a failed invocation. Ordinary runners remain reusable.
 
-The example uses application-owned `descriptor`, `root_id`, `baseline`, `store`,
-and `publish_question`. The descriptor includes the external tool. Store methods
-below represent durable application operations, not AgentLane APIs.
+The host supplies `descriptor` (with the external tool), `root_id`, `baseline`,
+`publish_question`, and the durable `store` operations below.
 
 ```python
-from agentlane.harness import (
-    Runner, RunPaused, ToolResultInput, continuation_from_json,
-    continuation_to_json, restore_run_continuation,
-)
+from agentlane.harness import Runner, RunContinuation, RunPaused, ToolResultInput
 from agentlane.harness.agents import DefaultAgent
 
 async def execute(input, external_input=None):
-    runner = Runner(
-        external_tool_agent_id=root_id, external_input=external_input,
-    )
     agent = DefaultAgent(
-        descriptor=descriptor, agent_id=root_id, run_state=baseline, runner=runner,
+        descriptor=descriptor, agent_id=root_id, run_state=baseline,
+        runner=Runner(external_tool_agent_id=root_id, external_input=external_input),
     )
     try:
         return await agent.run(input)
     except RunPaused as paused:
         # Commit the waiting record before showing the question.
-        await store.save_waiting(continuation_to_json(paused.continuation))
+        await store.save_waiting(paused.continuation.to_json())
         await publish_question(paused.continuation)
 
 await execute("Help me choose a destination.")
-
 # Later, possibly in another process: authorize and atomically claim one answer.
 record, answer = await store.claim_answer(continuation_id)
-saved = continuation_from_json(record)
-result = await execute(
-    restore_run_continuation(saved), ToolResultInput(saved, answer),
-)
+saved = RunContinuation.from_json(record)
+result = await execute(saved.to_run_state(), ToolResultInput(saved, answer))
 ```
 
 For `run_stream()` and `run_events()`, catch `RunPaused` around both stream
 iteration and `stream.result()`, then close and drain the stream as described
-above. Both surfaces preserve the typed pause. Resume appends one tool result to
-the original call without adding a user message or replaying completed tools.
-Saved execution limits remain in force; the host can apply stricter limits.
+above. Resume adds one result to the original tool call, with no extra user
+message or replay of completed tools. Saved limits apply and can be reduced.
 
-The host must persist before publishing, authorize and atomically claim answers,
-and block ordinary input while a question is pending. The runner's local guard
-does not prevent replay across processes or guarantee exactly-once side effects.
-The host must reconcile a failed or uncertain resume before another attempt.
+The host must block ordinary input while waiting, prevent replay across processes,
+and reconcile failed or uncertain attempts before retrying. The local runner guard
+does not guarantee exactly-once side effects.
 
 Only a single external call at an idle root boundary is supported. Mixed tool
 batches, live provider sessions, asynchronous dispatch, steering, child

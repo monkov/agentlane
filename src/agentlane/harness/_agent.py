@@ -1,7 +1,6 @@
 """Default harness agent primitive."""
 
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -27,8 +26,9 @@ from ._lifecycle import (
     DefaultHandoffTool,
     HandoffTool,
 )
-from ._run import RunHistoryItem, RunInput, RunPaused, RunResult, RunState
+from ._run import RunHistoryItem, RunInput, RunResult, RunState
 from ._runner import Runner
+from ._snapshot import RunPaused
 from ._stream import RunStream
 from ._task import Task
 from ._tooling import merge_tools, resolve_tools
@@ -37,13 +37,6 @@ from .shims._manager import BoundShimManager
 
 if TYPE_CHECKING:
     from .tools._approvals import ToolApprovalEvent
-
-
-@dataclass(frozen=True, slots=True)
-class PausedRunDelivery:
-    """Carry a typed pause through local runtime delivery without an error."""
-
-    pause: RunPaused
 
 
 class Agent(Task):
@@ -285,7 +278,7 @@ class Agent(Task):
 
     async def _deliver_run_input(
         self, run_input: RunInput, *, cancellation_token: CancellationToken | None
-    ) -> RunResult | PausedRunDelivery:
+    ) -> RunResult | RunPaused:
         """Preserve the pause object across the runtime's error boundary."""
         try:
             return await self._enqueue_input(
@@ -294,4 +287,4 @@ class Agent(Task):
         except RunPaused as pause:
             # Runtime delivery converts other exceptions to text. A pause must
             # retain its continuation so the facade can raise the same signal.
-            return PausedRunDelivery(pause)
+            return pause

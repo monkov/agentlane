@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Self
+from typing import Self, cast
 
 import pytest
 from pydantic import BaseModel
@@ -13,14 +13,12 @@ from agentlane.harness import (
     Agent,
     AgentDescriptor,
     ExternalTool,
+    RunContinuation,
     Runner,
     RunPaused,
     RunResult,
     RunState,
     ToolResultInput,
-    continuation_from_json,
-    continuation_to_json,
-    restore_run_continuation,
 )
 from agentlane.harness._run_loop import AgentDelegationState
 from agentlane.messaging import AgentId
@@ -120,10 +118,7 @@ async def execute(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["run", "stream", "events"])
-@pytest.mark.parametrize("lower_cap", [False, True])
-async def test_restart_retains_prior_effects_and_original_call(
-    mode: str, lower_cap: bool
-) -> None:
+async def test_restart_retains_effects_calls_and_saved_budgets(mode: str) -> None:
     effects: list[str] = []
 
     async def write(text: str) -> str:
@@ -136,64 +131,38 @@ async def test_restart_retains_prior_effects_and_original_call(
         tool_call_limits={"write": 1, "external": 2},
         max_tool_round_trips=3,
     )
-    first = Runner(external_tool_agent_id=ROOT, max_turns=4 if lower_cap else 3)
+    first = Runner(external_tool_agent_id=ROOT, max_turns=3)
     model = ScriptedModel(response("write"), response("external"))
     with pytest.raises(RunPaused) as paused:
         await execute(first, model, state(), tools, mode)
-    saved = continuation_from_json(
-        json.loads(json.dumps(continuation_to_json(paused.value.continuation)))
+    saved = RunContinuation.from_json(
+        json.loads(json.dumps(paused.value.continuation.to_json()))
     )
     assert model.closed and len(model.calls) == 2
-    assert saved.state.turn_count == 2 and saved.base_revision == 0
+    assert saved.checkpoint.state.turn_count == 2 and saved.checkpoint.revision == 0
     assert saved.tool_call_counts == {"write": 1, "external": 1}
+    original = saved.to_json()
 
-    # A new process has only JSON and application configuration.
+    # A new execution can lower limits, but cannot expand the saved budget.
     resumed = Runner(
         external_tool_agent_id=ROOT,
         max_turns=999,
         external_input=ToolResultInput(continuation=saved, result="Prague"),
     )
-    next_model = ScriptedModel(
-        response("external", call_suffix="_again") if lower_cap else response()
-    )
+    next_model = ScriptedModel(response("external", call_suffix="_again"))
     expanded_tools = Tools(
         tools=[write, external()],
-        tool_call_limits={"write": 0 if lower_cap else 999, "external": 999},
+        tool_call_limits={"write": 0, "external": 999},
         max_tool_round_trips=999,
     )
-    if lower_cap:
-        # Lower limits constrain future calls, including after another pause.
-        with pytest.raises(RunPaused) as paused_again:
-            await execute(
-                resumed,
-                next_model,
-                restore_run_continuation(saved),
-                expanded_tools,
-                mode,
-            )
-        again = continuation_from_json(
-            continuation_to_json(paused_again.value.continuation)
-        )
-        assert again.tool_call_counts == {"write": 1, "external": 2}
-        assert again.tool_call_limits == {"write": 0, "external": 2}
-        last = Runner(
-            external_tool_agent_id=ROOT,
-            external_input=ToolResultInput(continuation=again, result="answer"),
-        )
-        final_model = ScriptedModel(response())
-        result = await execute(
-            last, final_model, restore_run_continuation(again), tools, mode
-        )
-        catalog = final_model.call_tools[0]
-        assert catalog is not None and not catalog.normalized_tools
-    else:
-        result = await execute(
-            resumed, next_model, restore_run_continuation(saved), expanded_tools, mode
-        )
-    assert result.final_output == "done" and result.turn_count == (
-        4 if lower_cap else 3
-    )
-    assert effects == ["needed"]
+    with pytest.raises(RunPaused) as paused_again:
+        await execute(resumed, next_model, saved.to_run_state(), expanded_tools, mode)
+    again = RunContinuation.from_json(paused_again.value.continuation.to_json())
+    assert again.tool_call_counts == {"write": 1, "external": 2}
+    assert again.tool_call_limits == {"write": 0, "external": 2}
+    assert again.max_turns == again.tool_round_trips == 3
+    assert again.max_tool_round_trips == 3
+    assert effects == ["needed"] and saved.to_json() == original
     assert [m for m in next_model.calls[0] if m["role"] == "user"] == [
         {"role": "user", "content": "start"}
     ]
@@ -202,43 +171,22 @@ async def test_restart_retains_prior_effects_and_original_call(
         for m in next_model.calls[0]
         if m["role"] == "tool"
     ] == [("write", "written"), ("external", "Prague")]
-    assert saved.state.turn_count == 2
     catalog = next_model.call_tools[0]
     assert catalog is not None
     assert [tool.name for tool in catalog.normalized_tools] == ["external"]
     assert catalog.max_tool_round_trips == 3
-    assert catalog.tool_call_limits == {"write": 0 if lower_cap else 1, "external": 2}
+    assert catalog.tool_call_limits == {"write": 0, "external": 2}
 
-
-@pytest.mark.asyncio
-async def test_repeated_pause_cannot_expand_saved_budgets() -> None:
-    saved = None
-    for turn in (1, 2):
-        runner = Runner(
-            external_tool_agent_id=ROOT,
-            max_turns=2 if saved is None else 999,
-            external_input=(
-                ToolResultInput(continuation=saved, result="answer") if saved else None
-            ),
-        )
-        with pytest.raises(RunPaused) as paused:
-            await execute(
-                runner,
-                ScriptedModel(response("external", call_suffix=str(turn))),
-                restore_run_continuation(saved) if saved else state(),
-            )
-        saved = paused.value.continuation
-        assert saved.tool_round_trips == turn and saved.max_turns == 2
-        assert saved.tool_call_counts == {"external": turn}
-    assert saved is not None
-    model = ScriptedModel()
-    runner = Runner(
+    # A second answer cannot grant another model turn after the saved limit.
+    last = Runner(
         external_tool_agent_id=ROOT,
-        external_input=ToolResultInput(continuation=saved, result="answer"),
+        max_turns=999,
+        external_input=ToolResultInput(continuation=again, result="answer"),
     )
+    final_model = ScriptedModel()
     with pytest.raises(RuntimeError, match="turn limit"):
-        await execute(runner, model, restore_run_continuation(saved))
-    assert model.calls == []
+        await execute(last, final_model, again.to_run_state(), expanded_tools, mode)
+    assert final_model.calls == []
 
 
 @pytest.mark.asyncio
@@ -248,7 +196,7 @@ async def test_invalid_resume_rejects_before_model_io(invalid: str) -> None:
     with pytest.raises(RunPaused) as paused:
         await execute(runner, ScriptedModel(response("external")), state())
     saved = paused.value.continuation.model_copy(deep=True)
-    resumed_state = restore_run_continuation(saved)
+    resumed_state = saved.to_run_state()
     tools = Tools(tools=[external()])
     if invalid == "state":
         resumed_state.history.append("unexpected user turn")
@@ -261,11 +209,11 @@ async def test_invalid_resume_rejects_before_model_io(invalid: str) -> None:
             ]
         )
     elif invalid == "identity":
-        saved = saved.model_copy(
-            update={"agent_id": AgentId.from_values("test", "other")}
-        )
+        saved.checkpoint.agent_id = AgentId.from_values("test", "other")
     else:
-        saved.state.history.append({"role": "user", "content": "wrong boundary"})
+        saved.checkpoint.state.history.append(
+            {"role": "user", "content": "wrong boundary"}
+        )
     model = ScriptedModel()
     with pytest.raises(ValueError):
         resumed = Runner(
@@ -328,6 +276,11 @@ async def test_cancelled_input_does_not_consume_root_but_execution_does(
         ("max_turns", False),
         ("tool_round_trips", -1),
         ("format_version", True),
+        ("continuation_id", None),
+        ("checkpoint.revision", -1),
+        ("checkpoint.schema_version", True),
+        ("checkpoint.state.turn_count", True),
+        ("checkpoint.state.shim_state", {"bad": float("nan")}),
         ("unexpected", 1),
     ],
 )
@@ -341,21 +294,26 @@ async def test_codec_rejects_invalid_counters_and_owns_copies(
             state(),
         )
     saved = paused.value.continuation
-    data = continuation_to_json(saved)
+    data = saved.to_json()
     result_input = ToolResultInput(continuation=saved, result="answer")
     runner = Runner(external_tool_agent_id=ROOT, external_input=result_input)
 
     # Neither caller can change the payload already owned by the runner.
     saved.arguments["text"] = "first mutation"
     result_input.continuation.arguments["text"] = "second mutation"
-    restored = continuation_from_json(data)
-    result = await execute(
-        runner, ScriptedModel(response()), restore_run_continuation(restored)
-    )
+    restored = RunContinuation.from_json(data)
+    result = await execute(runner, ScriptedModel(response()), restored.to_run_state())
     assert result.final_output == "done"
-    data[field] = value
+    target = data
+    *parents, name = field.split(".")
+    for parent in parents:
+        target = cast(dict[str, object], target[parent])
+    if value is None:
+        target.pop(name)
+    else:
+        target[name] = value
     with pytest.raises(ValueError):
-        continuation_from_json(data)
+        RunContinuation.from_json(data)
 
 
 @pytest.mark.asyncio

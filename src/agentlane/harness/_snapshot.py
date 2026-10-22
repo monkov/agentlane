@@ -1,26 +1,52 @@
-"""Versioned codecs for completed state and pending external calls."""
+"""Versioned JSON values for committed state and pending external calls."""
 
-from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Self, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import (
     AwareDatetime,
     BaseModel,
     ConfigDict,
+    Field,
     JsonValue,
     NonNegativeInt,
     field_serializer,
     field_validator,
+    model_validator,
 )
 
 from agentlane.messaging import AgentId
-from agentlane.models import ToolCall, render_instruction_text
+from agentlane.models import ModelResponse, ToolCall, render_instruction_text
 
 from ._render import render_request_messages
-from ._run import RunContinuation, RunHistoryItem, RunState, RunStatePayload, ShimState
+from ._run import RunHistoryItem, RunState, ShimState
 from ._serialization import serialize_value
+
+
+class _RunStatePayload(BaseModel):
+    """JSON representation of one committed harness run state."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    instructions: str | None
+    history: list[dict[str, JsonValue]]
+    responses: list[ModelResponse]
+    shim_state: dict[str, JsonValue]
+    turn_count: NonNegativeInt
+
+    @field_validator("history")
+    @classmethod
+    def _require_message_roles(
+        cls,
+        history: list[dict[str, JsonValue]],
+    ) -> list[dict[str, JsonValue]]:
+        """Reject malformed canonical messages."""
+        for index, message in enumerate(history):
+            if not isinstance(message.get("role"), str):
+                raise ValueError(f"history[{index}].role must be a string")
+        return history
 
 
 class AgentSnapshot(BaseModel):
@@ -40,7 +66,7 @@ class AgentSnapshot(BaseModel):
     created_at: AwareDatetime
     """UTC timestamp for when the snapshot value was created."""
 
-    state: RunStatePayload
+    state: _RunStatePayload
     """Canonical model-ready state captured for the agent."""
 
     @field_validator("agent_id", mode="before")
@@ -65,17 +91,37 @@ class AgentSnapshot(BaseModel):
     @classmethod
     def capture(cls, *, agent_id: AgentId, run_state: RunState) -> Self:
         """Capture one live run state as a canonical snapshot value."""
+        instructions = run_state.instructions
+        if instructions is not None and not isinstance(instructions, str):
+            instructions = render_instruction_text(instructions)
+
         return cls(
             schema_version=1,
             agent_id=agent_id,
             revision=run_state.revision,
             created_at=datetime.now(UTC),
-            state=_capture_run_state(run_state),
+            state=_RunStatePayload.model_validate(
+                {
+                    "instructions": instructions,
+                    "history": render_request_messages(None, run_state.history),
+                    "responses": run_state.responses,
+                    "shim_state": run_state.shim_state,
+                    "turn_count": run_state.turn_count,
+                }
+            ),
         )
 
     def to_run_state(self) -> RunState:
         """Return an isolated live run state restored from this snapshot."""
-        return _restore_run_state(self.state, self.revision)
+        state = self.state.model_copy(deep=True)
+        return RunState(
+            instructions=state.instructions,
+            history=cast(list[RunHistoryItem], state.history),
+            responses=state.responses,
+            shim_state=ShimState(context=state.shim_state),
+            turn_count=state.turn_count,
+            revision=self.revision,
+        )
 
     def to_json(self) -> dict[str, object]:
         """Return the canonical JSON-safe snapshot mapping."""
@@ -87,109 +133,170 @@ class AgentSnapshot(BaseModel):
         return cls.model_validate(data)
 
 
-def _capture_run_state(run_state: RunState) -> RunStatePayload:
-    """Use the existing canonical conversion for both persistence formats."""
-    instructions = run_state.instructions
-    if instructions is not None and not isinstance(instructions, str):
-        instructions = render_instruction_text(instructions)
+class RunContinuation(BaseModel):
+    """Uncommitted working state for one external call, stored and claimed by the host.
 
-    return RunStatePayload.model_validate(
-        {
-            "instructions": instructions,
-            "history": render_request_messages(None, run_state.history),
-            "responses": run_state.responses,
-            "shim_state": run_state.shim_state,
-            "turn_count": run_state.turn_count,
-        }
-    )
+    The checkpoint reuses the snapshot codec; it must not enter the completed
+    snapshot store. This envelope grants no permission to resume. Treat nested
+    data as read-only; transport and execution boundaries validate and copy it.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    kind: Literal["external_tool_continuation"] = "external_tool_continuation"
+    """Keep pending execution separate from completed snapshots."""
+    format_version: Literal[1] = 1
+    """Version of this continuation format, not a state revision."""
+    continuation_id: UUID = Field(default_factory=uuid4)
+    """Runtime-generated identity for the host's durable claim."""
+    checkpoint: AgentSnapshot
+    """Uncommitted state, owner, and completed baseline revision."""
+    tool_call: ToolCall
+    """Original provider call ID, function name, and raw arguments."""
+    arguments: dict[str, JsonValue]
+    """Validated arguments for the host's external interaction."""
+    args_schema: dict[str, JsonValue]
+    """Saved function schema used to reject a changed tool contract."""
+    tool_call_counts: dict[str, NonNegativeInt]
+    """Used calls, including the pending call; stricter caps may be below usage."""
+    tool_round_trips: NonNegativeInt
+    """Used tool rounds, including the pending round."""
+    max_turns: NonNegativeInt
+    """Saved model-turn limit that resume must not increase."""
+    tool_call_limits: dict[str, NonNegativeInt] | None
+    """Saved per-tool limits, or no configured limits."""
+    max_tool_round_trips: NonNegativeInt
+    """Saved tool-round limit that resume must not increase."""
+
+    @field_validator("continuation_id", mode="before")
+    @classmethod
+    def _decode_continuation_id(cls, value: object) -> UUID:
+        """Accept UUID objects and their JSON text representation."""
+        if isinstance(value, str):
+            return UUID(value)
+        if isinstance(value, UUID):
+            return value
+        raise ValueError("Continuation identity must be a UUID.")
+
+    @field_validator("checkpoint", mode="before")
+    @classmethod
+    def _check_checkpoint(cls, value: object) -> object:
+        """Validate strict pending state without changing the snapshot v1 contract."""
+        raw = value.model_dump() if isinstance(value, AgentSnapshot) else value
+        if not isinstance(raw, dict) or set(cast(dict[object, object], raw)) != set(
+            AgentSnapshot.model_fields
+        ):
+            raise ValueError("Continuation checkpoint requires canonical fields.")
+        checkpoint = cast(dict[str, object], raw)
+        state = checkpoint["state"]
+        identity = checkpoint["agent_id"]
+        if not isinstance(state, dict) or set(cast(dict[object, object], state)) != set(
+            _RunStatePayload.model_fields
+        ):
+            raise ValueError("Continuation state requires canonical fields.")
+        if not isinstance(identity, dict) or set(
+            cast(dict[object, object], identity)
+        ) != {"type", "key"}:
+            raise ValueError("Continuation agent_id requires only type and key.")
+        counters = (
+            checkpoint["schema_version"],
+            checkpoint["revision"],
+            cast(dict[str, object], state)["turn_count"],
+        )
+        if any(type(counter) is not int for counter in counters):
+            raise ValueError("Continuation checkpoint counters must be integers.")
+
+        return checkpoint
+
+    @field_validator("tool_call", mode="before")
+    @classmethod
+    def _copy_tool_call(cls, value: object) -> object:
+        """Detach the pending call from the caller's nested model."""
+        return value.model_dump() if isinstance(value, ToolCall) else value
+
+    @field_validator("format_version", mode="before")
+    @classmethod
+    def _check_version(cls, value: object) -> object:
+        """Do not accept booleans as version one."""
+        if type(value) is not int:
+            raise ValueError("Continuation format_version must be an integer.")
+
+        return value
+
+    @model_validator(mode="after")
+    def _check_pending_run(self) -> Self:
+        """Require consistent pending history, counters, schema, and JSON values."""
+        call = self.tool_call
+        if not call.id or not call.function.name or call.type != "function":
+            raise ValueError("Continuation requires a named function and call ID.")
+        if not 1 <= self.checkpoint.state.turn_count <= self.max_turns:
+            raise ValueError("Continuation turn_count exceeds the saved limit.")
+        if not 1 <= self.tool_round_trips <= self.max_tool_round_trips:
+            raise ValueError("Continuation tool rounds exceed the saved limit.")
+        if self.tool_call_counts.get(call.function.name, 0) < 1:
+            raise ValueError("Continuation must count the pending tool call.")
+        _validate_pending_call(self)
+
+        # Check raw JSON payloads before Pydantic can encode nonfinite values as null.
+        # Snapshot timestamps use the existing snapshot codec instead.
+        for value in (self.checkpoint.state, call, self.arguments, self.args_schema):
+            serialize_value(value)
+
+        return self
+
+    def to_json(self) -> dict[str, object]:
+        """Return checked pending state for the host to store and claim."""
+        checked = self.from_json(self.model_dump())
+
+        return cast(dict[str, object], checked.model_dump(mode="json"))
+
+    @classmethod
+    def from_json(cls, data: object) -> Self:
+        """Decode and copy pending state, rejecting inconsistent nested values."""
+        raw = data.model_dump() if isinstance(data, cls) else data
+        if not isinstance(raw, dict) or set(cast(dict[object, object], raw)) != set(
+            cls.model_fields
+        ):
+            raise ValueError("Continuation requires the canonical envelope fields.")
+
+        return cls.model_validate(raw)
+
+    def to_run_state(self) -> RunState:
+        """Restore a private working copy for the existing run entry points."""
+        return self.from_json(self.model_dump()).checkpoint.to_run_state()
 
 
-def _restore_run_state(state: RunStatePayload, revision: int) -> RunState:
-    """Restore a private working copy without marking the state completed."""
-    copied = state.model_copy(deep=True)
+@dataclass(frozen=True, slots=True)
+class ToolResultInput:
+    """Host-validated text for a claimed continuation, passed to a new Runner."""
 
-    return RunState(
-        instructions=copied.instructions,
-        history=cast(list[RunHistoryItem], copied.history),
-        responses=copied.responses,
-        shim_state=ShimState(context=copied.shim_state),
-        turn_count=copied.turn_count,
-        revision=revision,
-    )
+    continuation: RunContinuation
+    """Exact pending execution; this is not a new user message."""
+    result: str
+    """Model-readable result already validated by the host."""
 
-
-def capture_run_continuation(
-    *,
-    agent_id: AgentId,
-    run_state: RunState,
-    tool_call: ToolCall,
-    arguments: dict[str, JsonValue],
-    args_schema: dict[str, JsonValue],
-    tool_call_counts: Mapping[str, int],
-    tool_round_trips: int,
-    max_turns: int,
-    tool_call_limits: Mapping[str, int] | None,
-    max_tool_round_trips: int,
-) -> RunContinuation:
-    """Capture one waiting call without committing state or granting a claim."""
-    if type(run_state.turn_count) is not int:
-        raise ValueError("Continuation turn_count must be an integer.")
-    continuation = RunContinuation(
-        kind="external_tool_continuation",
-        format_version=1,
-        agent_id=agent_id,
-        continuation_id=uuid4(),
-        base_revision=run_state.revision,
-        state=_capture_run_state(run_state),
-        tool_call=tool_call,
-        arguments=arguments,
-        args_schema=args_schema,
-        tool_call_counts=dict(tool_call_counts),
-        tool_round_trips=tool_round_trips,
-        max_turns=max_turns,
-        tool_call_limits=(
-            dict(tool_call_limits) if tool_call_limits is not None else None
-        ),
-        max_tool_round_trips=max_tool_round_trips,
-    )
-
-    return continuation_from_json(continuation.model_dump())
+    def __post_init__(self) -> None:
+        """Detach and revalidate caller-owned data before execution."""
+        if not isinstance(cast(object, self.result), str):
+            raise TypeError("External tool result must be a string.")
+        copied = RunContinuation.from_json(self.continuation.model_dump())
+        object.__setattr__(self, "continuation", copied)
 
 
-def continuation_to_json(continuation: RunContinuation) -> dict[str, object]:
-    """Encode checked pending state; the host must store and claim it."""
-    validated = continuation_from_json(continuation.model_dump())
+class RunPaused(Exception):
+    """Signal a durable waiting boundary after the run's resources close."""
 
-    return cast(dict[str, object], validated.model_dump(mode="json"))
-
-
-def continuation_from_json(data: object) -> RunContinuation:
-    """Decode pending state and reject inconsistent history or saved limits."""
-    raw = data.model_dump() if isinstance(data, RunContinuation) else data
-    continuation = RunContinuation.model_validate(raw)
-    _validate_pending_call(continuation)
-    serialize_value(continuation)
-
-    return continuation
-
-
-def validate_run_continuation(continuation: RunContinuation) -> None:
-    """Recheck mutable nested data before the runner opens resources."""
-    continuation_from_json(continuation.model_dump())
-
-
-def restore_run_continuation(continuation: RunContinuation) -> RunState:
-    """Copy pending state for the existing run entry points on a new Runner."""
-    checked = continuation_from_json(continuation.model_dump())
-
-    return _restore_run_state(checked.state, checked.base_revision)
+    def __init__(self, continuation: RunContinuation) -> None:
+        """Own a validated copy for the host to persist and claim."""
+        self.continuation = RunContinuation.from_json(continuation.model_dump())
+        super().__init__(f"Run waits for external call {continuation.tool_call.id}.")
 
 
 def _validate_pending_call(continuation: RunContinuation) -> None:
     """Require resolved previous rounds and exactly the original final call."""
     pending: dict[str, ToolCall] = {}
     seen: set[str] = set()
-    history = continuation.state.history
+    history = continuation.checkpoint.state.history
 
     # A missing earlier result must not be skipped by a later external answer.
     for message in history:
