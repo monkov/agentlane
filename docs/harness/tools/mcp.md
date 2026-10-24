@@ -164,9 +164,8 @@ servers retry transient discovery failures on later turns. AgentLane does
 not automatically repeat a tool call after a transport failure or timeout.
 
 To change output limits, set `MCPServer.result_policy=MCPResultPolicy(...)`.
-Without result storage, the defaults are 32 content blocks and 51,200
-characters. Servers repeat structured content in text blocks for clients
-that cannot read it. If a successful result has structured content, the model
+The inline defaults are 32 content blocks and 51,200 characters. Servers repeat
+structured content in text blocks for clients that cannot read it. If a successful result has structured content, the model
 gets the structured content and the other content blocks, but not the text
 blocks. A failed result
 keeps its text blocks, because they contain the failure details. Set
@@ -193,16 +192,24 @@ Import `HarnessToolsShim` and `read_tool` from `agentlane.harness.tools`, and
 pass `shims` to `AgentDescriptor`. Use a directory that the filesystem can
 resolve. See [File I/O interfaces](../filesystem.md) for mounts and backends.
 
-With storage enabled, AgentLane uses its existing serialization and redaction
-for all text blocks, structured content, and embedded resource text. If the
-text fits `max_text_chars`, it returns inline. Otherwise, the same text is
-saved to one UUID-named `.txt` file.
+With storage enabled, AgentLane sanitizes the selected content once with its
+existing renderer. Saved content includes all supported text blocks and embedded
+resource text. `include_structured_content` controls structured content in both
+the saved file and the inline response. Image, audio, and blob bodies remain
+metadata.
+
+`max_text_chars` and `max_content_blocks` limit the inline response. If the
+selected content fits both limits, the result returns inline. Otherwise,
+AgentLane saves one UUID-named `.txt` file. The file retains text beyond both
+inline limits. Inline responses keep the structured-content and resource
+metadata behavior described above.
 
 A saved result returns a preview and `[Full MCP result: "<path>"]`. The model
 calls `read(path="<path>", offset=1, limit=200)` and follows the reader's next
 offset. Text lines wrap at 4,096 characters so large strings remain readable.
 The file contains serialized MCP text with JSON escaping; line wrapping means
-it is not a stable JSON format. Image, audio, and blob bodies remain metadata.
+it is not a stable JSON format. “Full” means the complete supported text
+representation selected by policy.
 
 The response, including its path, stays within `max_text_chars`. Storage uses
 the existing write and cancellation handling. If a write fails or the path
@@ -210,9 +217,14 @@ cannot fit, the preview reports `[Full MCP result unavailable.]`. The provider
 call is not repeated. The host owns write deadlines and file retention.
 
 Configure both storage options together. With neither option set, the existing
-response and processing limits are unchanged. With storage enabled, all text
-is processed before budgeting; `max_content_blocks` and
-`include_structured_content` do not apply.
+response and processing limits are unchanged.
+
+Storage preparation has separate processing limits: depth 32, 4,096 nodes,
+8 Mi characters processed, and 8 Mi serialized characters. These internal
+limits bound renderer work. They are independent of the inline limits and
+application storage quotas. If a processing limit is reached, AgentLane writes
+no file and returns a bounded preview with
+`[MCP processing limit exceeded; full result not saved.]`.
 
 ## Troubleshooting
 

@@ -22,10 +22,16 @@ async def _prepare(
     limit: int = 512,
     directory: str = "results",
     secrets: tuple[str, ...] = (),
+    include_structured_content: bool = False,
+    max_content_blocks: int = 32,
 ) -> str | ToolFailure:
     return await render_mcp_result_with_storage(
         result,
-        policy=MCPResultPolicy(max_text_chars=limit, include_structured_content=False),
+        policy=MCPResultPolicy(
+            max_text_chars=limit,
+            include_structured_content=include_structured_content,
+            max_content_blocks=max_content_blocks,
+        ),
         secrets=secrets,
         writer=writer,
         directory=directory if writer is not None else None,
@@ -50,9 +56,7 @@ async def test_exact_fit_is_inline_and_overflow_saves_the_same_text(
 ) -> None:
     filesystem = LocalFileSystem(tmp_path)
     result = types.CallToolResult(content=[types.TextContent(text="x" * size)])
-    inline = render_mcp_result(
-        result, MCPResultPolicy(max_text_chars=size + 1000), complete=True
-    )
+    inline = render_mcp_result(result, MCPResultPolicy(max_text_chars=size + 1000))
     assert await _prepare(result, filesystem, limit=size + 1000) == inline
     assert await _prepare(result, filesystem, limit=len(inline)) == inline
     assert not tuple(tmp_path.iterdir())
@@ -68,7 +72,7 @@ async def test_exact_fit_is_inline_and_overflow_saves_the_same_text(
 
 
 @pytest.mark.asyncio
-async def test_small_result_keeps_text_and_binary_metadata_without_saving(
+async def test_small_result_keeps_existing_resource_and_media_preview(
     tmp_path: Path,
 ) -> None:
     filesystem = LocalFileSystem(tmp_path)
@@ -86,9 +90,9 @@ async def test_small_result_keeps_text_and_binary_metadata_without_saving(
     )
     inline = await _prepare(result, filesystem, limit=1000)
     assert not tuple(tmp_path.iterdir())
-    assert all(
-        text in inline for text in ("Transcript", "Embedded text", "meeting-123")
-    )
+    assert "Transcript" in inline
+    assert "Embedded text" not in inline and "meeting-123" not in inline
+    assert "textCharsOmitted" in inline
     assert "image/png" in inline and "binary-canary" not in inline
 
 
@@ -121,7 +125,9 @@ async def test_redaction_runs_before_budgeting_and_preserves_full_text(
         ],
         structured_content={"authorization": secret, "extra": "structured-only"},
     )
-    response = await _prepare(result, filesystem, secrets=(secret,))
+    response = await _prepare(
+        result, filesystem, secrets=(secret,), include_structured_content=True
+    )
     (path,) = tmp_path.rglob("*.txt")
     saved = "".join(path.read_text().splitlines())
     assert "credential-canary" not in saved + response
@@ -210,49 +216,141 @@ async def test_credential_paths_are_rejected_before_writing(
 
 
 @pytest.mark.asyncio
-async def test_more_than_eight_mib_is_saved_with_readable_lines(tmp_path: Path) -> None:
-    transcript = "x" * (8 * 1024 * 1024) + "final words beyond eight MiB"
+@pytest.mark.parametrize("storage", [False, True])
+@pytest.mark.parametrize("include_structured_content", [False, True])
+@pytest.mark.parametrize("size", [10, 10_000])
+async def test_structured_content_policy_applies_with_and_without_storage(
+    tmp_path: Path, storage: bool, include_structured_content: bool, size: int
+) -> None:
+    result = types.CallToolResult(
+        content=[types.TextContent(text="transcript " + "x" * size)],
+        structured_content={"details": "structured-only " + "y" * size},
+    )
     response = await _prepare(
-        types.CallToolResult(content=[types.TextContent(text=transcript)]),
+        result,
+        LocalFileSystem(tmp_path) if storage else None,
+        include_structured_content=include_structured_content,
+    )
+    paths = tuple(tmp_path.rglob("*.txt"))
+    if storage and size > 512:
+        (path,) = paths
+        payload = json.loads("".join(path.read_text().splitlines()))
+        assert payload["content"][0]["text"] == "transcript " + "x" * size
+        assert "[Full MCP result: " in response
+    else:
+        assert not paths
+        payload = json.loads(response)
+        if include_structured_content:
+            assert not payload["content"]
+    assert ("structuredContent" in payload) is include_structured_content
+    assert ("structured-only" in str(payload)) is include_structured_content
+    assert len(response) <= 512
+
+
+@pytest.mark.asyncio
+async def test_block_preview_limit_saves_all_supported_blocks(tmp_path: Path) -> None:
+    content = [{"type": "text", "text": f"block-{index}"} for index in range(40)]
+    response = await _prepare(
+        {"content": content},
+        LocalFileSystem(tmp_path),
+        limit=10_000,
+        max_content_blocks=1,
+    )
+    (path,) = tmp_path.rglob("*.txt")
+    payload = json.loads("".join(path.read_text().splitlines()))
+    assert payload["content"] == content
+    assert "block-0" in response and "block-1" not in response
+    assert "[Full MCP result: " in response
+    assert len(response) <= 10_000
+
+
+@pytest.mark.asyncio
+async def test_saved_text_resource_keeps_its_body_and_readable_lines(
+    tmp_path: Path,
+) -> None:
+    transcript = "x" * 100_000 + "final words"
+    response = await _prepare(
+        types.CallToolResult(
+            content=[
+                types.EmbeddedResource(
+                    resource=types.TextResourceContents(
+                        uri="resource://notes/1", text=transcript
+                    )
+                )
+            ]
+        ),
         LocalFileSystem(tmp_path),
     )
     (path,) = tmp_path.rglob("*.txt")
     lines = path.read_text().splitlines()
-    assert transcript in "".join(lines)
+    payload = json.loads("".join(lines))
+    assert payload["content"][0]["resource"]["text"] == transcript
     assert all(len(line) <= 4096 for line in lines)
     assert len(response) <= 512
-    assert response.endswith(
-        f"\n\n[Full MCP result: {json.dumps(str(path.relative_to(tmp_path)))}]"
-    )
+    assert "[Full MCP result: " in response
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["nodes", "depth", "blocks", "integer"])
-async def test_preview_processing_limits_do_not_drop_saved_text(
+@pytest.mark.parametrize("kind", ["nodes", "depth", "input", "output"])
+async def test_processing_limits_do_not_write_partial_results(
     kind: str, tmp_path: Path
 ) -> None:
-    content: list[object] = []
-    structured: object = None
     if kind == "nodes":
-        structured = [f"node-{index}" for index in range(5000)]
-        final_value = "node-4999"
+        value: object = [f"node-{index}" for index in range(5000)]
     elif kind == "depth":
-        final_value = "deep text"
-        structured = final_value
+        value = "deep-value"
         for _ in range(40):
-            structured = {"nested": structured}
-    elif kind == "blocks":
-        content = [{"type": "text", "text": f"block-{index}"} for index in range(4100)]
-        final_value = "block-4099"
+            value = {"nested": value}
+    elif kind == "input":
+        value = "x" * (8 * 1024 * 1024 + 1)
     else:
-        structured = 1 << 5000
-        final_value = str(structured)
+        value = "\x00" * (2 * 1024 * 1024)
 
     response = await _prepare(
-        {"content": content, "structuredContent": structured},
+        {
+            "content": [{"type": "text", "text": "credential-canary"}],
+            "structuredContent": value,
+        },
         LocalFileSystem(tmp_path),
-        limit=128,
+        include_structured_content=True,
+        secrets=("credential-canary",),
+    )
+    assert not tuple(tmp_path.iterdir())
+    assert "processing limit" in response.lower()
+    assert "[Full MCP result: " not in response
+    assert "credential-canary" not in response
+    assert len(response) <= 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secret", ["type", "text"])
+async def test_redacted_block_keys_remain_readable(tmp_path: Path, secret: str) -> None:
+    response = await _prepare(
+        {"content": [{"type": "text", "text": "hello"}]},
+        LocalFileSystem(tmp_path),
+        secrets=(secret,),
+    )
+    assert "hello" in response
+    assert "[redacted]" in response
+    assert not tuple(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_saved_text_can_use_more_than_the_inline_content_share(
+    tmp_path: Path,
+) -> None:
+    transcript = "x" * (5 * 1024 * 1024)
+    response = await _prepare(
+        {
+            "content": [{"type": "text", "text": transcript}],
+            "structuredContent": {"id": "meeting"},
+        },
+        LocalFileSystem(tmp_path),
+        include_structured_content=True,
     )
     (path,) = tmp_path.rglob("*.txt")
-    assert final_value in "".join(path.read_text().splitlines())
+    payload = json.loads("".join(path.read_text().splitlines()))
+    assert payload["content"][0]["text"] == transcript
+    assert payload["structuredContent"] == {"id": "meeting"}
+    assert "[Full MCP result: " in response
     assert len(response) <= 512

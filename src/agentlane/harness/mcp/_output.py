@@ -10,7 +10,12 @@ from agentlane.models import ToolFailure
 from .._storage_write import write_content
 from ..filesystem import FileWriter
 from ._redaction import redact_known_secrets, redact_secret_pairs
-from ._result import read_result, render_mcp_result, result_response
+from ._result import (
+    read_result,
+    render_mcp_result,
+    render_mcp_storage_text,
+    result_response,
+)
 from ._types import MCPResultPolicy
 
 _UNAVAILABLE = "\n\n[Full MCP result unavailable.]"
@@ -31,18 +36,27 @@ async def render_mcp_result_with_storage(
     if writer is None:
         return render_mcp_result(result, policy, secrets=secrets)
 
-    is_error = read_result(result).is_error
+    source = read_result(result)
+    is_error = source.is_error
     try:
-        text = render_mcp_result(result, policy, secrets=secrets, complete=True)
+        text, preview, complete = render_mcp_storage_text(
+            result, policy, secrets=secrets
+        )
     except Exception:
         return result_response(
             "[MCP result unavailable: could not prepare readable text.]", is_error
         )
 
-    if len(text) <= policy.max_text_chars:
-        return result_response(text, is_error)
+    if (
+        complete
+        and max(len(text), len(preview)) <= policy.max_text_chars
+        and len(source.content) <= policy.max_content_blocks
+    ):
+        return result_response(preview, is_error)
 
     try:
+        if not complete:
+            raise ValueError("MCP result exceeds processing limit.")
         if not directory:
             raise ValueError("MCP result storage requires a directory.")
         read_path = str(PurePosixPath(directory) / f"{uuid4()}.txt")
@@ -60,14 +74,18 @@ async def render_mcp_result_with_storage(
         await write_content(writer, read_path, file_text.encode("utf-8"))
         notice = f"\n\n[Full MCP result: {json.dumps(read_path, ensure_ascii=False)}]"
     except Exception:
-        notice = _UNAVAILABLE
+        notice = (
+            _UNAVAILABLE
+            if complete
+            else "\n\n[MCP processing limit exceeded; full result not saved.]"
+        )
 
     # Truncate the preview, never the file path the model needs to read it.
     if len(notice) > policy.max_text_chars:
         notice = _UNAVAILABLE
     available = policy.max_text_chars - len(notice)
-    preview = text[:available]
-    if len(text) > available and available:
-        preview = preview[:-1] + "…"
+    preview_text = preview[:available]
+    if len(preview) > available and available:
+        preview_text = preview_text[:-1] + "…"
 
-    return result_response(preview + notice, is_error)
+    return result_response(preview_text + notice, is_error)

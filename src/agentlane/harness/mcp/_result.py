@@ -1,9 +1,8 @@
 """Convert MCP tool results to bounded, safe model-facing text."""
 
 import json
-import sys
 from collections.abc import Collection, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from typing import Protocol, cast
 
@@ -18,6 +17,12 @@ from ._types import MCPResultPolicy
 _OMISSION = "[omitted: exceeds processing limit]"
 _MAX_NODES = 4096
 _MAX_DEPTH = 32
+_MAX_INPUT_CHARS = 8 * 1024 * 1024
+"""Bound text processed when preparing a saved result."""
+
+_MAX_SERIALIZED_CHARS = 8 * 1024 * 1024
+"""Bound the serialized representation prepared for storage."""
+
 _NOT_JSON = object()
 """Returned by `_parse_json` when text is not valid JSON."""
 
@@ -40,16 +45,50 @@ def render_mcp_result(
     policy: MCPResultPolicy,
     *,
     secrets: Collection[str] = (),
-    complete: bool = False,
 ) -> str | ToolFailure:
-    """Render sanitized text; complete=True disables preview limits."""
+    """Render sanitized text within the model response limits."""
     source = read_result(result)
-    renderer = _Renderer(policy.max_text_chars, secrets, complete=complete)
+    text = _render(source, policy, _Renderer(policy.max_text_chars, secrets))
 
+    return result_response(text, source.is_error)
+
+
+def render_mcp_storage_text(
+    result: object, policy: MCPResultPolicy, *, secrets: Collection[str]
+) -> tuple[str, str, bool]:
+    """Return saved text, preview text and whether processing was complete."""
+    source = read_result(result)
+    renderer = _Renderer(_MAX_INPUT_CHARS, secrets, resource_text=True)
+    storage_policy = replace(
+        policy,
+        max_text_chars=_MAX_SERIALIZED_CHARS,
+        max_content_blocks=len(source.content) or 1,
+    )
+    text = _render(source, storage_policy, renderer, saved=True)
+
+    # Select the preview from sanitized content without parsing text or
+    # redacting it again. Keep the inline structured and resource conventions.
+    safe_source = read_result(json.loads(text))
+    preview = _render(
+        safe_source,
+        replace(policy, max_text_chars=_MAX_SERIALIZED_CHARS),
+        _Renderer(_MAX_SERIALIZED_CHARS, (), sanitized=True),
+    )
+
+    return text, preview, not renderer.truncated
+
+
+def _render(
+    source: _Result,
+    policy: MCPResultPolicy,
+    renderer: "_Renderer",
+    *,
+    saved: bool = False,
+) -> str:
     # An empty structured result carries no data, so it does not replace text.
     structured = (
         source.structured_content
-        if complete or (policy.include_structured_content and source.structured_content)
+        if policy.include_structured_content and source.structured_content
         else None
     )
     reserved: dict[str, object] = {
@@ -61,10 +100,10 @@ def render_mcp_result(
     if structured is not None:
         reserved["structuredContent"] = {"omitted": True}
 
-    available = (
-        sys.maxsize if complete else policy.max_text_chars - len(_json(reserved))
+    available = policy.max_text_chars - len(_json(reserved))
+    content_budget = 2 + (
+        int(available * 0.6) if structured is not None and not saved else available
     )
-    content_budget = 2 + (int(available * 0.6) if structured is not None else available)
 
     # Servers repeat structured content in text blocks for clients that cannot
     # read it, so skip that copy. Keep the text blocks of a failure, because
@@ -72,8 +111,8 @@ def render_mcp_result(
     content, kept = renderer.content(
         source.content,
         max(2, content_budget),
-        len(source.content) if complete else policy.max_content_blocks,
-        skip_text=not complete and structured is not None and not source.is_error,
+        policy.max_content_blocks,
+        skip_text=not saved and structured is not None and not source.is_error,
     )
     fields = [f'"content":{content}', f'"isError":{_json(source.is_error)}']
     if structured is not None:
@@ -88,7 +127,7 @@ def render_mcp_result(
         fields.extend(['"truncated":true', f'"omittedBlocks":{omitted_blocks}'])
 
     text = "{" + ",".join(fields) + "}"
-    return result_response(text, source.is_error)
+    return text
 
 
 def result_response(text: str, is_error: bool) -> str | ToolFailure:
@@ -160,8 +199,11 @@ def _field(value: Mapping[str, object] | BaseModel, name: str) -> object:
 
 
 def _block_type(block: object) -> object | None:
-    if isinstance(block, (Mapping, BaseModel)):
-        return _field(cast(Mapping[str, object] | BaseModel, block), "type")
+    if isinstance(block, Mapping):
+        return cast(Mapping[str, object], block).get("type")
+
+    if isinstance(block, BaseModel):
+        return getattr(block, "type", None)
 
     return None
 
@@ -170,11 +212,17 @@ class _Renderer:
     """Own the input and output budgets for one result, including JSON text."""
 
     def __init__(
-        self, output_limit: int, secrets: Collection[str], *, complete: bool = False
+        self,
+        output_limit: int,
+        secrets: Collection[str],
+        *,
+        resource_text: bool = False,
+        sanitized: bool = False,
     ) -> None:
-        self.complete = complete
-        self.characters = sys.maxsize if complete else max(64 * 1024, output_limit)
-        self.nodes = sys.maxsize if complete else _MAX_NODES
+        self.resource_text = resource_text
+        self.sanitized = sanitized
+        self.characters = max(64 * 1024, output_limit)
+        self.nodes = _MAX_NODES
         self.secrets = tuple(secrets)
         self.truncated = False
 
@@ -234,7 +282,7 @@ class _Renderer:
             return self._omission(available)
 
         self.nodes -= 1
-        if not self.complete and depth >= _MAX_DEPTH:
+        if depth >= _MAX_DEPTH:
             return self._omission(available)
 
         if isinstance(value, (Mapping, BaseModel)):
@@ -247,10 +295,13 @@ class _Renderer:
                 charged=charged,
             )
 
-        if self.complete and isinstance(value, AnyUrl):
+        if self.resource_text and isinstance(value, AnyUrl):
             value = str(value)
 
         if isinstance(value, str):
+            if self.sanitized:
+                return self._text(value, available)
+
             # Charge JSON text before each parse. A string parsed from charged
             # JSON text is part of that text, so do not charge it again.
             is_json = value.lstrip().startswith(("{", "["))
@@ -299,9 +350,9 @@ class _Renderer:
         block: bool,
         charged: bool,
     ) -> str | None:
-        kind = _field(value, "type") if block else None
+        kind = _block_type(value) if block else None
         fields = _fields(value)
-        if block:
+        if block and not self.sanitized:
             fields = self._content_fields(fields, text=kind == "text")
 
         parts: list[str] = []
@@ -323,14 +374,18 @@ class _Renderer:
             output_name = alias
             omitted_body = (
                 resource
-                and (alias == "blob" or (alias == "text" and not self.complete))
+                and (alias == "blob" or (alias == "text" and not self.resource_text))
             ) or (block and kind in {"image", "audio"} and alias == "data")
             if omitted_body:
                 output_name = (
                     "textCharsOmitted" if alias == "text" else "encodedBytesOmitted"
                 )
 
-            safe_key = cast(str, redact_known_secrets(output_name, self.secrets))
+            safe_key = (
+                output_name
+                if self.sanitized
+                else cast(str, redact_known_secrets(output_name, self.secrets))
+            )
             if len(safe_key) > available - used - 5:
                 self.truncated = True
                 continue
@@ -341,7 +396,7 @@ class _Renderer:
                 self.truncated = True
                 break
 
-            if is_secret_key(alias):
+            if not self.sanitized and is_secret_key(alias):
                 encoded = self._text("[redacted]", remaining)
             else:
                 item = _field(value, name)
@@ -364,7 +419,11 @@ class _Renderer:
             parts.append(part)
             kept.add(alias)
 
-        if block and ("type" not in kept or (kind == "text" and "text" not in kept)):
+        if (
+            block
+            and not self.sanitized
+            and ("type" not in kept or (kind == "text" and "text" not in kept))
+        ):
             self.truncated = True
             return None
 

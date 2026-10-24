@@ -187,7 +187,9 @@ async def test_runner_reads_complete_saved_output_through_native_pagination(
     assert list((tmp_path / "tool-results").iterdir()) == [local_path]
     assert read_path == f"/saved/tool-results/{local_path.name}"
     notice = f"\n\n[Full MCP result: {json.dumps(read_path)}]"
-    assert saved.startswith(preview.removesuffix(notice).removesuffix("…"))
+    inline = json.loads(preview.removesuffix(notice))
+    assert inline["content"] == []
+    assert inline["structuredContent"] == restored["structuredContent"]
 
 
 @pytest.mark.asyncio
