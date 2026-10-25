@@ -48,7 +48,7 @@ def render_mcp_result(
 ) -> str | ToolFailure:
     """Render sanitized text within the model response limits."""
     source = read_result(result)
-    text = _render(source, policy, _Renderer(policy.max_text_chars, secrets))
+    text = _json(_render(source, policy, _Renderer(policy.max_text_chars, secrets)))
 
     return result_response(text, source.is_error)
 
@@ -64,18 +64,19 @@ def render_mcp_storage_text(
         max_text_chars=_MAX_SERIALIZED_CHARS,
         max_content_blocks=len(source.content) or 1,
     )
-    text = _render(source, storage_policy, renderer, saved=True)
+    safe = _render(source, storage_policy, renderer, saved=True)
+    text = _json(safe)
 
     # Select the preview from sanitized content without parsing text or
     # redacting it again. Keep the inline structured and resource conventions.
-    safe_source = read_result(json.loads(text))
+    safe_source = read_result(safe)
     preview = _render(
         safe_source,
         replace(policy, max_text_chars=_MAX_SERIALIZED_CHARS),
         _Renderer(_MAX_SERIALIZED_CHARS, (), sanitized=True),
     )
 
-    return text, preview, not renderer.truncated
+    return text, _json(preview), not renderer.truncated
 
 
 def _render(
@@ -84,7 +85,7 @@ def _render(
     renderer: "_Renderer",
     *,
     saved: bool = False,
-) -> str:
+) -> dict[str, object]:
     # An empty structured result carries no data, so it does not replace text.
     structured = (
         source.structured_content
@@ -108,26 +109,27 @@ def _render(
     # Servers repeat structured content in text blocks for clients that cannot
     # read it, so skip that copy. Keep the text blocks of a failure, because
     # the server puts the failure details there.
-    content, kept = renderer.content(
+    content, content_size, kept = renderer.content(
         source.content,
         max(2, content_budget),
         policy.max_content_blocks,
         skip_text=not saved and structured is not None and not source.is_error,
     )
-    fields = [f'"content":{content}', f'"isError":{_json(source.is_error)}']
+    fields: dict[str, object] = {"content": content, "isError": source.is_error}
     if structured is not None:
         structured_budget = len(_json(reserved["structuredContent"])) + (
-            available - (len(content) - 2)
+            available - (content_size - 2)
         )
-        preview = renderer.value(structured, structured_budget) or '{"omitted":true}'
-        fields.append(f'"structuredContent":{preview}')
+        preview = renderer.value(structured, structured_budget)
+        fields["structuredContent"] = (
+            preview[0] if preview is not None else {"omitted": True}
+        )
 
     omitted_blocks = len(source.content) - kept
     if renderer.truncated or omitted_blocks:
-        fields.extend(['"truncated":true', f'"omittedBlocks":{omitted_blocks}'])
+        fields.update(truncated=True, omittedBlocks=omitted_blocks)
 
-    text = "{" + ",".join(fields) + "}"
-    return text
+    return fields
 
 
 def result_response(text: str, is_error: bool) -> str | ToolFailure:
@@ -234,11 +236,11 @@ class _Renderer:
         self.characters -= len(value)
         return True
 
-    def _omission(self, available: int) -> str | None:
+    def _omission(self, available: int) -> tuple[str, int] | None:
         self.truncated = True
         return self._text(_OMISSION, available)
 
-    def _text(self, value: str, available: int) -> str | None:
+    def _text(self, value: str, available: int) -> tuple[str, int] | None:
         if available < 2:
             self.truncated = True
             return None
@@ -248,11 +250,11 @@ class _Renderer:
         prefix = value[:available]
         encoded = _json(prefix)
         if len(prefix) == len(value) and len(encoded) <= available:
-            return encoded
+            return value, len(encoded)
 
         self.truncated = True
         if available < 3:
-            return '""'
+            return "", 2
 
         low, high = 0, len(prefix)
         while low < high:
@@ -262,7 +264,8 @@ class _Renderer:
             else:
                 high = midpoint - 1
 
-        return _json(prefix[:low] + "…")
+        text = prefix[:low] + "…"
+        return text, len(_json(text))
 
     def value(
         self,
@@ -273,7 +276,7 @@ class _Renderer:
         resource: bool = False,
         block: bool = False,
         charged: bool = False,
-    ) -> str | None:
+    ) -> tuple[object, int] | None:
         if available < 2:
             self.truncated = True
             return None
@@ -312,10 +315,10 @@ class _Renderer:
             # Text that does not parse is text, so redact it as text.
             parsed = _parse_json(value) if is_json else _NOT_JSON
             if parsed is not _NOT_JSON:
-                safe = (
-                    self.value(parsed, max(2, available - 2), depth + 1, charged=True)
-                    or "null"
+                rendered = self.value(
+                    parsed, max(2, available - 2), depth + 1, charged=True
                 )
+                safe = _json(rendered[0]) if rendered is not None else "null"
             else:
                 text = cast(str, redact_known_secrets(value, self.secrets))
                 safe = redact_secret_pairs(text)
@@ -336,7 +339,7 @@ class _Renderer:
 
             encoded = _json(value)
             if len(encoded) <= available:
-                return encoded
+                return value, len(encoded)
 
         return self._omission(available)
 
@@ -349,13 +352,13 @@ class _Renderer:
         resource: bool,
         block: bool,
         charged: bool,
-    ) -> str | None:
+    ) -> tuple[dict[str, object], int] | None:
         kind = _block_type(value) if block else None
         fields = _fields(value)
         if block and not self.sanitized:
             fields = self._content_fields(fields, text=kind == "text")
 
-        parts: list[str] = []
+        parts: dict[str, object] = {}
         used = 2
         kept: set[str] = set()
         for name, alias in fields:
@@ -386,6 +389,10 @@ class _Renderer:
                 if self.sanitized
                 else cast(str, redact_known_secrets(output_name, self.secrets))
             )
+            if safe_key in parts:
+                self.truncated = True
+                continue
+
             if len(safe_key) > available - used - 5:
                 self.truncated = True
                 continue
@@ -414,9 +421,9 @@ class _Renderer:
             if encoded is None:
                 break
 
-            part = encoded_key + ":" + encoded
-            used += len(part) + bool(parts)
-            parts.append(part)
+            item, size = encoded
+            used += len(encoded_key) + 1 + size + bool(parts)
+            parts[safe_key] = item
             kept.add(alias)
 
         if (
@@ -427,7 +434,7 @@ class _Renderer:
             self.truncated = True
             return None
 
-        return "{" + ",".join(parts) + "}"
+        return parts, used
 
     @staticmethod
     def _content_fields(
@@ -443,8 +450,8 @@ class _Renderer:
 
     def _array(
         self, value: Sequence[object], available: int, depth: int, *, charged: bool
-    ) -> str:
-        parts: list[str] = []
+    ) -> tuple[list[object], int]:
+        parts: list[object] = []
         used = 2
         for index in range(len(value)):
             remaining = available - used - bool(parts)
@@ -456,10 +463,11 @@ class _Renderer:
             if encoded is None:
                 break
 
-            used += len(encoded) + bool(parts)
-            parts.append(encoded)
+            item, size = encoded
+            used += size + bool(parts)
+            parts.append(item)
 
-        return "[" + ",".join(parts) + "]"
+        return parts, used
 
     def content(
         self,
@@ -468,8 +476,8 @@ class _Renderer:
         max_blocks: int,
         *,
         skip_text: bool,
-    ) -> tuple[str, int]:
-        parts: list[str] = []
+    ) -> tuple[list[object], int, int]:
+        parts: list[object] = []
         used = 2
         kept = 0
         for index in range(min(len(value), max_blocks)):
@@ -489,8 +497,9 @@ class _Renderer:
             if encoded is None:
                 break
 
-            used += len(encoded) + bool(parts)
-            parts.append(encoded)
+            item, size = encoded
+            used += size + bool(parts)
+            parts.append(item)
             kept += 1
 
-        return "[" + ",".join(parts) + "]", kept
+        return parts, used, kept

@@ -354,3 +354,21 @@ async def test_saved_text_can_use_more_than_the_inline_content_share(
     assert payload["structuredContent"] == {"id": "meeting"}
     assert "[Full MCP result: " in response
     assert len(response) <= 512
+
+
+@pytest.mark.asyncio
+async def test_redacted_key_collision_does_not_save_incomplete_content(
+    tmp_path: Path,
+) -> None:
+    response = await _prepare(
+        {
+            "content": [],
+            "structuredContent": {"first-key": "first", "second-key": "second"},
+        },
+        LocalFileSystem(tmp_path),
+        include_structured_content=True,
+        secrets=("first-key", "second-key"),
+    )
+    assert not tuple(tmp_path.iterdir())
+    assert "full result not saved" in response
+    assert "[Full MCP result: " not in response
