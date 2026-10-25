@@ -330,3 +330,65 @@ async def test_redacted_key_collision_does_not_save_incomplete_content(
     assert not tuple(tmp_path.iterdir())
     assert "full result not saved" in response
     assert "[Full MCP result: " not in response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage", [False, True])
+@pytest.mark.parametrize(
+    "kind", ["depth", "duplicate", "escaped-duplicate", "nested-duplicate"]
+)
+async def test_unverifiable_json_is_omitted_without_saving(
+    tmp_path: Path, storage: bool, kind: str
+) -> None:
+    if kind == "depth":
+        text = "[" * 15_000 + r'{"pass\u0077ord":"credential-canary"}' + "]" * 15_000
+    else:
+        key = r"rec\u006frd" if kind == "escaped-duplicate" else "record"
+        text = (
+            '{"record":"first-canary","' + key + '":"second-canary",'
+            '"padding":"' + "x" * 1000 + '"}'
+        )
+        if kind == "nested-duplicate":
+            text = json.dumps({"nested": text})
+    limit = 64 * 1024 if kind == "depth" and not storage else 512
+    result = types.CallToolResult(content=[types.TextContent(text=text)])
+    response = (
+        await _prepare(result, LocalFileSystem(tmp_path))
+        if storage
+        else render_mcp_result(result, MCPResultPolicy(max_text_chars=limit))
+    )
+    assert len(response) <= limit
+    assert "canary" not in response
+    assert "omitted" in response
+    assert not tuple(tmp_path.iterdir())
+    assert "[Full MCP result:" not in response
+    if storage:
+        assert "full result not saved" in response
+    else:
+        assert json.loads(response)["truncated"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage", [False, True])
+async def test_oversized_text_is_rejected_before_stripping(
+    tmp_path: Path, storage: bool
+) -> None:
+    stripped: list[int] = []
+
+    class ObservedText(str):
+        def lstrip(self, chars: str | None = None) -> str:
+            stripped.append(len(self))
+            return super().lstrip(chars)
+
+    size = 8 * 1024 * 1024 if storage else 64 * 1024
+    text = ObservedText(" " + "x" * size)
+    result = {"content": [{"type": "text", "text": text}]}
+    response = (
+        await _prepare(result, LocalFileSystem(tmp_path))
+        if storage
+        else render_mcp_result(result, MCPResultPolicy(max_text_chars=512))
+    )
+    assert stripped == []
+    assert "omitted" in response
+    assert len(response) <= 512
+    assert not tuple(tmp_path.iterdir())

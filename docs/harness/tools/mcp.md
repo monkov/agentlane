@@ -173,6 +173,10 @@ keeps its text blocks, because they contain the failure details. Set
 content blocks.
 Image, audio, and resource bodies are returned as metadata.
 
+JSON text that exceeds parser limits or contains duplicate keys is omitted
+and marks the result as incomplete. This applies with and without storage;
+an incomplete result is not saved as a full result.
+
 ## Store full results
 
 Pass an existing `FileWriter` and a directory to `MCPToolsShim`. Give the

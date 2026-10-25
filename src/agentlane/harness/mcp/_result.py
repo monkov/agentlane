@@ -163,9 +163,19 @@ def read_result(value: object) -> _Result:
 
 def _parse_json(text: str) -> object:
     try:
-        return json.loads(text)
-    except (ValueError, RecursionError):
+        return json.loads(text, object_pairs_hook=_json_object)
+    except json.JSONDecodeError:
         return _NOT_JSON
+
+
+def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON key.")
+        result[key] = value
+
+    return result
 
 
 def _sequence(value: object) -> Sequence[object]:
@@ -305,15 +315,21 @@ class _Renderer:
             if self.sanitized:
                 return self._text(value, available)
 
-            # Charge JSON text before each parse. A string parsed from charged
-            # JSON text is part of that text, so do not charge it again.
+            # Charge raw text before inspecting it, and nested JSON again before
+            # parsing. Plain strings from parsed JSON were already charged.
+            if not charged and not self._take_text(value):
+                return self._omission(available)
             is_json = value.lstrip().startswith(("{", "["))
-            if (is_json or not charged) and not self._take_text(value):
+            if is_json and charged and not self._take_text(value):
                 return self._omission(available)
 
             # Render JSON text as structure, so credential keys are redacted.
             # Text that does not parse is text, so redact it as text.
-            parsed = _parse_json(value) if is_json else _NOT_JSON
+            try:
+                parsed = _parse_json(value) if is_json else _NOT_JSON
+            except (ValueError, RecursionError):
+                # Parsing limits and duplicate keys must not expose unchecked text.
+                return self._omission(available)
             if parsed is not _NOT_JSON:
                 rendered = self.value(
                     parsed, max(2, available - 2), depth + 1, charged=True
