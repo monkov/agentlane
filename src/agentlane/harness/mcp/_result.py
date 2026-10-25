@@ -420,7 +420,7 @@ class _Renderer:
                 break
 
             if not self.sanitized and is_secret_key(alias):
-                encoded = self._text("[redacted]", remaining)
+                encoded: tuple[object, int] | None = self._text("[redacted]", remaining)
             else:
                 item = _field(value, name)
                 if omitted_body:
