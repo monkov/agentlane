@@ -6,7 +6,7 @@ import re
 import sys
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -25,6 +25,7 @@ from agentlane.harness.mcp import (
     MCPToolsShim,
 )
 from agentlane.harness.mcp._connection import MCPConnection
+from agentlane.harness.mcp._result import render_mcp_result
 from agentlane.harness.tools import read_tool
 from agentlane.models import ToolCall, ToolFailure, Tools
 from agentlane.runtime import CancellationToken
@@ -460,3 +461,78 @@ async def test_cancellation_after_mcp_response_does_not_start_storage(
     assert not backend.write_started.is_set()
     assert backend.writes == []
     assert backend.files == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [10, 100_000])
+async def test_no_writer_keeps_existing_response(output_peer: _Peer, size: int) -> None:
+    output_peer.result = types.CallToolResult(
+        content=[types.TextContent(text="x" * size)]
+    )
+    server = _server()
+    async with MCPClientManager() as manager:
+        lease = await acquire_lease(
+            manager, server, MCPAuthorizationContext(key="inline")
+        )
+        try:
+            (tool,) = await lease.tools()
+            response = await tool.run(
+                tool.args_type().model_validate({}), CancellationToken()
+            )
+        finally:
+            await lease.release()
+
+    assert response == render_mcp_result(output_peer.result, server.result_policy)
+    assert output_peer.calls == [(_TOOL_NAME, {})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage", [False, True])
+@pytest.mark.parametrize("include_structured_content", [False, True])
+@pytest.mark.parametrize("size", [10, 10_000])
+async def test_structured_content_policy_applies_with_and_without_storage(
+    output_peer: _Peer,
+    tmp_path: Path,
+    storage: bool,
+    include_structured_content: bool,
+    size: int,
+) -> None:
+    output_peer.result = types.CallToolResult(
+        content=[types.TextContent(text="transcript " + "x" * size)],
+        structured_content={"details": "structured-only " + "y" * size},
+    )
+    server = replace(
+        _server(),
+        result_policy=MCPResultPolicy(
+            max_text_chars=512, include_structured_content=include_structured_content
+        ),
+    )
+    async with MCPClientManager() as manager:
+        lease = await acquire_lease(
+            manager, server, MCPAuthorizationContext(key="policy")
+        )
+        try:
+            (tool,) = await lease.tools(
+                result_writer=LocalFileSystem(tmp_path) if storage else None,
+                result_directory="results" if storage else None,
+            )
+            response = await tool.run(
+                tool.args_type().model_validate({}), CancellationToken()
+            )
+        finally:
+            await lease.release()
+
+    paths = tuple(tmp_path.rglob("*.txt"))
+    if storage and size > 512:
+        (path,) = paths
+        payload = json.loads("".join(path.read_text().splitlines()))
+        assert payload["content"][0]["text"] == "transcript " + "x" * size
+        assert "[Full MCP result: " in response
+    else:
+        assert not paths
+        payload = json.loads(response)
+        if include_structured_content:
+            assert not payload["content"]
+    assert ("structuredContent" in payload) is include_structured_content
+    assert ("structured-only" in str(payload)) is include_structured_content
+    assert len(response) <= 512

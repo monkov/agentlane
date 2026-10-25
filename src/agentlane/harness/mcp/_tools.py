@@ -31,6 +31,7 @@ from ._errors import (
 )
 from ._operation import mcp_operation
 from ._output import render_mcp_result_with_storage
+from ._result import render_mcp_result
 from ._sdk import exception_kind
 from ._types import MCPRemoteTool, MCPServer
 
@@ -145,22 +146,26 @@ async def call_tool(
             connection.active_calls.discard(call)
             connection.secrets.update(operation.secrets)
 
-        if result_writer is not None:
+        if result_writer is None:
+            rendered = render_mcp_result(
+                result,
+                connection.server.result_policy,
+                secrets=connection.secrets,
+            )
+        else:
             if is_closed() or connection.closing:
                 return tool_failure(
                     CONNECTION_UNAVAILABLE, MCP_TRANSPORT_TOOL_ERROR_KIND
                 )
 
-        preparation = render_mcp_result_with_storage(
-            result,
-            policy=connection.server.result_policy,
-            secrets=connection.secrets,
-            writer=result_writer,
-            directory=result_directory,
-        )
-        if result_writer is None:
-            rendered = await preparation
-        else:
+            preparation = render_mcp_result_with_storage(
+                result,
+                policy=connection.server.result_policy,
+                secrets=connection.secrets,
+                writer=result_writer,
+                directory=result_directory,
+            )
+
             # Shutdown must cancel and drain storage after the provider call
             # ends, before the connection owner releases its resources.
             preparing = asyncio.create_task(preparation)

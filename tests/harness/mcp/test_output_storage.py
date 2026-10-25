@@ -17,7 +17,7 @@ from agentlane.models import ToolFailure
 
 async def _prepare(
     result: object,
-    writer: FileWriter | None,
+    writer: FileWriter,
     *,
     limit: int = 512,
     directory: str = "results",
@@ -34,18 +34,8 @@ async def _prepare(
         ),
         secrets=secrets,
         writer=writer,
-        directory=directory if writer is not None else None,
+        directory=directory,
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("size", [10, 100_000])
-async def test_no_writer_keeps_existing_response(size: int) -> None:
-    result = types.CallToolResult(content=[types.TextContent(text="x" * size)])
-    expected = render_mcp_result(
-        result, MCPResultPolicy(max_text_chars=512, include_structured_content=False)
-    )
-    assert await _prepare(result, None) == expected
 
 
 @pytest.mark.asyncio
@@ -213,38 +203,6 @@ async def test_credential_paths_are_rejected_before_writing(
     assert not tuple(tmp_path.iterdir())
     assert response.endswith("\n\n[Full MCP result unavailable.]")
     assert directory not in response
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("storage", [False, True])
-@pytest.mark.parametrize("include_structured_content", [False, True])
-@pytest.mark.parametrize("size", [10, 10_000])
-async def test_structured_content_policy_applies_with_and_without_storage(
-    tmp_path: Path, storage: bool, include_structured_content: bool, size: int
-) -> None:
-    result = types.CallToolResult(
-        content=[types.TextContent(text="transcript " + "x" * size)],
-        structured_content={"details": "structured-only " + "y" * size},
-    )
-    response = await _prepare(
-        result,
-        LocalFileSystem(tmp_path) if storage else None,
-        include_structured_content=include_structured_content,
-    )
-    paths = tuple(tmp_path.rglob("*.txt"))
-    if storage and size > 512:
-        (path,) = paths
-        payload = json.loads("".join(path.read_text().splitlines()))
-        assert payload["content"][0]["text"] == "transcript " + "x" * size
-        assert "[Full MCP result: " in response
-    else:
-        assert not paths
-        payload = json.loads(response)
-        if include_structured_content:
-            assert not payload["content"]
-    assert ("structuredContent" in payload) is include_structured_content
-    assert ("structured-only" in str(payload)) is include_structured_content
-    assert len(response) <= 512
 
 
 @pytest.mark.asyncio

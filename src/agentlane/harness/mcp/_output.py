@@ -12,7 +12,6 @@ from ..filesystem import FileWriter
 from ._redaction import redact_known_secrets, redact_secret_pairs
 from ._result import (
     read_result,
-    render_mcp_result,
     render_mcp_storage_text,
     result_response,
 )
@@ -30,12 +29,9 @@ async def render_mcp_result_with_storage(
     *,
     policy: MCPResultPolicy,
     secrets: Collection[str],
-    writer: FileWriter | None,
+    writer: FileWriter,
     directory: str | None,
 ) -> str | ToolFailure:
-    if writer is None:
-        return render_mcp_result(result, policy, secrets=secrets)
-
     source = read_result(result)
     is_error = source.is_error
     try:
