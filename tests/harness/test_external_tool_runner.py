@@ -44,6 +44,7 @@ from .tools_test_utils import (
 )
 
 ROOT = AgentId.from_values("test", "root")
+"""Root address shared by paused and resumed test agents."""
 
 
 class ChangedArgs(BaseModel):
@@ -299,8 +300,9 @@ async def test_resume_preserves_external_argument_defaults(mode: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid", ["schema", "identity", "pending"])
-async def test_invalid_resume_rejects_before_model_io(invalid: str) -> None:
+@pytest.mark.parametrize("mode", ["run", "stream", "events"])
+@pytest.mark.parametrize("invalid", ["schema", "identity", "pending", "mutated"])
+async def test_invalid_resume_rejects_before_model_io(invalid: str, mode: str) -> None:
     runner = Runner()
     with pytest.raises(RunPaused) as paused:
         await execute(runner, ScriptedModel(response("external")), state())
@@ -316,15 +318,16 @@ async def test_invalid_resume_rejects_before_model_io(invalid: str) -> None:
         )
     elif invalid == "identity":
         saved.checkpoint.agent_id = AgentId.from_values("test", "other")
-    else:
+    elif invalid == "pending":
         saved.checkpoint.state.history.append(
             {"role": "user", "content": "wrong boundary"}
         )
     model = ScriptedModel()
     with pytest.raises(ValueError):
-        await execute(
-            Runner(), model, ToolResultInput(continuation=saved, result="answer"), tools
-        )
+        run_input = ToolResultInput(continuation=saved, result="answer")
+        if invalid == "mutated":
+            run_input.continuation.checkpoint.state.history.clear()
+        await execute(Runner(), model, run_input, tools, mode)
     assert model.calls == []
 
 
@@ -375,6 +378,7 @@ async def test_cancelled_input_does_not_consume_continuation_but_execution_does(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["stream", "events"])
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -390,7 +394,7 @@ async def test_cancelled_input_does_not_consume_continuation_but_execution_does(
     ],
 )
 async def test_codec_rejects_invalid_counters_and_owns_copies(
-    field: str, value: object
+    field: str, value: object, mode: str
 ) -> None:
     with pytest.raises(RunPaused) as paused:
         await execute(
@@ -402,13 +406,20 @@ async def test_codec_rejects_invalid_counters_and_owns_copies(
     data = saved.to_json()
     result_input = ToolResultInput(continuation=saved, result="answer")
     runner = Runner()
-    stream = runner.run_events(agent(ScriptedModel(response()), runner), result_input)
+    model = ScriptedModel(response())
+    task = agent(model, runner)
+    stream = (
+        runner.run_events(task, result_input)
+        if mode == "events"
+        else runner.run_stream(task, result_input)
+    )
     try:
         # Neither caller can change the payload already owned by the runner.
         saved.arguments["text"] = "first mutation"
         result_input.continuation.arguments["text"] = "second mutation"
         result_input.continuation.checkpoint.state.history.clear()
         assert (await stream.result()).final_output == "done"
+        assert model.calls[0][0] == {"role": "user", "content": "start"}
     finally:
         await stream.aclose()
     target = data

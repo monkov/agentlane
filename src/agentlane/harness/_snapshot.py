@@ -18,7 +18,12 @@ from pydantic import (
 )
 
 from agentlane.messaging import AgentId
-from agentlane.models import ModelResponse, ToolCall, render_instruction_text
+from agentlane.models import (
+    MessageRole,
+    ModelResponse,
+    ToolCall,
+    render_instruction_text,
+)
 
 from ._render import render_request_messages
 from ._run import RunHistoryItem, RunState, ShimState
@@ -308,7 +313,11 @@ def _validate_pending_call(continuation: RunContinuation) -> None:
         raw_calls = message.get("tool_calls")
         role = message["role"]
         if raw_calls:
-            if role != "assistant" or pending or not isinstance(raw_calls, list):
+            if (
+                role != MessageRole.ASSISTANT.value
+                or pending
+                or not isinstance(raw_calls, list)
+            ):
                 raise ValueError("Continuation has overlapping or malformed calls.")
             for raw_call in raw_calls:
                 call = ToolCall.model_validate(raw_call, strict=True)
@@ -316,7 +325,7 @@ def _validate_pending_call(continuation: RunContinuation) -> None:
                     raise ValueError("Continuation has an empty or repeated call ID.")
                 seen.add(call.id)
                 pending[call.id] = call
-        elif role == "tool":
+        elif role == MessageRole.TOOL.value:
             call_id = message.get("tool_call_id")
             if not isinstance(call_id, str) or call_id not in pending:
                 raise ValueError("Continuation has a result without its call.")
@@ -327,7 +336,7 @@ def _validate_pending_call(continuation: RunContinuation) -> None:
     # The final history entry must match the call being answered.
     if (
         not history
-        or history[-1]["role"] != "assistant"
+        or history[-1]["role"] != MessageRole.ASSISTANT.value
         or pending != {continuation.tool_call.id: continuation.tool_call}
         or len(cast(list[JsonValue], history[-1].get("tool_calls", []))) != 1
     ):

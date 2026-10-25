@@ -284,7 +284,7 @@ class RunLoop:
         self.model = model
         self.external_input = state if isinstance(state, ToolResultInput) else None
         self.state = (
-            state.continuation.to_run_state()
+            state.continuation.checkpoint.to_run_state()
             if isinstance(state, ToolResultInput)
             else state
         )
