@@ -419,3 +419,44 @@ async def test_tool_cancellation_waits_for_active_file_write(
             await asyncio.gather(shutdown, return_exceptions=True)
         await lease.release()
         await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_mcp_response_does_not_start_storage(
+    output_peer: _Peer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = MemoryFileSystem()
+    token = CancellationToken()
+    original_call = output_peer.call_tool
+
+    async def cancel_after_response(
+        name: str, arguments: dict[str, Any], *, read_timeout_seconds: float
+    ) -> types.CallToolResult:
+        result = await original_call(
+            name, arguments, read_timeout_seconds=read_timeout_seconds
+        )
+        # Complete the MCP task before cancellation, but cancel before its caller resumes.
+        asyncio.get_running_loop().call_soon(token.cancel)
+        return result
+
+    monkeypatch.setattr(output_peer, "call_tool", cancel_after_response)
+    async with MCPClientManager() as manager:
+        lease = await acquire_lease(
+            manager, _server(), MCPAuthorizationContext(key="cancel-after-response")
+        )
+        try:
+            (tool,) = await lease.tools(
+                result_writer=backend, result_directory="tool-results"
+            )
+            result = await tool.run(tool.args_type().model_validate({}), token)
+        finally:
+            await lease.release()
+
+    assert token.is_cancelled
+    assert isinstance(result, ToolFailure)
+    assert result.error.kind == "cancelled"
+    assert "[Full MCP result:" not in result
+    assert output_peer.calls == [(_TOOL_NAME, {})]
+    assert not backend.write_started.is_set()
+    assert backend.writes == []
+    assert backend.files == {}

@@ -146,8 +146,6 @@ async def call_tool(
             connection.secrets.update(operation.secrets)
 
         if result_writer is not None:
-            if cancellation_token.is_cancelled:
-                return tool_failure(TOOL_CANCELLED, ToolErrorKind.CANCELLED.value)
             if is_closed() or connection.closing:
                 return tool_failure(
                     CONNECTION_UNAVAILABLE, MCP_TRANSPORT_TOOL_ERROR_KIND
