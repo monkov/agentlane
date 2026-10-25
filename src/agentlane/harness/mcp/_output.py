@@ -36,7 +36,7 @@ async def render_mcp_result_with_storage(
     is_error = source.is_error
     try:
         text, preview, complete = render_mcp_storage_text(
-            result, policy, secrets=secrets
+            source, policy, secrets=secrets
         )
     except Exception:
         return result_response(

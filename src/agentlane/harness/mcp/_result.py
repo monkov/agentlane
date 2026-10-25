@@ -54,10 +54,9 @@ def render_mcp_result(
 
 
 def render_mcp_storage_text(
-    result: object, policy: MCPResultPolicy, *, secrets: Collection[str]
+    source: _Result, policy: MCPResultPolicy, *, secrets: Collection[str]
 ) -> tuple[str, str, bool]:
     """Return saved text, preview text and whether processing was complete."""
-    source = read_result(result)
     renderer = _Renderer(_MAX_INPUT_CHARS, secrets, resource_text=True)
     storage_policy = replace(
         policy,
