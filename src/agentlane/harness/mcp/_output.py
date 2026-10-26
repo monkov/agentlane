@@ -26,7 +26,18 @@ _FILE_LINE_CHARS = 4096
 """Keep saved lines within the native read tool byte limit, including UTF-8."""
 
 
-def validate_result_directory(directory: str, max_text_chars: int) -> None:
+def validate_result_storage(
+    writer: FileWriter | None,
+    directory: str | None,
+    max_text_chars: int,
+) -> None:
+    if (writer is None) != (directory is None):
+        raise ValueError(
+            "result_writer and result_directory must be configured together."
+        )
+    if directory is None:
+        return
+
     # UUID filenames have a fixed length; include JSON escaping of the directory.
     path = str(PurePosixPath(directory) / "00000000-0000-0000-0000-000000000000.txt")
     reference = _RESULT_REFERENCE.format(json.dumps(path, ensure_ascii=False))

@@ -35,7 +35,7 @@ from ._errors import (
     MCPShutdownTimeoutError,
 )
 from ._operation import mcp_operation
-from ._output import validate_result_directory
+from ._output import validate_result_storage
 from ._sdk import exception_kind
 from ._tools import call_tool, native_tool, tool_failure
 from ._types import (
@@ -119,14 +119,9 @@ class MCPClientLease:
         if self._manager.closed:
             raise MCPError(CLIENT_CLOSED)
 
-        if (result_writer is None) != (result_directory is None):
-            raise ValueError(
-                "result_writer and result_directory must be configured together."
-            )
-        if result_directory is not None:
-            validate_result_directory(
-                result_directory, self.server.result_policy.max_text_chars
-            )
+        validate_result_storage(
+            result_writer, result_directory, self.server.result_policy.max_text_chars
+        )
 
         discovery = asyncio.create_task(
             self._tools(), name=f"agentlane-mcp-discovery-{self.server.name}"

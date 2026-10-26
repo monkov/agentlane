@@ -22,7 +22,7 @@ from ..shims import (
 )
 from ._client import MCPClientLease, MCPClientManager
 from ._errors import MCPDiscoveryError
-from ._output import validate_result_directory
+from ._output import validate_result_storage
 from ._types import MCPAuthorizationContext, MCPServer
 
 logger = structlog.get_logger(__name__)
@@ -232,23 +232,19 @@ class MCPToolsShim(Shim):
             or max_concurrent_discoveries < 1
         ):
             raise ValueError("max_concurrent_discoveries must be a positive integer.")
-        if (result_writer is None) != (result_directory is None):
-            raise ValueError(
-                "result_writer and result_directory must be configured together."
-            )
 
         # Resolve paths once in the same namespace used by injected file tools.
-        if result_directory is not None:
+        if result_writer is not None and result_directory is not None:
             result_directory = str(
                 result_writer.resolve_path(result_directory)
                 if isinstance(result_writer, FilePathResolver)
                 else normalize_relative_path(result_directory)
             )
 
-            for server in servers:
-                validate_result_directory(
-                    result_directory, server.result_policy.max_text_chars
-                )
+        for server in servers:
+            validate_result_storage(
+                result_writer, result_directory, server.result_policy.max_text_chars
+            )
 
         self._servers = servers
         self._authorization_context = authorization_context or MCPAuthorizationContext(
