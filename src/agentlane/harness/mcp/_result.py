@@ -69,10 +69,17 @@ def render_mcp_storage_text(
     # Select the preview from sanitized content without parsing text or
     # redacting it again. Keep the inline structured and resource conventions.
     safe_source = read_result(safe)
+
+    # Keep exact-fit results intact; only overflow needs a bounded preview.
+    preview_limit = (
+        policy.max_text_chars
+        if len(text) > policy.max_text_chars
+        else _MAX_SERIALIZED_CHARS
+    )
     preview = _render(
         safe_source,
-        replace(policy, max_text_chars=_MAX_SERIALIZED_CHARS),
-        _Renderer(_MAX_SERIALIZED_CHARS, (), sanitized=True),
+        replace(policy, max_text_chars=preview_limit),
+        _Renderer(preview_limit, (), sanitized=True),
     )
 
     return text, _json(preview), not renderer.truncated

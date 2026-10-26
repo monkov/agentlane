@@ -11,7 +11,11 @@ from mcp import types
 from agentlane.harness.filesystem import FileWriter, LocalFileSystem
 from agentlane.harness.mcp import MCPResultPolicy
 from agentlane.harness.mcp._output import render_mcp_result_with_storage
-from agentlane.harness.mcp._result import render_mcp_result
+from agentlane.harness.mcp._result import (
+    read_result,
+    render_mcp_result,
+    render_mcp_storage_text,
+)
 from agentlane.models import ToolFailure
 
 
@@ -392,3 +396,43 @@ async def test_oversized_text_is_rejected_before_stripping(
     assert "omitted" in response
     assert len(response) <= 512
     assert not tuple(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("kind", ["text", "structured", "resource"])
+@pytest.mark.parametrize("is_error", [False, True])
+def test_overflow_preview_is_bounded_before_writing(kind: str, is_error: bool) -> None:
+    transcript = "visit \n🙂" * 20_000 + "final words"
+    result = types.CallToolResult(
+        content=[types.TextContent(text=transcript)], is_error=is_error
+    )
+    if kind == "structured":
+        result.structured_content = {"transcript": transcript}
+    elif kind == "resource":
+        result.content = [
+            types.EmbeddedResource(
+                resource=types.TextResourceContents(
+                    uri="resource://notes/1", text=transcript
+                )
+            )
+        ]
+    text, preview, complete = render_mcp_storage_text(
+        read_result(result), MCPResultPolicy(max_text_chars=512), secrets=()
+    )
+    assert complete
+    assert len(text) > 512
+    assert len(preview) <= 512
+    saved = json.loads(text)
+    inline = json.loads(preview)
+    assert saved["isError"] is inline["isError"] is is_error
+    if kind == "structured":
+        assert saved["structuredContent"]["transcript"] == transcript
+        assert saved["content"][0]["text"] == transcript
+        assert bool(inline["content"]) is is_error
+        assert "structuredContent" in inline
+    elif kind == "resource":
+        assert saved["content"][0]["resource"]["text"] == transcript
+        assert "text" not in inline["content"][0]["resource"]
+        assert inline["content"][0]["resource"]["textCharsOmitted"] == len(transcript)
+    else:
+        assert saved["content"][0]["text"] == transcript
+        assert inline["truncated"] is True
