@@ -536,3 +536,60 @@ async def test_structured_content_policy_applies_with_and_without_storage(
     assert ("structuredContent" in payload) is include_structured_content
     assert ("structured-only" in str(payload)) is include_structured_content
     assert len(response) <= 512
+
+
+@pytest.mark.parametrize("extra_chars", [-1, 0, 1])
+def test_shim_validates_resolved_reference_for_each_server(extra_chars: int) -> None:
+    filesystem = MountedFileSystem({"saved": MemoryFileSystem()})
+    directory = '/saved/results/../é\n"quoted"'
+    resolved = filesystem.resolve_path(directory)
+    reference = f"\n\n[Full MCP result: {json.dumps(str(resolved / ('0' * 36 + '.txt')), ensure_ascii=False)}]"
+    limit = max(128, len(reference) + 1)
+    # Extend the resolved path to exercise the exact JSON-escaped boundary.
+    directory += "x" * (limit + extra_chars - len(reference))
+    servers = (
+        _server(max_chars=limit + 100),
+        replace(_server(max_chars=limit), name="second", required=False),
+    )
+    if extra_chars > 0:
+        with pytest.raises(ValueError, match="reference exceeds max_text_chars"):
+            MCPToolsShim(
+                servers=servers, result_writer=filesystem, result_directory=directory
+            )
+    else:
+        MCPToolsShim(
+            servers=servers, result_writer=filesystem, result_directory=directory
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_chars", [-1, 0, 1])
+async def test_lease_validates_reference_before_discovery(
+    output_peer: _Peer, extra_chars: int
+) -> None:
+    directory = 'results/é\n"quoted"'
+    reference = f"\n\n[Full MCP result: {json.dumps(directory + '/' + '0' * 36 + '.txt', ensure_ascii=False)}]"
+    directory += "x" * (128 + extra_chars - len(reference))
+    async with MCPClientManager() as manager:
+        lease = await acquire_lease(
+            manager,
+            _server(max_chars=128),
+            MCPAuthorizationContext(key="reference-budget"),
+        )
+        try:
+            if extra_chars > 0:
+                with pytest.raises(
+                    ValueError, match="reference exceeds max_text_chars"
+                ):
+                    await lease.tools(
+                        result_writer=MemoryFileSystem(), result_directory=directory
+                    )
+                assert output_peer.discoveries == 0
+            else:
+                tools = await lease.tools(
+                    result_writer=MemoryFileSystem(), result_directory=directory
+                )
+                assert len(tools) == 1
+        finally:
+            await lease.release()
+    assert output_peer.calls == []

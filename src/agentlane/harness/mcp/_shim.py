@@ -22,6 +22,7 @@ from ..shims import (
 )
 from ._client import MCPClientLease, MCPClientManager
 from ._errors import MCPDiscoveryError
+from ._output import validate_result_directory
 from ._types import MCPAuthorizationContext, MCPServer
 
 logger = structlog.get_logger(__name__)
@@ -243,6 +244,11 @@ class MCPToolsShim(Shim):
                 if isinstance(result_writer, FilePathResolver)
                 else normalize_relative_path(result_directory)
             )
+
+            for server in servers:
+                validate_result_directory(
+                    result_directory, server.result_policy.max_text_chars
+                )
 
         self._servers = servers
         self._authorization_context = authorization_context or MCPAuthorizationContext(

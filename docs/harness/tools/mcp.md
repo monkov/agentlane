@@ -216,12 +216,18 @@ it is not a stable JSON format. “Full” means the complete supported text
 representation selected by policy.
 
 The response, including its path, stays within `max_text_chars`. Storage uses
-the existing write and cancellation handling. If a write fails or the path
-cannot fit, the preview reports `[Full MCP result unavailable.]`. The provider
-call is not repeated. The host owns write deadlines and file retention.
+the existing write and cancellation handling. If a write fails, the preview
+reports `[Full MCP result unavailable.]`. The provider call is not repeated.
+The host owns write deadlines and file retention.
 
 Configure both storage options together. With neither option set, the existing
 response and processing limits are unchanged.
+
+`MCPToolsShim` checks that the resolved directory, UUID filename, and reference
+format fit each server's `max_text_chars`, including JSON escaping. Direct calls
+to `MCPClientLease.tools()` check the supplied directory before tool discovery.
+If the reference cannot fit, configuration raises `ValueError`. Use a shorter
+directory or increase `max_text_chars`.
 
 Storage preparation has separate processing limits: depth 32, 4,096 nodes,
 8 Mi characters processed, and 8 Mi serialized characters. These internal

@@ -161,7 +161,7 @@ async def test_storage_outcomes_keep_server_error_kind(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("extra_chars", [-1, 0, 1])
+@pytest.mark.parametrize("extra_chars", [-1, 0])
 async def test_quoted_path_notice_at_the_response_budget_boundary(
     extra_chars: int, tmp_path: Path
 ) -> None:
@@ -182,13 +182,10 @@ async def test_quoted_path_notice_at_the_response_budget_boundary(
     notice = f"\n\n[Full MCP result: {json.dumps(relative)}]"
     assert len(notice) == limit + extra_chars
     assert len(response) <= limit
-    if extra_chars > 0:
-        assert response.endswith("\n\n[Full MCP result unavailable.]")
-    else:
-        assert response.endswith(notice)
-        assert json.loads(response.split("[Full MCP result: ", 1)[1][:-1]) == relative
-        if extra_chars == 0:
-            assert response == notice
+    assert response.endswith(notice)
+    assert json.loads(response.split("[Full MCP result: ", 1)[1][:-1]) == relative
+    if extra_chars == 0:
+        assert response == notice
 
 
 @pytest.mark.asyncio
