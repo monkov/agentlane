@@ -50,31 +50,30 @@ async def render_mcp_result_with_storage(
     ):
         return result_response(preview, is_error)
 
-    try:
-        if not complete:
-            raise ValueError("MCP result exceeds processing limit.")
-        if not directory:
-            raise ValueError("MCP result storage requires a directory.")
-        read_path = str(PurePosixPath(directory) / f"{uuid4()}.txt")
-        if (
-            redact_known_secrets(read_path, secrets) != read_path
-            or redact_secret_pairs(read_path) != read_path
-        ):
-            raise ValueError("MCP output path contains credentials.")
+    if not complete:
+        notice = "\n\n[MCP processing limit exceeded; full result not saved.]"
+    else:
+        try:
+            if not directory:
+                raise ValueError("MCP result storage requires a directory.")
+            read_path = str(PurePosixPath(directory) / f"{uuid4()}.txt")
+            if (
+                redact_known_secrets(read_path, secrets) != read_path
+                or redact_secret_pairs(read_path) != read_path
+            ):
+                raise ValueError("MCP output path contains credentials.")
 
-        # read cannot return a single line larger than its byte limit.
-        file_text = "\n".join(
-            text[i : i + _FILE_LINE_CHARS]
-            for i in range(0, len(text), _FILE_LINE_CHARS)
-        )
-        await write_content(writer, read_path, file_text.encode("utf-8"))
-        notice = f"\n\n[Full MCP result: {json.dumps(read_path, ensure_ascii=False)}]"
-    except Exception:
-        notice = (
-            _UNAVAILABLE
-            if complete
-            else "\n\n[MCP processing limit exceeded; full result not saved.]"
-        )
+            # read cannot return a single line larger than its byte limit.
+            file_text = "\n".join(
+                text[i : i + _FILE_LINE_CHARS]
+                for i in range(0, len(text), _FILE_LINE_CHARS)
+            )
+            await write_content(writer, read_path, file_text.encode("utf-8"))
+            notice = (
+                f"\n\n[Full MCP result: {json.dumps(read_path, ensure_ascii=False)}]"
+            )
+        except Exception:
+            notice = _UNAVAILABLE
 
     # Truncate the preview, never the file path the model needs to read it.
     if len(notice) > policy.max_text_chars:

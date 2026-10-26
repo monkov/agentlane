@@ -426,13 +426,15 @@ class _Renderer:
                 break
 
             if not self.sanitized and is_secret_key(alias):
-                encoded: tuple[object, int] | None = self._text("[redacted]", remaining)
+                rendered: tuple[object, int] | None = self._text(
+                    "[redacted]", remaining
+                )
             else:
                 item = _field(value, name)
                 if omitted_body:
                     item = len(item) if isinstance(item, str) else 0
 
-                encoded = self.value(
+                rendered = self.value(
                     item,
                     remaining,
                     depth + 1,
@@ -440,10 +442,10 @@ class _Renderer:
                     charged=charged,
                 )
 
-            if encoded is None:
+            if rendered is None:
                 break
 
-            item, size = encoded
+            item, size = rendered
             used += len(encoded_key) + 1 + size + bool(parts)
             parts[safe_key] = item
             kept.add(alias)
@@ -481,11 +483,11 @@ class _Renderer:
                 self.truncated = True
                 break
 
-            encoded = self.value(value[index], remaining, depth + 1, charged=charged)
-            if encoded is None:
+            rendered = self.value(value[index], remaining, depth + 1, charged=charged)
+            if rendered is None:
                 break
 
-            item, size = encoded
+            item, size = rendered
             used += size + bool(parts)
             parts.append(item)
 
@@ -515,11 +517,11 @@ class _Renderer:
                 self.truncated = True
                 break
 
-            encoded = self.value(block, remaining, block=True)
-            if encoded is None:
+            rendered = self.value(block, remaining, block=True)
+            if rendered is None:
                 break
 
-            item, size = encoded
+            item, size = rendered
             used += size + bool(parts)
             parts.append(item)
             kept += 1
